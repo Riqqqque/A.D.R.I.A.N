@@ -1,0 +1,9 @@
+target/
+web/node_modules/
+web/build/
+web/.svelte-kit/
+data/
+*.db
+*.db-shm
+*.db-wal
+SETUP_TOKEN.txt
