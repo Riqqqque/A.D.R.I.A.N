@@ -34,3 +34,19 @@ impl RateLimiter {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enforces_max_per_window_and_isolates_keys() {
+        let rl = RateLimiter::new();
+        let w = Duration::from_secs(60);
+        for _ in 0..3 {
+            assert!(rl.check("ip:1", 3, w));
+        }
+        assert!(!rl.check("ip:1", 3, w)); // 4th hit blocked
+        assert!(rl.check("ip:2", 3, w)); // other key unaffected
+    }
+}

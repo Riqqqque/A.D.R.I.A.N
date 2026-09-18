@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy, onMount } from 'svelte';
   import { get, post } from '../api';
   import { session } from '../session.svelte';
   import type { Entity } from '../types';
@@ -7,6 +8,7 @@
   let error = $state('');
   let busy = $state('');
   let brightness = $state<Record<string, number>>({});
+  let events: EventSource | null = null;
   const isOwner = $derived(session.user?.role === 'owner');
 
   async function load() {
@@ -17,7 +19,21 @@
       error = e instanceof Error ? e.message : String(e);
     }
   }
-  load();
+
+  onMount(() => {
+    load();
+    // Live state updates pushed by the HA state subscription.
+    events = new EventSource('/api/events');
+    events.addEventListener('entity_state', (e) => {
+      try {
+        const d = JSON.parse((e as MessageEvent).data) as { entity_id: string; state: string };
+        const ent = entities.find((x) => x.entity_id === d.entity_id);
+        if (ent) ent.state = d.state;
+      } catch { /* ignore */ }
+    });
+    events.addEventListener('entities', () => void load());
+  });
+  onDestroy(() => events?.close());
 
   async function setAllowed(e: Entity, allowed: boolean) {
     try {

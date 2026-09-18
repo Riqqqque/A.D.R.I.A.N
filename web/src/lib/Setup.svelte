@@ -50,26 +50,32 @@
       <code>SETUP_TOKEN.txt</code> in the data directory. It works once.
     </p>
     <form onsubmit={(e) => { e.preventDefault(); submit(); }}>
-      <label>Setup token</label>
-      <input class="grow" bind:value={token} required autocomplete="off" />
-      <label>Username</label>
-      <input class="grow" bind:value={username} required autocomplete="username" />
-      <label>Display name (optional)</label>
-      <input class="grow" bind:value={displayName} />
-      <label>Password (min 8 chars)</label>
-      <input class="grow" type="password" bind:value={password} required minlength="8" autocomplete="new-password" />
-      <label>Confirm password</label>
-      <input class="grow" type="password" bind:value={confirm} required autocomplete="new-password" />
-      <label>Timezone</label>
-      <select class="grow" bind:value={timezone}>
-        {#each timezones as tz}<option value={tz}>{tz}</option>{/each}
-      </select>
-      <label>Privacy mode</label>
+      <label class="field">Setup token
+        <input bind:value={token} required autocomplete="off" />
+      </label>
+      <label class="field">Username
+        <input bind:value={username} required autocomplete="username" />
+      </label>
+      <label class="field">Display name (optional)
+        <input bind:value={displayName} />
+      </label>
+      <label class="field">Password (min 8 chars)
+        <input type="password" bind:value={password} required minlength="8" autocomplete="new-password" />
+      </label>
+      <label class="field">Confirm password
+        <input type="password" bind:value={confirm} required autocomplete="new-password" />
+      </label>
+      <label class="field">Timezone
+        <select bind:value={timezone}>
+          {#each timezones as tz}<option value={tz}>{tz}</option>{/each}
+        </select>
+      </label>
+      <span class="field">Privacy mode</span>
       <div class="row">
-        <label class="row" style="margin:0">
+        <label class="row" style="margin:0; align-items:center">
           <input type="radio" bind:group={privacy} value="hybrid" /> hybrid — cloud providers allowed
         </label>
-        <label class="row" style="margin:0">
+        <label class="row" style="margin:0; align-items:center">
           <input type="radio" bind:group={privacy} value="strict_local" /> strict-local — no cloud calls
         </label>
       </div>
@@ -80,7 +86,3 @@
     </form>
   </div>
 </main>
-
-<style>
-  input.grow, select.grow { width: 100%; }
-</style>

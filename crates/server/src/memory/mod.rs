@@ -216,9 +216,15 @@ mod tests {
     async fn add_search_update_delete() {
         let (db, _dir) = db().await;
         let uid = user(&db, "ann").await;
-        let f = add(&db, uid, "the spare key is under the mat", "private", "test")
-            .await
-            .unwrap();
+        let f = add(
+            &db,
+            uid,
+            "the spare key is under the mat",
+            "private",
+            "test",
+        )
+        .await
+        .unwrap();
         assert_eq!(f.version, 1);
         assert_eq!(search(&db, uid, "spare key", 10).await.unwrap().len(), 1);
         let f2 = update(&db, f.id, uid, "the spare key moved to the garage")
@@ -237,9 +243,15 @@ mod tests {
         let (db, _dir) = db().await;
         let ann = user(&db, "ann").await;
         let bob = user(&db, "bob").await;
-        add(&db, ann, "ann's diary entry", "private", "test").await.unwrap();
-        add(&db, ann, "shared wifi password", "household", "test").await.unwrap();
-        add(&db, bob, "bob's pin code", "private", "test").await.unwrap();
+        add(&db, ann, "ann's diary entry", "private", "test")
+            .await
+            .unwrap();
+        add(&db, ann, "shared wifi password", "household", "test")
+            .await
+            .unwrap();
+        add(&db, bob, "bob's pin code", "private", "test")
+            .await
+            .unwrap();
 
         let ann_facts = list(&db, ann).await.unwrap();
         let bob_facts = list(&db, bob).await.unwrap();

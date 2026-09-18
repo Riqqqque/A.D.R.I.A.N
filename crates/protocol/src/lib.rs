@@ -183,8 +183,14 @@ mod tests {
 
     #[test]
     fn request_ids_are_unique() {
-        let a = Envelope::new(Message::Ack { ok: true, detail: None });
-        let b = Envelope::new(Message::Ack { ok: true, detail: None });
+        let a = Envelope::new(Message::Ack {
+            ok: true,
+            detail: None,
+        });
+        let b = Envelope::new(Message::Ack {
+            ok: true,
+            detail: None,
+        });
         assert_ne!(a.request_id, b.request_id);
     }
 }

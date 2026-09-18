@@ -94,8 +94,8 @@
 <div class="panel">
   <h2>Add a Home Assistant speaker</h2>
   <div class="row" style="align-items:end">
-    <div class="grow"><label>Name</label><input style="width:100%" bind:value={name} placeholder="Kitchen speaker" /></div>
-    <div class="grow"><label>Media player entity</label><input style="width:100%" bind:value={entityId} placeholder="media_player.kitchen" /></div>
+    <label class="field grow">Name<input bind:value={name} placeholder="Kitchen speaker" /></label>
+    <label class="field grow">Media player entity<input bind:value={entityId} placeholder="media_player.kitchen" /></label>
     <button onclick={addHa} disabled={!name.trim() || !entityId.trim()}>Add</button>
   </div>
   <p class="dim small">Requires Home Assistant connected and a reachable <code>public_url</code> (set under System) if speakers can't reach this machine's hostname.</p>

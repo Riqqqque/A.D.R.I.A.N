@@ -26,10 +26,12 @@
     <h1>Adrian</h1>
     {#if session.error}<p class="warn small">could not reach the server: {session.error}</p>{/if}
     <form onsubmit={(e) => { e.preventDefault(); submit(); }}>
-      <label>Username</label>
-      <input style="width:100%" bind:value={username} required autocomplete="username" />
-      <label>Password</label>
-      <input style="width:100%" type="password" bind:value={password} required autocomplete="current-password" />
+      <label class="field">Username
+        <input bind:value={username} required autocomplete="username" />
+      </label>
+      <label class="field">Password
+        <input type="password" bind:value={password} required autocomplete="current-password" />
+      </label>
       {#if error}<p class="err">{error}</p>{/if}
       <div style="margin-top: 1rem;">
         <button disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>

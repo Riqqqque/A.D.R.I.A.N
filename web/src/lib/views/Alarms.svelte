@@ -87,25 +87,29 @@
     <button class="small {mode === 'clock' ? '' : 'ghost'}" onclick={() => (mode = 'clock')}>Alarm clock</button>
   </div>
   <div class="row" style="margin-top:.6rem; align-items:end">
-    <div class="grow"><label>Label</label><input style="width:100%" bind:value={label} placeholder="e.g. take out laundry" /></div>
+    <label class="field grow">Label
+      <input bind:value={label} placeholder="e.g. take out laundry" />
+    </label>
     {#if mode === 'timer'}
-      <div><label>In minutes</label><input type="number" min="1" max="43200" style="width:6rem" bind:value={inMinutes} /></div>
+      <label class="field" style="width:6rem">In minutes
+        <input type="number" min="1" max="43200" bind:value={inMinutes} />
+      </label>
     {:else}
-      <div><label>Time</label><input type="time" bind:value={atTime} /></div>
-      <div><label>Date (optional)</label><input type="date" bind:value={atDate} /></div>
-      <div><label>Repeat</label>
+      <label class="field">Time<input type="time" bind:value={atTime} /></label>
+      <label class="field">Date (optional)<input type="date" bind:value={atDate} /></label>
+      <label class="field">Repeat
         <select bind:value={recurrence}>
           <option value="none">once</option><option value="daily">daily</option><option value="weekdays">weekdays</option>
         </select>
-      </div>
+      </label>
     {/if}
-    <div><label>Speaker</label>
+    <label class="field">Speaker
       <select bind:value={endpointId}>
         {#if endpoints.length === 0}<option value="">— none configured —</option>{/if}
         {#each endpoints as e}<option value={e.id}>{e.name}</option>{/each}
       </select>
-    </div>
-    <div><label>Volume {volume}%</label><input type="range" min="1" max="100" bind:value={volume} /></div>
+    </label>
+    <label class="field">Volume {volume}%<input type="range" min="1" max="100" bind:value={volume} /></label>
     <div><button onclick={create}>Schedule</button></div>
   </div>
   {#if endpoints.length === 0}

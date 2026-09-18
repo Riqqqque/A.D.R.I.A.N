@@ -278,11 +278,12 @@ async fn put_ha(
     // Blank token keeps the existing secret; first save requires one.
     let tok = b.token.as_deref().map(str::trim).unwrap_or("");
     let secret_name = if tok.is_empty() {
-        let existing: Option<String> = s
-            .db
-            .q1("SELECT secret_name FROM ha_connection WHERE id = 1", vec![], |r| {
-                r.get(0)
-            })
+        let existing: Option<String> =
+            s.db.q1(
+                "SELECT secret_name FROM ha_connection WHERE id = 1",
+                vec![],
+                |r| r.get(0),
+            )
             .await?;
         existing.ok_or_else(|| ApiError::BadRequest("token required on first save".into()))?
     } else {

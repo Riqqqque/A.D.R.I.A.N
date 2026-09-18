@@ -5,6 +5,7 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use std::sync::Arc;
 
+#[derive(Debug)]
 pub enum FastPath {
     LightCommand {
         entity_id: String,
@@ -99,4 +100,61 @@ pub async fn parse(state: &Arc<AppState>, text: &str) -> Result<Option<FastPath>
         }));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn state_with_light() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::Config {
+            data_dir: dir.path().to_path_buf(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            web_dir: dir.path().to_path_buf(),
+        };
+        let state = crate::build_state(config).await.unwrap();
+        state
+            .db
+            .exec(
+                "INSERT INTO entities(entity_id,name,domain,state,allowed,updated_at)
+                 VALUES('light.kitchen','Kitchen Light','light','off',1,1),
+                       ('light.hall','Hall Light','light','off',0,1)",
+                vec![],
+            )
+            .await
+            .unwrap();
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn matches_allowlisted_light_and_action() {
+        let (state, _d) = state_with_light().await;
+        match parse(&state, "turn off the kitchen light").await.unwrap() {
+            Some(FastPath::LightCommand {
+                entity_id, action, ..
+            }) => {
+                assert_eq!(entity_id, "light.kitchen");
+                assert_eq!(action, "turn_off");
+            }
+            other => panic!("expected light command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ignores_unallowlisted_and_non_light_text() {
+        let (state, _d) = state_with_light().await;
+        // Hall light is not allowlisted — no fast path.
+        assert!(
+            parse(&state, "turn on the hall light")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse(&state, "tell me a joke").await.unwrap().is_none());
+        assert!(matches!(
+            parse(&state, "what time is it").await.unwrap(),
+            Some(FastPath::CurrentTime)
+        ));
+    }
 }

@@ -29,6 +29,9 @@ mod tests {
 
     #[test]
     fn hashes_are_salted() {
-        assert_ne!(hash_password("same").unwrap(), hash_password("same").unwrap());
+        assert_ne!(
+            hash_password("same").unwrap(),
+            hash_password("same").unwrap()
+        );
     }
 }

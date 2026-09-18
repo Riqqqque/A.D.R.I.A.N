@@ -11,9 +11,9 @@ use crate::state::AppState;
 use crate::tools::{self, ToolCtx, fastpath};
 use crate::util;
 use crate::{memory, providers};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -23,7 +23,68 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/chat", post(chat))
+    Router::new()
+        .route("/api/chat", post(chat))
+        .route("/api/chat/conversations", get(list_conversations))
+        .route("/api/chat/conversations/{id}", get(conversation_history))
+}
+
+async fn list_conversations(
+    user: AuthUser,
+    State(s): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let rows =
+        s.db.q(
+            "SELECT c.id, c.title, c.created_at,
+                    (SELECT content FROM messages m
+                      WHERE m.conversation_id = c.id
+                      ORDER BY m.id DESC LIMIT 1) AS last_message
+             FROM conversations c WHERE c.user_id = ?1
+             ORDER BY c.created_at DESC LIMIT 50",
+            vec![P::I(user.id)],
+            |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "title": r.get::<_, String>(1)?,
+                    "created_at": r.get::<_, i64>(2)?,
+                    "last_message": r.get::<_, Option<String>>(3)?,
+                }))
+            },
+        )
+        .await?;
+    Ok(Json(json!({"conversations": rows})))
+}
+
+async fn conversation_history(
+    user: AuthUser,
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let owned =
+        s.db.q1(
+            "SELECT 1 FROM conversations WHERE id = ?1 AND user_id = ?2",
+            vec![P::T(id.clone()), P::I(user.id)],
+            |r| r.get::<_, i64>(0),
+        )
+        .await?;
+    if owned.is_none() {
+        return Err(ApiError::NotFound("conversation".into()));
+    }
+    let rows =
+        s.db.q(
+            "SELECT role, content, created_at FROM messages
+             WHERE conversation_id = ?1 ORDER BY id LIMIT 200",
+            vec![P::T(id)],
+            |r| {
+                Ok(json!({
+                    "role": r.get::<_, String>(0)?,
+                    "content": r.get::<_, String>(1)?,
+                    "created_at": r.get::<_, i64>(2)?,
+                }))
+            },
+        )
+        .await?;
+    Ok(Json(json!({"messages": rows})))
 }
 
 #[derive(Deserialize)]

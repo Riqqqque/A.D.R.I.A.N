@@ -52,6 +52,18 @@ input, select, textarea {
 }
 input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent-2); }
 label { display: block; font-size: .85rem; color: var(--dim); margin: .55rem 0 .25rem; }
+/* Implicitly-associated label wrapping its control. */
+.field { display: block; font-size: .85rem; color: var(--dim); margin: .55rem 0 .25rem; }
+.field > input, .field > select, .field > textarea {
+  display: block;
+  width: 100%;
+  margin-top: .25rem;
+  font-size: 1rem;
+}
+.field > input[type="radio"], .field > input[type="checkbox"] {
+  display: inline-block;
+  width: auto;
+}
 button {
   background: var(--accent-2);
   color: #fff;

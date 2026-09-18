@@ -561,27 +561,60 @@ async fn next_due(db: &Db) -> Option<i64> {
 
 /// Crash/restart reconciliation: an alarm left 'ringing' was claimed but its
 /// delivery outcome is unknown — the delivery record exists, so do NOT
-/// redeliver; record the ambiguous outcome honestly.
+/// redeliver; record the ambiguous outcome honestly. Recurring alarms are
+/// rescheduled to their next occurrence rather than left dead.
 async fn reconcile_after_boot(state: &AppState) {
     let now = util::now_unix();
     let _ = state
         .db
-        .call(move |c| {
-            let tx = c.transaction()?;
-            tx.execute(
-                "UPDATE alarm_deliveries SET status='failed',
-                    detail = detail || ' (interrupted by server restart)', finished_at=?1
-                 WHERE status='delivering'",
-                rusqlite::params![now],
-            )?;
-            tx.execute(
-                "UPDATE alarms SET status='done', updated_at=?1 WHERE status='ringing'",
-                rusqlite::params![now],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
+        .exec(
+            "UPDATE alarm_deliveries SET status='failed',
+                detail = detail || ' (interrupted by server restart)', finished_at=?1
+             WHERE status='delivering'",
+            vec![P::I(now)],
+        )
         .await;
+    let ringing = state
+        .db
+        .q(
+            &format!(
+                "SELECT {ALARM_COLS} FROM alarms WHERE status='ringing' AND deleted_at IS NULL"
+            ),
+            vec![],
+            map_alarm,
+        )
+        .await
+        .unwrap_or_default();
+    for alarm in ringing {
+        let next = if alarm.recurrence != "none" {
+            match (alarm.local_time.clone(), TimeZone::get(&alarm.timezone)) {
+                (Some(hhmm), Ok(tz)) => next_clock_time(
+                    &tz,
+                    &hhmm,
+                    &alarm.recurrence,
+                    jiff::Timestamp::from_second(now).unwrap_or_else(|_| jiff::Timestamp::now()),
+                )
+                .ok()
+                .map(|z| z.timestamp().as_second()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let status = if next.is_some() { "scheduled" } else { "done" };
+        let _ = state
+            .db
+            .exec(
+                "UPDATE alarms SET status=?1, next_due_utc=?2, updated_at=?3 WHERE id=?4",
+                vec![
+                    P::T(status.to_string()),
+                    next.map(P::I).unwrap_or(P::Null),
+                    P::I(now),
+                    P::T(alarm.id),
+                ],
+            )
+            .await;
+    }
 }
 
 /// Atomically claim due alarms (delivery row + status change in one
@@ -851,7 +884,10 @@ mod tests {
         let due = jiff::Timestamp::from_second(r.due_utc)
             .unwrap()
             .to_zoned(TimeZone::UTC);
-        assert_eq!(due.strftime("%Y-%m-%d %H:%M").to_string(), "2026-09-18 09:00");
+        assert_eq!(
+            due.strftime("%Y-%m-%d %H:%M").to_string(),
+            "2026-09-18 09:00"
+        );
     }
 
     #[test]
@@ -861,7 +897,10 @@ mod tests {
         let due = jiff::Timestamp::from_second(r.due_utc)
             .unwrap()
             .to_zoned(TimeZone::UTC);
-        assert_eq!(due.strftime("%Y-%m-%d %H:%M").to_string(), "2026-09-20 07:30");
+        assert_eq!(
+            due.strftime("%Y-%m-%d %H:%M").to_string(),
+            "2026-09-20 07:30"
+        );
     }
 
     #[test]
@@ -901,5 +940,111 @@ mod tests {
         assert!(resolve(&tz("UTC"), Some("25:99"), None, "none", now).is_err());
         assert!(resolve(&tz("UTC"), None, None, "none", now).is_err());
         assert!(resolve(&tz("UTC"), Some("not a time"), None, "none", now).is_err());
+    }
+
+    /// Mid-delivery crash: 'ringing' alarms + 'delivering' rows must be
+    /// reconciled honestly (no silent refire) and recurring alarms must be
+    /// rescheduled rather than left dead.
+    #[tokio::test]
+    async fn reconcile_recovers_interrupted_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::Config {
+            data_dir: dir.path().to_path_buf(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            web_dir: dir.path().to_path_buf(),
+        };
+        let state = crate::build_state(config).await.unwrap();
+        let now = util::now_unix();
+        let uid: i64 = state
+            .db
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO users(username,display_name,password_hash,role,created_at)
+                     VALUES('o','o','x','owner',1)",
+                    [],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+        // One-off alarm claimed at crash: becomes 'done', delivery 'failed'.
+        state
+            .db
+            .exec(
+                "INSERT INTO alarms(id,owner_id,label,kind,timezone,recurrence,next_due_utc,status,created_at,updated_at)
+                 VALUES('one',?1,'t','alarm','UTC','none',?2,'ringing',1,1)",
+                vec![P::I(uid), P::I(now - 60)],
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .exec(
+                "INSERT INTO alarm_deliveries(id,alarm_id,occurrence_utc,execution_id,status,started_at)
+                 VALUES('d1','one',?1,'e','delivering',?1)",
+                vec![P::I(now - 60)],
+            )
+            .await
+            .unwrap();
+        // Recurring alarm claimed at crash: must be rescheduled, not dead.
+        state
+            .db
+            .exec(
+                "INSERT INTO alarms(id,owner_id,label,kind,timezone,local_time,recurrence,next_due_utc,status,created_at,updated_at)
+                 VALUES('rec',?1,'t','alarm','UTC','09:00','daily',?2,'ringing',1,1)",
+                vec![P::I(uid), P::I(now - 60)],
+            )
+            .await
+            .unwrap();
+
+        reconcile_after_boot(state.as_ref()).await;
+
+        let one = state
+            .db
+            .q1(
+                "SELECT status, next_due_utc FROM alarms WHERE id='one'",
+                vec![],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(one.0, "done");
+        assert_eq!(one.1, None);
+        let delivery: String = state
+            .db
+            .q1(
+                "SELECT status FROM alarm_deliveries WHERE id='d1'",
+                vec![],
+                |r| r.get(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery, "failed");
+        let rec = state
+            .db
+            .q1(
+                "SELECT status, next_due_utc FROM alarms WHERE id='rec'",
+                vec![],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.0, "scheduled");
+        assert!(rec.1.unwrap() > now);
+        // The occurrence that was interrupted is NOT refired.
+        let deliveries: i64 = state
+            .db
+            .q1(
+                "SELECT COUNT(*) FROM alarm_deliveries WHERE alarm_id='rec'",
+                vec![],
+                |r| r.get(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deliveries, 0); // no new delivery row created by reconciliation
     }
 }

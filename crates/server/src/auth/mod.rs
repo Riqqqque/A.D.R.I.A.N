@@ -166,6 +166,17 @@ pub async fn bootstrap(db: &crate::db::Db, data_dir: &std::path::Path) -> Result
     Ok(())
 }
 
+/// Delete sessions that are expired or revoked — keeps the table bounded.
+pub async fn sweep_expired_sessions(db: &crate::db::Db) {
+    let now = util::now_unix();
+    let _ = db
+        .exec(
+            "DELETE FROM sessions WHERE expires_at < ?1 OR revoked_at IS NOT NULL",
+            vec![P::I(now)],
+        )
+        .await;
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/setup/status", get(setup_status))

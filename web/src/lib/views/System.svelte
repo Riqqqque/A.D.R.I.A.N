@@ -106,16 +106,18 @@
   <div class="panel">
     <h2>Settings</h2>
     <div class="row" style="align-items:end">
-      <div><label>Timezone</label>
+      <label class="field">Timezone
         <select bind:value={timezone}>{#each timezones as tz}<option value={tz}>{tz}</option>{/each}</select>
-      </div>
-      <div><label>Assistant name</label><input bind:value={assistantName} /></div>
-      <div><label>Privacy</label>
+      </label>
+      <label class="field">Assistant name<input bind:value={assistantName} /></label>
+      <label class="field">Privacy
         <select bind:value={privacy}>
           <option value="hybrid">hybrid</option><option value="strict_local">strict-local</option>
         </select>
-      </div>
-      <div class="grow"><label>Public URL (for speakers to fetch audio)</label><input style="width:100%" bind:value={publicUrl} placeholder="http://192.168.1.10:8787" /></div>
+      </label>
+      <label class="field grow">Public URL (for speakers to fetch audio)
+        <input bind:value={publicUrl} placeholder="http://192.168.1.10:8787" />
+      </label>
       <button onclick={saveSettings}>Save</button>
     </div>
     <p class="dim small">strict-local blocks cloud provider calls. Public URL should be reachable by Home Assistant media players.</p>

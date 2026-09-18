@@ -55,6 +55,14 @@ pub async fn start_services(state: &Arc<AppState>) -> Result<(), error::ApiError
     auth::bootstrap(&state.db, &state.config.data_dir).await?;
     state.scheduler.clone().start(state.clone());
     Arc::new(state.ha.clone()).spawn();
+    // Periodic housekeeping: expired/revoked sessions.
+    let gc_db = state.db.clone();
+    tokio::spawn(async move {
+        loop {
+            auth::sweep_expired_sessions(&gc_db).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
     Ok(())
 }
 

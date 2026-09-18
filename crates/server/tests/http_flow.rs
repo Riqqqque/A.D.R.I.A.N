@@ -44,7 +44,10 @@ async fn request(
     let mut b = Request::builder()
         .method(method)
         .uri(path)
-        .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 40000))));
+        .extension(ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))));
     if body.is_some() {
         b = b.header(header::CONTENT_TYPE, "application/json");
     }
@@ -95,8 +98,10 @@ async fn setup_is_one_use_and_sessions_work() {
         &h.router,
         "POST",
         "/api/setup/claim",
-        Some(json!({"token": token, "username": "owner", "password": "password123",
-                    "timezone": "UTC", "privacy_mode": "hybrid"})),
+        Some(
+            json!({"token": token, "username": "owner", "password": "password123",
+                    "timezone": "UTC", "privacy_mode": "hybrid"}),
+        ),
         None,
         None,
     )
@@ -235,7 +240,10 @@ async fn data_survives_restart() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(mem["facts"][0]["text"], "the boiler room key hangs by the door");
+    assert_eq!(
+        mem["facts"][0]["text"],
+        "the boiler room key hangs by the door"
+    );
 }
 
 #[tokio::test]
@@ -316,4 +324,56 @@ async fn alarms_refuse_without_endpoint_but_persist_with_one() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn backup_file_is_a_valid_database() {
+    let h = harness().await;
+    let token = setup_token(&h.state.config.data_dir);
+    let (_, headers, body) = request(
+        &h.router,
+        "POST",
+        "/api/setup/claim",
+        Some(json!({"token": token, "username": "owner", "password": "password123", "timezone": "UTC"})),
+        None,
+        None,
+    )
+    .await;
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = body["csrf"].as_str().unwrap().to_string();
+
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/diagnostics/backup",
+        Some(json!({})),
+        Some(&cookie),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    let path = res["backup"].as_str().unwrap();
+
+    // The backup must be a real, readable SQLite database with our schema.
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let users: i64 = conn
+        .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(users, 1);
+    let tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('alarms','facts','sessions')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 3);
 }

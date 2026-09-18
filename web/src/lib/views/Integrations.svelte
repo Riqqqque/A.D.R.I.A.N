@@ -145,21 +145,25 @@
   {/each}
   {#if isOwner}
     <div class="row" style="margin-top:.8rem; align-items:end">
-      <div><label>Preset</label>
+      <label class="field">Preset
         <select onchange={(e) => applyPreset((e.target as HTMLSelectElement).value)}>
           <option value="">choose…</option>
           <option value="openai_responses">OpenAI</option>
           <option value="deepseek">DeepSeek</option>
           <option value="local">Local server</option>
         </select>
-      </div>
-      <div><label>Label</label><input bind:value={plabel} /></div>
-      <div class="grow"><label>Base URL</label><input style="width:100%" bind:value={baseUrl} /></div>
-      <div><label>Model</label><input bind:value={model} /></div>
+      </label>
+      <label class="field">Label<input bind:value={plabel} /></label>
+      <label class="field grow">Base URL<input bind:value={baseUrl} /></label>
+      <label class="field">Model<input bind:value={model} /></label>
     </div>
     <div class="row" style="align-items:end">
-      <div class="grow"><label>API key (stored server-side, optional for local)</label><input style="width:100%" type="password" bind:value={apiKey} autocomplete="off" /></div>
-      <div><label>Timeout (s)</label><input type="number" min="5" max="600" style="width:6rem" bind:value={timeoutSecs} /></div>
+      <label class="field grow">API key (stored server-side, optional for local)
+        <input type="password" bind:value={apiKey} autocomplete="off" />
+      </label>
+      <label class="field" style="width:6rem">Timeout (s)
+        <input type="number" min="5" max="600" bind:value={timeoutSecs} />
+      </label>
       <button onclick={addProvider} disabled={!plabel.trim() || !baseUrl.trim() || !model.trim()}>Add provider</button>
     </div>
   {/if}
@@ -177,8 +181,12 @@
   {/if}
   {#if isOwner}
     <div class="row" style="align-items:end">
-      <div class="grow"><label>URL</label><input style="width:100%" bind:value={haUrl} placeholder="http://homeassistant.local:8123" /></div>
-      <div class="grow"><label>Long-lived access token</label><input style="width:100%" type="password" bind:value={haToken} placeholder={ha?.configured ? '(keep existing — leave blank)' : ''} /></div>
+      <label class="field grow">URL
+        <input bind:value={haUrl} placeholder="http://homeassistant.local:8123" />
+      </label>
+      <label class="field grow">Long-lived access token
+        <input type="password" bind:value={haToken} placeholder={ha?.configured ? '(keep existing — leave blank)' : ''} />
+      </label>
       <button onclick={saveHa} disabled={!haUrl.trim() || (!haToken.trim() && !ha?.configured)}>Save</button>
     </div>
   {/if}
