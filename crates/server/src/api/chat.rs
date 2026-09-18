@@ -95,6 +95,14 @@ struct ChatBody {
 
 const MAX_TOOL_ROUNDS: usize = 8;
 
+/// Pipeline event sink — lets the SSE route and the satellite utterance
+/// route share one implementation.
+pub type TurnTx = tokio::sync::mpsc::UnboundedSender<(String, Value)>;
+
+fn emit(tx: &TurnTx, kind: &str, data: Value) {
+    let _ = tx.send((kind.to_string(), data));
+}
+
 async fn chat(
     user: AuthUser,
     State(s): State<AppState>,
@@ -105,20 +113,43 @@ async fn chat(
         return Err(ApiError::BadRequest("message must be 1-4000 chars".into()));
     }
     let state = Arc::new(s);
-    let conv_id = match &b.conversation_id {
+    let conv_id =
+        ensure_conversation(&state, &user, b.conversation_id.as_deref(), &message).await?;
+    save_message(&state, &conv_id, "user", &message).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
+    tokio::spawn(async move {
+        run_turn(&state, &user, &conv_id, &message, &tx).await;
+    });
+    let stream = async_stream::stream! {
+        while let Some((kind, data)) = rx.recv().await {
+            yield Ok(Event::default().event(kind).data(data.to_string()));
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20))))
+}
+
+/// Find or create the conversation a message belongs to.
+pub async fn ensure_conversation(
+    state: &Arc<AppState>,
+    user: &AuthUser,
+    conversation_id: Option<&str>,
+    title_seed: &str,
+) -> Result<String, ApiError> {
+    match conversation_id {
         Some(id) => {
             let owned = state
                 .db
                 .q1(
                     "SELECT 1 FROM conversations WHERE id = ?1 AND user_id = ?2",
-                    vec![P::T(id.clone()), P::I(user.id)],
+                    vec![P::T(id.to_string()), P::I(user.id)],
                     |r| r.get::<_, i64>(0),
                 )
                 .await?;
             if owned.is_none() {
                 return Err(ApiError::NotFound("conversation".into()));
             }
-            id.clone()
+            Ok(id.to_string())
         }
         None => {
             let id = util::new_id();
@@ -130,142 +161,191 @@ async fn chat(
                     vec![
                         P::T(id.clone()),
                         P::I(user.id),
-                        P::T(message.chars().take(60).collect::<String>()),
+                        P::T(title_seed.chars().take(60).collect::<String>()),
                         P::I(util::now_unix()),
                     ],
                 )
                 .await?;
-            id
+            Ok(id)
+        }
+    }
+}
+
+/// One assistant turn: fast path first, then the bounded model/tool loop.
+/// Events are pushed to `tx` as (kind, data); the sender is dropped when
+/// the turn finishes so receivers observe end-of-stream.
+pub async fn run_turn(
+    state: &Arc<AppState>,
+    user: &AuthUser,
+    cid: &str,
+    message: &str,
+    tx: &TurnTx,
+) {
+    // --- deterministic fast path ----------------------------------------
+    match fastpath::parse(state, message).await {
+        Ok(Some(fastpath::FastPath::LightCommand {
+            entity_id,
+            name,
+            action,
+        })) => {
+            emit(
+                tx,
+                "tool",
+                json!({"name": "control_light", "status": "executing",
+                    "detail": format!("{action} {name}")}),
+            );
+            match execute_light(state, user, &entity_id, &action, None).await {
+                Ok(v) => {
+                    let confirmed = v
+                        .get("confirmed")
+                        .and_then(|c| c.as_bool())
+                        .unwrap_or(false);
+                    let text = if confirmed {
+                        format!(
+                            "Done — {} is now {}.",
+                            name,
+                            v.get("observed_state")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("changed")
+                        )
+                    } else {
+                        format!(
+                            "The command was sent to {} but I couldn't confirm the state changed. {}",
+                            name,
+                            v.get("detail").and_then(|d| d.as_str()).unwrap_or("")
+                        )
+                    };
+                    emit(tx, "delta", json!({"text": text}));
+                    emit(
+                        tx,
+                        "tool",
+                        json!({"name": "control_light", "status": "done",
+                            "detail": v.get("detail")}),
+                    );
+                    save_message(state, cid, "assistant", &text).await;
+                }
+                Err(e) => {
+                    let text = format!("I couldn't do that: {e}");
+                    emit(tx, "delta", json!({"text": text}));
+                    save_message(state, cid, "assistant", &text).await;
+                }
+            }
+            emit(tx, "done", json!({"conversation_id": cid}));
+            return;
+        }
+        Ok(Some(fastpath::FastPath::CurrentTime)) => {
+            let tz = state.timezone().await.unwrap_or(jiff::tz::TimeZone::UTC);
+            let z = jiff::Timestamp::now().to_zoned(tz);
+            let text = format!("It's {}.", z.strftime("%A %Y-%m-%d %H:%M %Z"));
+            emit(tx, "delta", json!({"text": text}));
+            save_message(state, cid, "assistant", &text).await;
+            emit(tx, "done", json!({"conversation_id": cid}));
+            return;
+        }
+        _ => {}
+    }
+
+    // --- model path ------------------------------------------------------
+    let (provider, row) = match load_provider_checked(state).await {
+        Ok(v) => v,
+        Err(e) => {
+            emit(tx, "error", json!({"message": e.to_string()}));
+            emit(tx, "done", json!({"conversation_id": cid}));
+            return;
         }
     };
-    save_message(&state, &conv_id, "user", &message).await;
-
-    let user_c = user.clone();
-    let cid = conv_id.clone();
-    let stream = async_stream::stream! {
-        let emit = |kind: &str, data: Value| {
-            Ok(Event::default().event(kind).data(data.to_string()))
+    let messages = build_messages(state, user, cid, message).await;
+    let ctx = ToolCtx { state, user };
+    let mut history = messages;
+    let mut final_text = String::new();
+    for _round in 0..MAX_TOOL_ROUNDS {
+        let req = ChatRequest {
+            messages: history.clone(),
+            tools: if provider.capabilities().tools {
+                tools::specs()
+            } else {
+                vec![]
+            },
         };
-        // --- deterministic fast path ------------------------------------
-        match fastpath::parse(&state, &message).await {
-            Ok(Some(fastpath::FastPath::LightCommand { entity_id, name, action })) => {
-                yield emit("tool", json!({"name": "control_light", "status": "executing",
-                    "detail": format!("{action} {name}")}));
-                match execute_light(&state, &user_c, &entity_id, &action, None).await {
-                    Ok(v) => {
-                        let confirmed = v.get("confirmed").and_then(|c| c.as_bool()).unwrap_or(false);
-                        let text = if confirmed {
-                            format!("Done — {} is now {}.", name,
-                                v.get("observed_state").and_then(|s| s.as_str()).unwrap_or("changed"))
-                        } else {
-                            format!("The command was sent to {} but I couldn't confirm the state changed. {}",
-                                name, v.get("detail").and_then(|d| d.as_str()).unwrap_or(""))
-                        };
-                        yield emit("delta", json!({"text": text}));
-                        yield emit("tool", json!({"name": "control_light", "status": "done",
-                            "detail": v.get("detail")}));
-                        save_message(&state, &cid, "assistant", &text).await;
-                    }
-                    Err(e) => {
-                        let text = format!("I couldn't do that: {e}");
-                        yield emit("delta", json!({"text": text}));
-                        save_message(&state, &cid, "assistant", &text).await;
-                    }
+        let mut stream = provider.chat(req);
+        let mut round_text = String::new();
+        let mut calls: Vec<crate::providers::ToolCall> = Vec::new();
+        let mut failed: Option<String> = None;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                ChatEvent::Text(t) => {
+                    round_text.push_str(&t);
+                    emit(tx, "delta", json!({"text": t}));
                 }
-                yield emit("done", json!({"conversation_id": cid}));
-                return;
+                ChatEvent::ToolCall(c) => calls.push(c),
+                ChatEvent::Done => break,
+                ChatEvent::Failed(msg) => {
+                    failed = Some(msg);
+                    break;
+                }
             }
-            Ok(Some(fastpath::FastPath::CurrentTime)) => {
-                let tz = state.timezone().await.unwrap_or(jiff::tz::TimeZone::UTC);
-                let z = jiff::Timestamp::now().to_zoned(tz);
-                let text = format!("It's {}.", z.strftime("%A %Y-%m-%d %H:%M %Z"));
-                yield emit("delta", json!({"text": text}));
-                save_message(&state, &cid, "assistant", &text).await;
-                yield emit("done", json!({"conversation_id": cid}));
-                return;
-            }
-            _ => {}
         }
-
-        // --- model path ---------------------------------------------------
-        let (provider, row) = match load_provider_checked(&state).await {
-            Ok(v) => v,
-            Err(e) => {
-                yield emit("error", json!({"message": e.to_string()}));
-                yield emit("done", json!({"conversation_id": cid}));
-                return;
+        if let Some(msg) = failed {
+            emit(
+                tx,
+                "error",
+                json!({"message": format!("provider error: {msg}")}),
+            );
+            emit(tx, "done", json!({"conversation_id": cid}));
+            if !round_text.is_empty() {
+                save_message(state, cid, "assistant", &round_text).await;
             }
-        };
-        let messages = build_messages(&state, &user_c, &cid, &message).await;
-        let ctx = ToolCtx { state: &state, user: &user_c };
-        let mut history = messages;
-        let mut final_text = String::new();
-        for _round in 0..MAX_TOOL_ROUNDS {
-            let req = ChatRequest {
-                messages: history.clone(),
-                tools: if provider.capabilities().tools { tools::specs() } else { vec![] },
-            };
-            let mut stream = provider.chat(req);
-            let mut round_text = String::new();
-            let mut calls: Vec<crate::providers::ToolCall> = Vec::new();
-            let mut failed: Option<String> = None;
-            while let Some(ev) = stream.next().await {
-                match ev {
-                    ChatEvent::Text(t) => {
-                        round_text.push_str(&t);
-                        yield emit("delta", json!({"text": t}));
-                    }
-                    ChatEvent::ToolCall(c) => calls.push(c),
-                    ChatEvent::Done => break,
-                    ChatEvent::Failed(msg) => {
-                        failed = Some(msg);
-                        break;
-                    }
-                }
-            }
-            if let Some(msg) = failed {
-                yield emit("error", json!({"message": format!("provider error: {msg}")}));
-                yield emit("done", json!({"conversation_id": cid}));
-                if !round_text.is_empty() {
-                    save_message(&state, &cid, "assistant", &round_text).await;
-                }
-                return;
-            }
-            if calls.is_empty() {
-                final_text = round_text;
-                break;
-            }
-            history.push(ChatMessage::assistant(round_text.clone(), calls.clone()));
-            for call in calls {
-                yield emit("tool", json!({
+            return;
+        }
+        if calls.is_empty() {
+            final_text = round_text;
+            break;
+        }
+        history.push(ChatMessage::assistant(round_text.clone(), calls.clone()));
+        for call in calls {
+            emit(
+                tx,
+                "tool",
+                json!({
                     "name": call.name, "status": "executing",
                     "detail": call.arguments.to_string().chars().take(160).collect::<String>(),
-                }));
-                let out = tools::dispatch(&ctx, &call).await;
-                let ok = out.for_model.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                yield emit("tool", json!({
+                }),
+            );
+            let out = tools::dispatch(&ctx, &call).await;
+            let ok = out
+                .for_model
+                .get("ok")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            emit(
+                tx,
+                "tool",
+                json!({
                     "name": call.name,
                     "status": if ok { "done" } else { "failed" },
                     "detail": out.for_model.to_string().chars().take(240).collect::<String>(),
-                }));
-                if let Some(ui) = out.ui {
-                    yield emit("ui", ui);
-                }
-                history.push(ChatMessage::tool(
-                    call.id,
-                    out.for_model.to_string().chars().take(4000).collect(),
-                ));
+                }),
+            );
+            if let Some(ui) = out.ui {
+                emit(tx, "ui", ui);
             }
+            history.push(ChatMessage::tool(
+                call.id,
+                out.for_model.to_string().chars().take(4000).collect(),
+            ));
         }
-        if !final_text.is_empty() {
-            save_message(&state, &cid, "assistant", &final_text).await;
-        }
-        yield emit("done", json!({"conversation_id": cid, "provider": row.label, "model": row.model}));
-    };
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20))))
+    }
+    if !final_text.is_empty() {
+        save_message(state, cid, "assistant", &final_text).await;
+    }
+    emit(
+        tx,
+        "done",
+        json!({"conversation_id": cid, "provider": row.label, "model": row.model}),
+    );
 }
 
-async fn save_message(state: &Arc<AppState>, conv_id: &str, role: &str, content: &str) {
+pub async fn save_message(state: &Arc<AppState>, conv_id: &str, role: &str, content: &str) {
     let _ = state
         .db
         .exec(
@@ -287,32 +367,15 @@ async fn load_provider_checked(
 ) -> Result<(Arc<dyn providers::ChatProvider>, providers::ProviderRow), ApiError> {
     let (provider, row) = providers::load_provider(&state.db, state.http.clone(), None).await?;
     let strict = state.get_setting("privacy_mode").await?.as_deref() == Some("strict_local");
-    if strict {
+    if strict && !providers::base_is_local(&row.base_url) {
         let host = reqwest::Url::parse(&row.base_url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()))
             .unwrap_or_default();
-        let local = host == "localhost"
-            || host == "::1"
-            || host.starts_with("127.")
-            || host.starts_with("10.")
-            || host.starts_with("192.168.")
-            || host.starts_with("169.254.")
-            || host.starts_with("172.16.")
-            || host.starts_with("172.17.")
-            || host.starts_with("172.18.")
-            || host.starts_with("172.19.")
-            || host.starts_with("172.2")
-            || host.starts_with("172.30.")
-            || host.starts_with("172.31.")
-            || host.ends_with(".local")
-            || !host.contains('.');
-        if !local {
-            return Err(ApiError::Forbidden(format!(
-                "strict-local mode blocks cloud egress — provider '{}' ({}) is not a local endpoint",
-                row.label, host
-            )));
-        }
+        return Err(ApiError::Forbidden(format!(
+            "strict-local mode blocks cloud egress — provider '{}' ({}) is not a local endpoint",
+            row.label, host
+        )));
     }
     Ok((provider, row))
 }

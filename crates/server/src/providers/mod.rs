@@ -162,6 +162,101 @@ pub async fn load_provider_rows(db: &Db) -> Result<Vec<ProviderRow>, ApiError> {
     .await
 }
 
+/// True when a base URL points at a loopback/private/link-local host.
+/// Used by strict-local privacy mode to decide whether egress is allowed.
+pub fn base_is_local(base_url: &str) -> bool {
+    let host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_default();
+    host == "localhost"
+        || host == "::1"
+        || host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
+        || host.starts_with("172.16.")
+        || host.starts_with("172.17.")
+        || host.starts_with("172.18.")
+        || host.starts_with("172.19.")
+        || host.starts_with("172.2")
+        || host.starts_with("172.30.")
+        || host.starts_with("172.31.")
+        || host.ends_with(".local")
+        || !host.contains('.')
+}
+
+/// Speech-to-text against an OpenAI-compatible `/audio/transcriptions`
+/// endpoint. Works for `openai_responses` rows (api.openai.com) and any
+/// compatible local server (e.g. faster-whisper, whisper.cpp OpenAI shim).
+/// Returns an honest error when the endpoint doesn't support it.
+pub async fn transcribe_wav(
+    db: &Db,
+    http: reqwest::Client,
+    wav: Vec<u8>,
+) -> Result<String, ApiError> {
+    let rows = load_provider_rows(db).await?;
+    let row = rows
+        .iter()
+        .find(|r| r.enabled && r.is_default)
+        .or_else(|| rows.iter().find(|r| r.enabled))
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::NotConfigured("no AI provider configured for speech-to-text".into())
+        })?;
+    let key = secret_for(db, &row.secret_name).await?.unwrap_or_default();
+    let stt_model = match row.kind.as_str() {
+        "openai_responses" => "whisper-1".to_string(),
+        _ => row.model.clone(),
+    };
+    let url = format!(
+        "{}/audio/transcriptions",
+        row.base_url.trim_end_matches('/')
+    );
+    let part = reqwest::multipart::Part::bytes(wav)
+        .file_name("utterance.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| ApiError::internal_msg(format!("multipart: {e}")))?;
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("model", stt_model);
+    let mut req = http
+        .post(&url)
+        .timeout(Duration::from_secs(row.timeout_secs.max(30)))
+        .multipart(form);
+    if !key.is_empty() {
+        req = req.bearer_auth(key);
+    }
+    let res = req
+        .send()
+        .await
+        .map_err(|e| ApiError::internal_msg(format!("stt request failed: {e}")))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(ApiError::internal_msg(format!(
+            "stt endpoint returned {status}: {}",
+            body.chars().take(300).collect::<String>()
+        )));
+    }
+    let v: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| ApiError::internal_msg(format!("stt response: {e}")))?;
+    let text = v
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return Err(ApiError::internal_msg(
+            "stt endpoint returned an empty transcript",
+        ));
+    }
+    Ok(text)
+}
+
 async fn secret_for(db: &Db, name: &Option<String>) -> Result<Option<String>, ApiError> {
     match name {
         Some(n) => {

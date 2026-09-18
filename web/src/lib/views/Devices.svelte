@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { get, post } from '../api';
+  import { get, post, del } from '../api';
   import { session } from '../session.svelte';
   import type { Entity } from '../types';
 
@@ -60,6 +60,52 @@
       busy = '';
     }
   }
+
+  // ---------- satellites ----------
+
+  interface Satellite {
+    id: string;
+    name: string;
+    paired_at: number;
+    last_seen: number | null;
+    revoked: boolean;
+  }
+  let satellites = $state<Satellite[]>([]);
+  let pairCode = $state('');
+  let pairExpires = $state(0);
+
+  async function loadSatellites() {
+    try {
+      const res = await get<{ satellites: Satellite[] }>('/api/satellites');
+      satellites = res.satellites;
+    } catch { /* satellites are best-effort */ }
+  }
+
+  async function mintCode() {
+    error = '';
+    try {
+      const res = await post<{ code: string; expires_at: number }>(
+        '/api/satellites/pairing-code',
+        {}
+      );
+      pairCode = res.code;
+      pairExpires = res.expires_at;
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function revokeSat(id: string) {
+    error = '';
+    try {
+      await del(`/api/satellites/${encodeURIComponent(id)}`);
+      await loadSatellites();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  onMount(() => void loadSatellites());
 </script>
 
 <h2>Devices</h2>
@@ -116,3 +162,43 @@
     </p>
   </div>
 {/if}
+
+<h2 style="margin-top:2rem">Voice satellites</h2>
+<div class="panel">
+  <p class="dim small" style="margin-top:0">
+    Pair a Windows PC running <code>adrian-satellite</code>. Generate a code, then on
+    that PC run:
+    <code>adrian-satellite pair --server {location.origin} --code &lt;code&gt;</code>
+  </p>
+  {#if isOwner}
+    <div class="row">
+      <button class="small" onclick={mintCode}>Generate pairing code</button>
+      {#if pairCode}
+        <span class="chip ok" style="font-size:1.2rem; letter-spacing:.15em">{pairCode}</span>
+        <span class="dim small">expires {new Date(pairExpires * 1000).toLocaleTimeString()}</span>
+      {/if}
+    </div>
+  {/if}
+  {#if satellites.length === 0}
+    <p class="dim small">No satellites paired yet.</p>
+  {:else}
+    <table style="margin-top:.6rem">
+      <thead><tr><th>Name</th><th>Paired</th><th>Last seen</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        {#each satellites as s (s.id)}
+          <tr>
+            <td>{s.name}</td>
+            <td class="small">{new Date(s.paired_at * 1000).toLocaleString()}</td>
+            <td class="small">{s.last_seen ? new Date(s.last_seen * 1000).toLocaleString() : 'never'}</td>
+            <td><span class="chip {s.revoked ? 'err' : 'ok'}">{s.revoked ? 'revoked' : 'active'}</span></td>
+            <td>
+              {#if isOwner && !s.revoked}
+                <button class="small ghost" onclick={() => revokeSat(s.id)}>Revoke</button>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  {/if}
+</div>

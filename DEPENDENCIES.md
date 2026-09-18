@@ -37,8 +37,18 @@ serde, serde_json, thiserror only.
 
 ## Rust — satellite (`crates/satellite`)
 
-Stub: no external dependencies yet (native audio/wake-word arrives in the
-voice gate; planned: `cpal`, `tray-icon`).
+| Package | Version | Role |
+|---|---|---|
+| tokio | 1.53 | async runtime |
+| reqwest | 0.13 | utterance transport to the server |
+| serde / serde_json | 1 | config + wire types |
+| tracing / tracing-subscriber | 0.1 / 0.3 | logging |
+| anyhow | 1.0 | error handling |
+| cpal | 0.16 | microphone capture |
+| hound | 3.5 | WAV encoding |
+| tts | 0.26 | local speech synthesis (SAPI on Windows) |
+| global-hotkey | 0.7 | push-to-talk key (Ctrl+Alt+Space) |
+| directories | 6.0 | per-user config dir resolution |
 
 ## npm — frontend (`web/`)
 

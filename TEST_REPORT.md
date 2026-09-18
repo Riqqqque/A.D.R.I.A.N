@@ -1,6 +1,6 @@
-# Test report — Gate A
+# Test report — Gate A + early Gate B
 
-**Commit:** `1529f82`
+**Commits:** `1529f82` … `de88194`+ (see `git log`; this file is amended into the satellite commit)
 **Date:** 2026-09-17
 **OS/Hardware:** Windows 11 (x86_64), MSVC Build Tools 2022 (14.44), local dev machine
 **Toolchain:** rustc/cargo 1.94.1 stable-msvc · Node 24.12.0 · bundled SQLite 3.53.2
@@ -16,10 +16,10 @@ reproducible with the commands shown).
 |---|---|---|---|---|---|
 | A-FMT | `cargo fmt --all --check` | clean | clean | toolchain output | PASS |
 | A-CLIPPY | `cargo clippy --workspace` | 0 warnings | 0 warnings | toolchain output | PASS |
-| A-UNIT | `cargo test --workspace` | all pass | 16/16 pass (2 protocol, 11 server lib, 3 HTTP integration) | toolchain output | PASS |
-| A-FE-CHECK | `cd web && npm run check` | 0 errors | 0 errors, 30 `a11y_label_has_associated_control` warnings (cosmetic — labels adjacent to inputs, unassociated) | svelte-check output | PASS (with warnings noted) |
+| A-UNIT | `cargo test --workspace` | all pass | 22/22 pass (2 protocol, 15 server lib, 5 HTTP integration) | toolchain output | PASS |
+| A-FE-CHECK | `cd web && npm run check` | 0 errors, 0 warnings | 0 errors, 0 warnings (a11y warnings from previous report all fixed — controls wrapped in labels) | svelte-check output | PASS |
 | A-FE-BUILD | `cd web && npm run build` | static output emitted | `web/build/index.html` + `_app/` written | build log | PASS |
-| A-SAT-BUILD | `cargo check -p adrian-satellite` | compiles | compiles (stub) | toolchain output | PASS |
+| A-SAT-BUILD | `cargo check -p adrian-satellite` | compiles | compiles (real client: cpal mic, global-hotkey PTT, reqwest transport, tts output) | toolchain output | PASS |
 
 ## Gate A behavior
 
@@ -41,6 +41,13 @@ reproducible with the commands shown).
 | A-PROV-TIMEOUT | provider pointed at `127.0.0.1:1`, `POST …/test` | bounded failure | `ok:false, upstream error …` in ~2s, server healthy | live curl | PASS |
 | A-TOOL-POLICY | light command path validation | domain+allowlist+action+range checks | enforced in `tools::control_light_inner`/`execute_light` (bad action, unallowlisted entity, brightness>100 all rejected); no unrestricted `call_service` route exists | code review — HA cannot be exercised without an instance | PARTIAL — logic verified by inspection, real HA path NOT RUN |
 | A-INJECTION | tool-call args from model are re-validated | policy applied server-side | same validation functions run for model tool calls and UI calls (shared `execute_light`) | code inspection | PASS (design); live injection-vs-provider N/R — needs real model |
+| A-CHAT-HIST | `GET /api/chat/conversations` + `/{id}` | owner-scoped list + history | conversations list with last message; history returns ordered messages; cross-user id → 404 | live curl + code | PASS |
+| A-RECONCILE | crash while recurring alarm `ringing` | rescheduled, not killed | interrupted delivery marked failed; one-shot → `done`; recurring → next occurrence persisted; no duplicate delivery row | integration test | PASS |
+| A-RATELIMIT | >10 login attempts/min/IP | 429 lockout | limiter trips at threshold, recovers after window | unit test | PASS |
+| B-PAIR | `POST /api/satellites/pairing-code` → `POST /api/satellite/pair` | one-use code → device token | 6-digit code minted (5-min expiry); satellite redeemed → `sat_*` token + id; **code reuse → 403**; satellite CLI `pair` + `status` verified | integration test `satellite_pair_status_and_revoke` + live server | PASS |
+| B-AUTH | utterance/status with wrong or revoked token | 401 | bogus token → 401; after `DELETE /api/satellites/{id}` the token → 401 | integration test + live curl | PASS |
+| B-UTTER | WAV POST → transcribe → assistant turn → reply text | full pipeline | mock local STT (`/v1/audio/transcriptions`) returned "what time is it"; reply "It's Friday … UTC"; conversation persisted + `conversation_id` continuity honored | live server + mock STT | PASS (real whisper STT N/R — see N-9) |
+| B-STRICT | strict_local + cloud STT base | refusal before egress | cloud base URL → 403 `strict-local … needs a local STT endpoint` | code path shared with A-EGRESS | PASS (same check) |
 
 ## Not run / skipped — needs real external resources
 
@@ -50,17 +57,23 @@ reproducible with the commands shown).
 | N-2 | Real Home Assistant connect / entity import / real light command / real `media_player` alarm playback | no HA instance/token/hardware available → **NOT RUN** |
 | N-3 | Backup *restore* | backup file verified written; restore procedure not yet automated → **NOT RUN** |
 | N-4 | Prompt-injection resistance vs a live model | needs N-1 → **NOT RUN** (server-side policy is model-independent and shared) |
-| N-5 | Voice satellite: pairing, mic capture, wake word, PTT, STT, hot-unplug, pre-wake privacy, false-wake metrics | satellite crate is a stub by design; this gate is next → **NOT RUN** |
+| N-5 | Satellite wake word, hot-unplug behavior, pre-wake privacy, false-wake metrics | wake word not implemented (PTT only); hot-unplug and wake-word metrics need real mic sessions → **NOT RUN** |
+| N-9 | Real STT round-trip (OpenAI whisper / local whisper server) and real mic capture + TTS playback | pipeline verified against a mock local `/audio/transcriptions` endpoint; no real STT service or mic session exercised → **NOT RUN** |
+| N-10 | Satellite streaming session protocol (WS), tray UI, satellite-as-alarm-endpoint | not yet implemented → **NOT RUN** |
+| N-9 | Real STT round-trip (OpenAI whisper / local whisper server) and real mic capture + TTS playback | pipeline verified against a mock local `/audio/transcriptions` endpoint; no real STT service or mic session exercised → **NOT RUN** |
+| N-10 | Satellite streaming session protocol (WS), tray UI, satellite-as-alarm-endpoint | not yet implemented → **NOT RUN** |
 | N-6 | Browser smoke test of full UI flows | UI serves and all backing APIs verified via curl/integration tests; full click-through not instrumented → **SKIPPED** |
-| N-7 | Scheduler restart dedup while an alarm was `ringing` at shutdown | crash-mid-delivery reconciliation implemented (delivery row blocks refire, marks `missed_late`); no crash drill performed → **NOT RUN** |
-| N-8 | Rate-limiting lockout | limiter implemented (10/min/IP on login); lockout not exercised → **NOT RUN** |
+| N-7 | Scheduler restart dedup while an alarm was `ringing` at shutdown | covered by the reconcile integration test (delivery row blocks refire; recurring reschedules); no manual crash drill → **SUPERSEDED by A-RECONCILE** |
+| N-8 | Rate-limiting lockout | covered by unit test → **SUPERSEDED by A-RATELIMIT** |
 
 ## Known limitations
 
 - No real provider or Home Assistant credentials were available — every
   claim about those paths is code + unit/integration coverage only.
 - Secrets/database/backups are unencrypted at rest (see `docs/SECURITY.md`).
-- Satellite binary is a placeholder; no audio capture exists yet.
-- svelte-check reports 30 `a11y_label_has_associated_control` warnings.
+- Satellite is push-to-talk only: no wake word, no tray UI, no streaming
+  session protocol; mic capture and TTS output are compiled but not exercised
+  on real hardware in this report.
+- svelte-check reports 0 warnings (previous a11y findings fixed).
 - Windows Defender intermittently locked build artifacts during development;
   transient `os error 32`/`5` retries were needed (environmental, not a code issue).

@@ -176,6 +176,27 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     "#,
+    // v7 — native satellites: paired devices + one-use pairing codes
+    r#"
+    CREATE TABLE satellites (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        paired_at INTEGER NOT NULL,
+        last_seen INTEGER,
+        revoked INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX satellites_user ON satellites(user_id);
+
+    CREATE TABLE pairing_codes (
+        code TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+    );
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {

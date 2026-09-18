@@ -10,6 +10,7 @@ pub mod events;
 pub mod integrations;
 pub mod media;
 pub mod memory_api;
+pub mod satellites;
 pub mod settings;
 
 use crate::state::AppState;
@@ -24,6 +25,7 @@ pub fn routes() -> Router<AppState> {
         .merge(alarms::routes())
         .merge(endpoints::routes())
         .merge(chat::routes())
+        .merge(satellites::routes())
         .merge(events::routes())
         .merge(diagnostics::routes())
         .merge(media::routes())

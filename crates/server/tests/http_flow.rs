@@ -377,3 +377,136 @@ async fn backup_file_is_a_valid_database() {
         .unwrap();
     assert_eq!(tables, 3);
 }
+
+#[tokio::test]
+async fn satellite_pair_status_and_revoke() {
+    let h = harness().await;
+    let token = setup_token(&h.state.config.data_dir);
+    let (_, headers, body) = request(
+        &h.router,
+        "POST",
+        "/api/setup/claim",
+        Some(json!({"token": token, "username": "owner", "password": "password123", "timezone": "UTC"})),
+        None,
+        None,
+    )
+    .await;
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = body["csrf"].as_str().unwrap().to_string();
+
+    // Mint a pairing code (owner + CSRF).
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/satellites/pairing-code",
+        Some(json!({})),
+        Some(&cookie),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    let code = res["code"].as_str().unwrap().to_string();
+
+    // Redeem it — no session needed, the code is the credential.
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/satellite/pair",
+        Some(json!({"code": code, "name": "Test PC"})),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    let device_token = res["device_token"].as_str().unwrap().to_string();
+    let sat_id = res["satellite_id"].as_str().unwrap().to_string();
+    assert!(device_token.starts_with("sat_"));
+
+    // One-use: redeeming again is forbidden.
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/satellite/pair",
+        Some(json!({"code": code, "name": "Second PC"})),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{res}");
+
+    // Bearer-authed status check.
+    let bearer_req = |path: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .extension(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                40000,
+            ))))
+            .header(header::AUTHORIZATION, format!("Bearer {device_token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let res = h
+        .router
+        .clone()
+        .oneshot(bearer_req("/api/satellite/status"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Device list shows the paired satellite.
+    let (s, _, res) = request(
+        &h.router,
+        "GET",
+        "/api/satellites",
+        None,
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(res["satellites"][0]["id"].as_str().unwrap(), sat_id);
+
+    // Utterance with a wrong token is rejected before touching providers.
+    let bad = Request::builder()
+        .method("POST")
+        .uri("/api/satellite/utterance")
+        .extension(ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))))
+        .header(header::AUTHORIZATION, "Bearer bogus")
+        .header(header::CONTENT_TYPE, "audio/wav")
+        .body(Body::from(vec![0u8; 1024]))
+        .unwrap();
+    let res = h.router.clone().oneshot(bad).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // Revoke, then the token must be dead.
+    let (s, _, res) = request(
+        &h.router,
+        "DELETE",
+        &format!("/api/satellites/{sat_id}"),
+        None,
+        Some(&cookie),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    let res = h
+        .router
+        .clone()
+        .oneshot(bearer_req("/api/satellite/status"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}

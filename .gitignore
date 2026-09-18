@@ -8,3 +8,4 @@ data/
 *.db-wal
 SETUP_TOKEN.txt
 server-run.log
+.tmp/

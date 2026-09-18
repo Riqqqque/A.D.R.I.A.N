@@ -5,11 +5,11 @@ provider chat with typed tools, Home Assistant light control, durable memory,
 and alarms that fire on configured audio endpoints — all backed by a local
 SQLite database.
 
-**Status: Gate A preview.** The server, web UI, provider adapters, Home
-Assistant integration, memory, and alarm scheduler are implemented and tested.
-The native Windows voice satellite is a stub — wake word, microphone capture,
-and STT arrive in the next gate. See `TEST_REPORT.md` for what is actually
-verified versus skipped.
+**Status: Gate A preview + early Gate B.** The server, web UI, provider
+adapters, Home Assistant integration, memory, alarm scheduler, and the
+satellite pairing + push-to-talk voice path are implemented and tested.
+Still unbuilt: local wake word, tray UI, and satellite-side alarm audio.
+See `TEST_REPORT.md` for what is actually verified versus skipped.
 
 ## Requirements
 
@@ -52,6 +52,31 @@ Then, in the UI:
   other users.
 - **System** — diagnostics, action ledger, settings, online backup.
 
+## Voice satellite (Windows)
+
+```sh
+cargo build --release -p adrian-satellite
+
+# In the web UI: Devices → Voice satellites → Generate pairing code
+.\target\release\adrian-satellite.exe pair --server http://127.0.0.1:8787 --code 123456 --name "Desk PC"
+.\target\release\adrian-satellite.exe run      # hold Ctrl+Alt+Space, speak, release
+.\target\release\adrian-satellite.exe status   # verify the device token
+.\target\release\adrian-satellite.exe say "test"  # verify speech output
+```
+
+How it works: the satellite captures microphone audio while the hotkey is
+held, POSTs the WAV to `/api/satellite/utterance` with its device token, and
+the server transcribes it via the configured provider's OpenAI-compatible
+`/audio/transcriptions` endpoint (works against OpenAI or a local whisper
+server), runs the normal assistant turn, and returns reply text which the
+satellite speaks locally (SAPI on Windows). Pairing codes are one-use and
+expire in 5 minutes; device tokens are sha256-hashed at rest and revocable
+from the Devices page. Strict-local privacy mode blocks cloud STT egress.
+
+Honest limits: push-to-talk only (no wake word yet), one utterance per
+request (no streaming session protocol yet), and satellite audio output is
+local TTS — satellites are not yet alarm playback endpoints.
+
 ## Configuration
 
 | Env var | Default | Meaning |
@@ -70,7 +95,7 @@ proxy. See `docs/SECURITY.md` for the security model and honest limitations
 ```
 crates/protocol   shared wire types for server <-> satellite
 crates/server     axum HTTP API + SQLite worker + providers + HA + scheduler
-crates/satellite  native Windows voice satellite (stub — next gate)
+crates/satellite  native Windows voice satellite (push-to-talk, SAPI output)
 web/              SvelteKit SPA, statically built, served by the server
 ```
 
