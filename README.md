@@ -9,8 +9,9 @@ SQLite database.
 
 **Status: Gate A preview + early Gate B.** The server, web UI, provider
 adapters, Home Assistant integration, memory, alarm scheduler, and the
-satellite pairing + push-to-talk voice path are implemented and tested.
-Still unbuilt: local wake word, tray UI, and satellite-side alarm audio.
+satellite pairing, streaming voice sessions, satellite alarm playback, tray
+UI, and backup restore are implemented and tested. Wake word is implemented
+behind an opt-in feature + local model file (see below).
 See `TEST_REPORT.md` for what is actually verified versus skipped.
 
 ## Requirements
@@ -52,7 +53,9 @@ Then, in the UI:
   UI confirms and do not need the model or internet at due time.
 - **Memory** — save/search/edit/delete facts. Private facts are invisible to
   other users.
-- **System** — diagnostics, action ledger, settings, online backup.
+- **System** — diagnostics, action ledger, settings, online backup +
+  owner-only in-place restore (`POST /api/diagnostics/restore`, keeps a
+  `.pre-restore` copy and rolls back on failure).
 
 ## Voice satellite (Windows)
 
@@ -66,18 +69,36 @@ cargo build --release -p adrian-satellite
 .\target\release\adrian-satellite.exe say "test"  # verify speech output
 ```
 
-How it works: the satellite captures microphone audio while the hotkey is
-held, POSTs the WAV to `/api/satellite/utterance` with its device token, and
-the server transcribes it via the configured provider's OpenAI-compatible
-`/audio/transcriptions` endpoint (works against OpenAI or a local whisper
-server), runs the normal assistant turn, and returns reply text which the
-satellite speaks locally (SAPI on Windows). Pairing codes are one-use and
-expire in 5 minutes; device tokens are sha256-hashed at rest and revocable
-from the Devices page. Strict-local privacy mode blocks cloud STT egress.
+How it works: the satellite keeps a persistent websocket session
+(`GET /api/satellite/session`, bearer device token). While the hotkey is
+held — or after a wake-word detection — PCM audio streams to the server as
+binary frames between `AudioSessionStart`/`AudioSessionEnd` envelopes
+(`crates/protocol`, versioned JSON). The server transcribes via the
+configured provider's OpenAI-compatible `/audio/transcriptions` endpoint
+(OpenAI or a local whisper server), runs the normal assistant turn, and
+pushes a `Speak` message back; the satellite plays fetched media or speaks
+reply text locally (SAPI on Windows). The session also carries alarm
+playback: a satellite can be added as an audio endpoint (Endpoints page)
+and the scheduler pushes `Speak` + waits for the playback ack. Offline
+satellites record a `failed` delivery, never a silent miss.
 
-Honest limits: push-to-talk only (no wake word yet), one utterance per
-request (no streaming session protocol yet), and satellite audio output is
-local TTS — satellites are not yet alarm playback endpoints.
+Pairing codes are one-use, rate-limited, and expire in 5 minutes; device
+tokens are sha256-hashed at rest and revocable from the Devices page.
+Strict-local privacy mode blocks cloud STT egress. A tray icon (Windows)
+shows connection/mic state and a Quit menu; losing the mic (hot-unplug)
+re-initializes the default device instead of killing the client.
+
+Wake word (opt-in): build with `cargo build --release -p adrian-satellite
+--features wake-word` and set `wake_word.model_path` (a rustpotter `.rpw`
+model, e.g. built with `rustpotter-cli` from a few recordings) plus an
+optional `threshold` in `%APPDATA%drian\satellite\config.json`.
+Spotting is fully local on a 2-second rolling buffer; detection opens a
+capture that auto-endpoints on ~0.9 s of trailing silence. Note: the
+feature pulls the candle ML stack. No model ships with the repo, so this
+path is compiled but not exercised on hardware in the test report.
+
+Fallback: the one-shot WAV path `POST /api/satellite/utterance` remains for
+simple integrations.
 
 ## Configuration
 

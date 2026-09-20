@@ -18,6 +18,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/health", get(health))
         .route("/api/diagnostics", get(diagnostics))
         .route("/api/diagnostics/backup", post(backup))
+        .route("/api/diagnostics/restore", post(restore))
         .route("/api/diagnostics/ledger", get(ledger))
 }
 
@@ -117,6 +118,51 @@ async fn backup(user: AuthUser, State(s): State<AppState>) -> Result<Json<Value>
         "backup": dest.display().to_string(),
         "note": "backup contains local state; verify a restore before relying on it",
     })))
+}
+
+/// Restore the live database from a file inside `<data>/backups`. Owner
+/// only, CSRF-guarded like every mutating session route. The filename must
+/// be a bare name (no path separators) — restore never reads outside the
+/// backups directory. On success the pre-restore database is kept as
+/// `<db>.pre-restore`; the caller's session may be invalidated if the
+/// restored database predates it.
+async fn restore(
+    user: AuthUser,
+    State(s): State<AppState>,
+    Json(b): Json<RestoreBody>,
+) -> Result<Json<Value>, ApiError> {
+    user.require_owner()?;
+    let name = b.file.trim();
+    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") || name.len() > 200 {
+        return Err(ApiError::BadRequest(
+            "file must be a backup filename inside the backups directory".into(),
+        ));
+    }
+    let path = s.config.data_dir.join("backups").join(name);
+    if !path.is_file() {
+        return Err(ApiError::NotFound(format!("backup '{name}'")));
+    }
+    s.db.restore_from(&path).await?;
+    s.audit(
+        Some(user.id),
+        "user",
+        "diagnostics.restore",
+        name,
+        &json!({}),
+        "ok",
+        "database restored from backup",
+    )
+    .await;
+    Ok(Json(json!({
+        "ok": true,
+        "restored": name,
+        "note": "database replaced; a copy of the previous db was kept as <db>.pre-restore — sign back in if your session predates the backup",
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct RestoreBody {
+    file: String,
 }
 
 async fn ledger(user: AuthUser, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {

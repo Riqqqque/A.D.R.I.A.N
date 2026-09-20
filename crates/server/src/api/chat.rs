@@ -381,11 +381,7 @@ async fn load_provider_checked(
 }
 
 /// System prompt + recent history + relevant permitted memory context.
-async fn build_messages(
-    state: &Arc<AppState>,
-    user: &AuthUser,
-    conv_id: &str,
-) -> Vec<ChatMessage> {
+async fn build_messages(state: &Arc<AppState>, user: &AuthUser, conv_id: &str) -> Vec<ChatMessage> {
     let settings = state.get_settings().await.unwrap_or_default();
     let name = settings
         .get("assistant_name")

@@ -55,6 +55,7 @@ struct CreateBody {
     name: String,
     kind: String,
     entity_id: Option<String>,
+    satellite_id: Option<String>,
 }
 
 async fn create(
@@ -81,6 +82,23 @@ async fn create(
                 "browser endpoints are created from the browser itself — use 'Enable alarm audio on this device'"
                     .into(),
             ));
+        }
+        "satellite" => {
+            let sat_id = b.satellite_id.as_deref().unwrap_or("").trim().to_string();
+            let exists =
+                s.db.q1(
+                    "SELECT 1 FROM satellites WHERE id = ?1 AND user_id = ?2 AND revoked = 0",
+                    vec![P::T(sat_id.clone()), P::I(user.id)],
+                    |r| r.get::<_, i64>(0),
+                )
+                .await?
+                .is_some();
+            if !exists {
+                return Err(ApiError::BadRequest(
+                    "satellite_id must be a paired, unrevoked satellite of yours".into(),
+                ));
+            }
+            ("satellite", json!({"satellite_id": sat_id}))
         }
         other => {
             return Err(ApiError::BadRequest(format!(
@@ -156,6 +174,38 @@ async fn test(
                 Err(e) => Ok(Json(json!({"ok": false, "detail": e.to_string()}))),
             }
         }
+        "satellite" => {
+            let sat_id = cfg
+                .get("satellite_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let delivery = util::new_id();
+            let mut env = adrian_protocol::Envelope::new(adrian_protocol::Message::Speak {
+                media_url: format!("/media/{token}"),
+                text: Some(format!("Test — {name}")),
+            });
+            env.request_id = delivery.clone();
+            // Arm before sending so a fast ack cannot be missed.
+            let ack = s.audio.arm_ack(&delivery);
+            match s.satellites.send(&sat_id, &env) {
+                Ok(()) => match s.audio.await_ack(ack, Duration::from_secs(20)).await {
+                    Ok((true, d)) => Ok(Json(json!({"ok": true, "detail": d}))),
+                    Ok((false, d)) => Ok(Json(json!({
+                        "ok": false,
+                        "detail": format!("satellite reported failure: {d}"),
+                    }))),
+                    Err(e) => Ok(Json(json!({
+                        "ok": false,
+                        "detail": format!("no playback ack from the satellite: {e}"),
+                    }))),
+                },
+                Err(e) => Ok(Json(json!({
+                    "ok": false,
+                    "detail": format!("satellite is not connected: {e}"),
+                }))),
+            }
+        }
         "browser" => {
             let channel = cfg.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
             let delivery = util::new_id();
@@ -167,7 +217,7 @@ async fn test(
             };
             s.audio.send_to_channel(channel, &cmd)?;
             match s.audio.wait_ack(&delivery, Duration::from_secs(20)).await {
-                Ok(result) => Ok(Json(json!({"ok": true, "detail": result}))),
+                Ok((_, result)) => Ok(Json(json!({"ok": true, "detail": result}))),
                 Err(e) => Ok(Json(json!({
                     "ok": false,
                     "detail": format!("no playback ack from the browser: {e}"),

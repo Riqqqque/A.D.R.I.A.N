@@ -828,13 +828,12 @@ async fn deliver(state: &AppState, alarm: AlarmRow, delivery_id: String, occurre
                     alarm.label.clone()
                 },
             };
+            // Arm the ack waiter before dispatching so a fast client ack
+            // cannot land between send and wait.
+            let ack = state.audio.arm_ack(&delivery_id);
             match state.audio.send_to_channel(&channel, &cmd) {
-                Ok(()) => match state
-                    .audio
-                    .wait_ack(&delivery_id, Duration::from_secs(20))
-                    .await
-                {
-                    Ok(result) => (
+                Ok(()) => match state.audio.await_ack(ack, Duration::from_secs(20)).await {
+                    Ok((_, result)) => (
                         "played".into(),
                         format!("played on browser endpoint '{ep_name}' ({result}){late_note}"),
                     ),
@@ -844,6 +843,55 @@ async fn deliver(state: &AppState, alarm: AlarmRow, delivery_id: String, occurre
                     ),
                 },
                 Err(e) => ("failed".into(), format!("browser channel unavailable: {e}")),
+            }
+        }
+        "satellite" => {
+            let sat_id = cfg
+                .get("satellite_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if sat_id.is_empty() {
+                (
+                    "failed".into(),
+                    format!("endpoint '{ep_name}' has no satellite_id"),
+                )
+            } else {
+                // Push playback over the live session; the satellite fetches
+                // the tokenized media URL and acks with request_id=delivery.
+                let mut env = adrian_protocol::Envelope::new(adrian_protocol::Message::Speak {
+                    media_url: format!("/media/{token}"),
+                    text: Some(if alarm.label.is_empty() {
+                        "Alarm".into()
+                    } else {
+                        alarm.label.clone()
+                    }),
+                });
+                env.request_id = delivery_id.clone();
+                env.idempotency_key = Some(delivery_id.clone());
+                let ack = state.audio.arm_ack(&delivery_id);
+                match state.satellites.send(&sat_id, &env) {
+                    Ok(()) => match state.audio.await_ack(ack, Duration::from_secs(20)).await {
+                        Ok((true, result)) => (
+                            "played".into(),
+                            format!(
+                                "played on satellite endpoint '{ep_name}' ({result}){late_note}"
+                            ),
+                        ),
+                        Ok((false, result)) => (
+                            "failed".into(),
+                            format!("satellite playback failed: {result}"),
+                        ),
+                        Err(e) => (
+                            "failed".into(),
+                            format!("satellite endpoint did not ack: {e}"),
+                        ),
+                    },
+                    Err(e) => (
+                        "failed".into(),
+                        format!("satellite session unavailable: {e}"),
+                    ),
+                }
             }
         }
         other => (

@@ -43,6 +43,7 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>, error::ApiErro
         events,
         scheduler: scheduler::SchedulerHandle::detached(),
         audio: audio::AudioRegistry::new().into(),
+        satellites: api::satellites::SatelliteHub::new().into(),
         ha,
         started: std::time::Instant::now(),
     });

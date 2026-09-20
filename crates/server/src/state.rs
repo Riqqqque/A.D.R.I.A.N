@@ -27,6 +27,8 @@ pub struct AppState {
     pub events: broadcast::Sender<ServerEvent>,
     pub scheduler: crate::scheduler::SchedulerHandle,
     pub audio: Arc<crate::audio::AudioRegistry>,
+    /// Live satellite websocket sessions for server → device pushes.
+    pub satellites: Arc<crate::api::satellites::SatelliteHub>,
     pub ha: crate::ha::HaManager,
     pub started: Instant,
 }

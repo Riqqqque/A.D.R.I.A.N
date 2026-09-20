@@ -3,11 +3,20 @@
   import { audioEndpointId, audioEndpointStored, disableBrowserAudio, enableBrowserAudio } from '../audio';
   import type { Endpoint } from '../types';
 
+  interface Satellite {
+    id: string;
+    name: string;
+    revoked: boolean;
+  }
+
   let endpoints = $state<Endpoint[]>([]);
+  let satellites = $state<Satellite[]>([]);
   let error = $state('');
   let result = $state('');
   let name = $state('');
   let entityId = $state('');
+  let satId = $state('');
+  let satName = $state('');
   let browserOn = $state(audioEndpointStored());
   let testBusy = $state('');
 
@@ -15,6 +24,8 @@
     try {
       const res = await get<{ endpoints: Endpoint[] }>('/api/endpoints');
       endpoints = res.endpoints;
+      const sats = await get<{ satellites: Satellite[] }>('/api/satellites');
+      satellites = sats.satellites.filter((s) => !s.revoked);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -27,6 +38,22 @@
       await post('/api/endpoints', { name, kind: 'ha_media_player', entity_id: entityId });
       name = '';
       entityId = '';
+      await load();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function addSatellite() {
+    error = '';
+    try {
+      await post('/api/endpoints', {
+        name: satName,
+        kind: 'satellite',
+        satellite_id: satId,
+      });
+      satName = '';
+      satId = '';
       await load();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -99,6 +126,27 @@
     <button onclick={addHa} disabled={!name.trim() || !entityId.trim()}>Add</button>
   </div>
   <p class="dim small">Requires Home Assistant connected and a reachable <code>public_url</code> (set under System) if speakers can't reach this machine's hostname.</p>
+</div>
+
+<div class="panel">
+  <h2>Add a voice satellite</h2>
+  {#if satellites.length === 0}
+    <p class="dim small">No satellites paired — pair one under Devices first.</p>
+  {:else}
+    <div class="row" style="align-items:end">
+      <label class="field grow">Name<input bind:value={satName} placeholder="Desk PC" /></label>
+      <label class="field grow">Satellite
+        <select bind:value={satId}>
+          <option value="" disabled selected>Choose…</option>
+          {#each satellites as s (s.id)}
+            <option value={s.id}>{s.name}</option>
+          {/each}
+        </select>
+      </label>
+      <button onclick={addSatellite} disabled={!satName.trim() || !satId}>Add</button>
+    </div>
+    <p class="dim small">Alarms play through the satellite's speaker while it is connected. Offline satellites report a failed delivery.</p>
+  {/if}
 </div>
 
 <div class="panel">

@@ -31,7 +31,7 @@ struct MediaGrant {
 
 pub struct AudioRegistry {
     channels: Mutex<HashMap<String, broadcast::Sender<AudioCommand>>>,
-    pending_acks: Mutex<HashMap<String, oneshot::Sender<String>>>,
+    pending_acks: Mutex<HashMap<String, oneshot::Sender<(bool, String)>>>,
     media: Mutex<HashMap<String, MediaGrant>>,
     tone: Mutex<Option<Vec<u8>>>,
 }
@@ -128,28 +128,56 @@ impl AudioRegistry {
         Some(grant.kind.clone())
     }
 
-    /// Arm a oneshot the ack endpoint resolves for a delivery.
-    pub async fn wait_ack(&self, delivery_id: &str, timeout: Duration) -> Result<String, ApiError> {
+    /// Arm a oneshot the ack endpoint resolves for a delivery. Arm BEFORE
+    /// dispatching the play command so a fast ack cannot be missed.
+    /// Payload: (playback_ok, detail).
+    pub fn arm_ack(&self, delivery_id: &str) -> oneshot::Receiver<(bool, String)> {
         let (tx, rx) = oneshot::channel();
         self.pending_acks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(delivery_id.to_string(), tx);
+        rx
+    }
+
+    /// Await a previously armed ack receiver.
+    pub async fn await_ack(
+        &self,
+        rx: oneshot::Receiver<(bool, String)>,
+        timeout: Duration,
+    ) -> Result<(bool, String), ApiError> {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(s)) => Ok(s),
             Ok(Err(_)) => Err(ApiError::internal_msg("ack channel dropped")),
-            Err(_) => Err(ApiError::Timeout("browser playback ack".into())),
+            Err(_) => Err(ApiError::Timeout("playback ack".into())),
         }
     }
 
+    /// Arm + await in one call (for callers that cannot pre-arm).
+    pub async fn wait_ack(
+        &self,
+        delivery_id: &str,
+        timeout: Duration,
+    ) -> Result<(bool, String), ApiError> {
+        let rx = self.arm_ack(delivery_id);
+        self.await_ack(rx, timeout).await
+    }
+
+    /// Resolve an armed waiter from the browser HTTP ack endpoint (the
+    /// browser reports a result string; treat it as success).
     pub fn resolve_ack(&self, delivery_id: &str, result: String) {
+        self.resolve_ack_status(delivery_id, true, result);
+    }
+
+    /// Resolve an armed waiter with an explicit success/failure flag.
+    pub fn resolve_ack_status(&self, delivery_id: &str, ok: bool, detail: String) {
         if let Some(tx) = self
             .pending_acks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(delivery_id)
         {
-            let _ = tx.send(result);
+            let _ = tx.send((ok, detail));
         }
     }
 

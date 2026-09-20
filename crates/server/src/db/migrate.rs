@@ -197,6 +197,21 @@ const MIGRATIONS: &[&str] = &[
         used INTEGER NOT NULL DEFAULT 0
     );
     "#,
+    // v6: satellites as alarm endpoints — rebuild endpoints with an
+    // extended kind CHECK (SQLite cannot ALTER a CHECK constraint).
+    r#"
+    CREATE TABLE endpoints_v6 (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('ha_media_player','browser','satellite')),
+        config TEXT NOT NULL DEFAULT '{}',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL
+    );
+    INSERT INTO endpoints_v6 SELECT * FROM endpoints;
+    DROP TABLE endpoints;
+    ALTER TABLE endpoints_v6 RENAME TO endpoints;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {

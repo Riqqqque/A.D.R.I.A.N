@@ -613,3 +613,128 @@ async fn pair_is_rate_limited_and_one_use_is_atomic() {
     .await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{res}");
 }
+
+#[tokio::test]
+async fn backup_restore_roundtrip() {
+    let h = harness().await;
+    let token = setup_token(&h.state.config.data_dir);
+    let (_, headers, body) = request(
+        &h.router,
+        "POST",
+        "/api/setup/claim",
+        Some(json!({"token": token, "username": "owner", "password": "password123", "timezone": "UTC"})),
+        None,
+        None,
+    )
+    .await;
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = body["csrf"].as_str().unwrap().to_string();
+
+    async fn marker_is(state: &adrian_server::AppState, v: &str) -> bool {
+        state
+            .db
+            .q1(
+                "SELECT value FROM settings WHERE key = 'restore_marker'",
+                vec![],
+                |r| r.get::<_, String>(0),
+            )
+            .await
+            .unwrap()
+            .map(|s| s == v)
+            .unwrap_or(false)
+    }
+
+    h.state
+        .db
+        .exec(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES('restore_marker','original')",
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Owner-only backup.
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/diagnostics/backup",
+        Some(json!({})),
+        Some(&cookie),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    let backup_path = res["backup"].as_str().unwrap().to_string();
+    let file_name = std::path::Path::new(&backup_path)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Mutate the db after the backup.
+    h.state
+        .db
+        .exec(
+            "UPDATE settings SET value='changed' WHERE key='restore_marker'",
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(marker_is(&h.state, "changed").await);
+
+    // Path traversal is rejected before touching the filesystem.
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/diagnostics/restore",
+        Some(json!({"file": "../../adrian.db"})),
+        Some(&cookie),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{res}");
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/diagnostics/restore",
+        Some(json!({"file": "nope.db"})),
+        Some(&cookie),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{res}");
+
+    // Real restore swaps the live db on the worker thread.
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/diagnostics/restore",
+        Some(json!({"file": file_name})),
+        Some(&cookie),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    assert!(marker_is(&h.state, "original").await);
+
+    // The worker keeps serving queries on the restored connection.
+    let (s, _, res) = request(
+        &h.router,
+        "GET",
+        "/api/diagnostics",
+        None,
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+}
