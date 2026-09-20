@@ -60,8 +60,6 @@ reproducible with the commands shown).
 | N-5 | Satellite wake word, hot-unplug behavior, pre-wake privacy, false-wake metrics | wake word not implemented (PTT only); hot-unplug and wake-word metrics need real mic sessions → **NOT RUN** |
 | N-9 | Real STT round-trip (OpenAI whisper / local whisper server) and real mic capture + TTS playback | pipeline verified against a mock local `/audio/transcriptions` endpoint; no real STT service or mic session exercised → **NOT RUN** |
 | N-10 | Satellite streaming session protocol (WS), tray UI, satellite-as-alarm-endpoint | not yet implemented → **NOT RUN** |
-| N-9 | Real STT round-trip (OpenAI whisper / local whisper server) and real mic capture + TTS playback | pipeline verified against a mock local `/audio/transcriptions` endpoint; no real STT service or mic session exercised → **NOT RUN** |
-| N-10 | Satellite streaming session protocol (WS), tray UI, satellite-as-alarm-endpoint | not yet implemented → **NOT RUN** |
 | N-6 | Browser smoke test of full UI flows | UI serves and all backing APIs verified via curl/integration tests; full click-through not instrumented → **SKIPPED** |
 | N-7 | Scheduler restart dedup while an alarm was `ringing` at shutdown | covered by the reconcile integration test (delivery row blocks refire; recurring reschedules); no manual crash drill → **SUPERSEDED by A-RECONCILE** |
 | N-8 | Rate-limiting lockout | covered by unit test → **SUPERSEDED by A-RATELIMIT** |

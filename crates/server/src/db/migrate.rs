@@ -176,7 +176,7 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     "#,
-    // v7 — native satellites: paired devices + one-use pairing codes
+    // v5: native satellites — paired devices + one-use pairing codes
     r#"
     CREATE TABLE satellites (
         id TEXT PRIMARY KEY,

@@ -15,7 +15,6 @@ dependencies = [
 name = "adrian-satellite"
 version = "0.1.0"
 dependencies = [
- "adrian-protocol",
  "anyhow",
  "cpal",
  "directories",

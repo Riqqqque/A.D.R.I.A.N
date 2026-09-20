@@ -1,4 +1,6 @@
-# Adrian
+# A.D.R.I.A.N
+
+**A**dvanced **D**igital **R**easoning & **I**ntelligence **A**ssistant **N**etwork
 
 A self-hosted household assistant: authenticated local web UI, real AI
 provider chat with typed tools, Home Assistant light control, durable memory,

@@ -510,3 +510,106 @@ async fn satellite_pair_status_and_revoke() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn pair_is_rate_limited_and_one_use_is_atomic() {
+    let h = harness().await;
+    let token = setup_token(&h.state.config.data_dir);
+    let (_, headers, body) = request(
+        &h.router,
+        "POST",
+        "/api/setup/claim",
+        Some(json!({"token": token, "username": "owner", "password": "password123", "timezone": "UTC"})),
+        None,
+        None,
+    )
+    .await;
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = body["csrf"].as_str().unwrap().to_string();
+
+    // Redeeming a minted code is a race — exactly one concurrent attempt wins.
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/satellites/pairing-code",
+        Some(json!({})),
+        Some(&cookie),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    let code = res["code"].as_str().unwrap().to_string();
+
+    let results = futures_util::future::join_all((0..6).map(|_| {
+        request(
+            &h.router,
+            "POST",
+            "/api/satellite/pair",
+            Some(json!({"code": code, "name": "racer"})),
+            None,
+            None,
+        )
+    }))
+    .await;
+    let oks = results
+        .iter()
+        .filter(|(s, _, _)| *s == StatusCode::OK)
+        .count();
+    assert_eq!(oks, 1, "exactly one redemption may succeed: {results:?}");
+    for (s, _, res) in results.iter().filter(|(s, _, _)| *s != StatusCode::OK) {
+        assert_eq!(*s, StatusCode::FORBIDDEN, "{res}");
+    }
+    let winner = results
+        .iter()
+        .find(|(s, _, _)| *s == StatusCode::OK)
+        .unwrap();
+    let device_token = winner.2["device_token"].as_str().unwrap().to_string();
+
+    // The utterance route lifts axum's 2MB default body limit for WAVs:
+    // a >2MB body reaches the handler (fails later on STT config, not 413).
+    let big = Request::builder()
+        .method("POST")
+        .uri("/api/satellite/utterance")
+        .extension(ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))))
+        .header(header::AUTHORIZATION, format!("Bearer {device_token}"))
+        .header(header::CONTENT_TYPE, "audio/wav")
+        .body(Body::from(vec![0u8; 3 * 1024 * 1024]))
+        .unwrap();
+    let res = h.router.clone().oneshot(big).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+
+    // Bad-code attempts are throttled per IP: 10/min, then 429.
+    for _ in 0..4 {
+        let (s, _, _) = request(
+            &h.router,
+            "POST",
+            "/api/satellite/pair",
+            Some(json!({"code": "000000", "name": "x"})),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/satellite/pair",
+        Some(json!({"code": "000000", "name": "x"})),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{res}");
+}

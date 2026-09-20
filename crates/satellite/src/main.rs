@@ -81,7 +81,7 @@ fn start_mic(
         if !rec.recording.load(Ordering::Relaxed) {
             return;
         }
-        if let Ok(mut buf) = rec.samples.lock() {
+        if let Ok(mut buf) = rec.samples.try_lock() {
             // First channel only — good enough for speech.
             for frame in data.chunks(channels) {
                 buf.push(frame[0]);
@@ -207,12 +207,13 @@ async fn status(cfg: &Config) -> Result<()> {
 
 async fn send_utterance(cfg: &Config, wav: Vec<u8>) -> Result<serde_json::Value> {
     let client = reqwest::Client::new();
-    let mut url = format!("{}/api/satellite/utterance", cfg.server_url);
+    let mut url =
+        reqwest::Url::parse(&format!("{}/api/satellite/utterance", cfg.server_url))?;
     if let Some(cid) = &cfg.conversation_id {
-        url = format!("{url}?conversation_id={cid}");
+        url.query_pairs_mut().append_pair("conversation_id", cid);
     }
     let res = client
-        .post(&url)
+        .post(url)
         .bearer_auth(&cfg.device_token)
         .header("Content-Type", "audio/wav")
         .body(wav)
@@ -251,56 +252,64 @@ async fn run(mut cfg: Config) -> Result<()> {
     let hotkey = HotKey::new(Some(PTT_MODS), PTT_KEY);
     manager.register(hotkey).context("register PTT hotkey")?;
 
-    loop {
-        match GlobalHotKeyEvent::receiver().recv() {
-            Ok(ev) if ev.id == hotkey.id() => match ev.state {
-                HotKeyState::Pressed => {
-                    rec.samples.lock().unwrap().clear();
-                    rec.recording.store(true, Ordering::Relaxed);
-                    print!("listening… ");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+    // global_hotkey's receiver is blocking — pump it on a dedicated
+    // thread and forward events into the async loop.
+    let (hk_tx, mut hk_rx) = tokio::sync::mpsc::unbounded_channel::<GlobalHotKeyEvent>();
+    std::thread::spawn(move || {
+        while let Ok(ev) = GlobalHotKeyEvent::receiver().recv() {
+            if hk_tx.send(ev).is_err() {
+                return;
+            }
+        }
+    });
+
+    while let Some(ev) = hk_rx.recv().await {
+        if ev.id != hotkey.id() {
+            continue;
+        }
+        match ev.state {
+            HotKeyState::Pressed => {
+                rec.samples.lock().unwrap().clear();
+                rec.recording.store(true, Ordering::Relaxed);
+                print!("listening… ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            HotKeyState::Released => {
+                rec.recording.store(false, Ordering::Relaxed);
+                let samples: Vec<f32> = rec.samples.lock().unwrap().drain(..).collect();
+                let secs = samples.len() as f32 / rec.sample_rate.max(1) as f32;
+                if secs < 0.4 {
+                    println!("(too short, ignored)");
+                    continue;
                 }
-                HotKeyState::Released => {
-                    rec.recording.store(false, Ordering::Relaxed);
-                    let samples: Vec<f32> = rec.samples.lock().unwrap().drain(..).collect();
-                    let secs = samples.len() as f32 / rec.sample_rate.max(1) as f32;
-                    if secs < 0.4 {
-                        println!("(too short, ignored)");
-                        continue;
-                    }
-                    println!("{secs:.1}s captured, sending…");
-                    match encode_wav(&samples, rec.sample_rate) {
-                        Ok(wav) => match send_utterance(&cfg, wav).await {
-                            Ok(v) => {
-                                if let Some(cid) = v["conversation_id"].as_str() {
-                                    cfg.conversation_id = Some(cid.to_string());
-                                    let _ = save_config(&cfg);
-                                }
-                                let transcript = v["transcript"].as_str().unwrap_or("");
-                                let response = v["response"].as_str().unwrap_or("");
-                                let error = v["error"].as_str().unwrap_or("");
-                                println!("you: {transcript}");
-                                if !response.is_empty() {
-                                    println!("adrian: {response}");
-                                    speak(response);
-                                }
-                                if !error.is_empty() {
-                                    println!("error: {error}");
-                                }
+                println!("{secs:.1}s captured, sending…");
+                match encode_wav(&samples, rec.sample_rate) {
+                    Ok(wav) => match send_utterance(&cfg, wav).await {
+                        Ok(v) => {
+                            if let Some(cid) = v["conversation_id"].as_str() {
+                                cfg.conversation_id = Some(cid.to_string());
+                                let _ = save_config(&cfg);
                             }
-                            Err(e) => println!("send failed: {e:#}"),
-                        },
-                        Err(e) => println!("wav encode failed: {e:#}"),
-                    }
+                            let transcript = v["transcript"].as_str().unwrap_or("");
+                            let response = v["response"].as_str().unwrap_or("");
+                            let error = v["error"].as_str().unwrap_or("");
+                            println!("you: {transcript}");
+                            if !response.is_empty() {
+                                println!("adrian: {response}");
+                                speak(response);
+                            }
+                            if !error.is_empty() {
+                                println!("error: {error}");
+                            }
+                        }
+                        Err(e) => println!("send failed: {e:#}"),
+                    },
+                    Err(e) => println!("wav encode failed: {e:#}"),
                 }
-            },
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("hotkey channel error: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
     }
+    Ok(())
 }
 
 #[tokio::main]
@@ -338,8 +347,14 @@ async fn main() -> Result<()> {
         Some("status") => status(&load_config()?).await,
         Some("say") => {
             let text = args.get(2).cloned().unwrap_or_default();
-            speak(&text);
-            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            let mut t = tts::Tts::default()?;
+            t.speak(&text, true)?;
+            for _ in 0..600 {
+                if !t.is_speaking().unwrap_or(false) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             Ok(())
         }
         _ => {

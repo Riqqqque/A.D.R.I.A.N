@@ -254,7 +254,7 @@ pub async fn run_turn(
             return;
         }
     };
-    let messages = build_messages(state, user, cid, message).await;
+    let messages = build_messages(state, user, cid).await;
     let ctx = ToolCtx { state, user };
     let mut history = messages;
     let mut final_text = String::new();
@@ -385,7 +385,6 @@ async fn build_messages(
     state: &Arc<AppState>,
     user: &AuthUser,
     conv_id: &str,
-    _latest: &str,
 ) -> Vec<ChatMessage> {
     let settings = state.get_settings().await.unwrap_or_default();
     let name = settings

@@ -14,7 +14,7 @@ use crate::providers;
 use crate::state::AppState;
 use crate::util;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -22,19 +22,26 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 const PAIRING_TTL_SECS: i64 = 300; // 5 minutes
 const MAX_WAV_BYTES: usize = 25 * 1024 * 1024;
 
 pub fn routes() -> Router<AppState> {
+    // The utterance route carries WAV bodies up to MAX_WAV_BYTES; the rest
+    // stay under axum's default 2MB request-body limit.
+    let voice = Router::new()
+        .route("/api/satellite/utterance", post(utterance))
+        .layer(DefaultBodyLimit::max(MAX_WAV_BYTES));
     Router::new()
         .route("/api/satellites", get(list_satellites))
         .route("/api/satellites/pairing-code", post(mint_code))
         .route("/api/satellites/{id}", delete(revoke_satellite))
         .route("/api/satellite/pair", post(pair))
         .route("/api/satellite/status", get(status))
-        .route("/api/satellite/utterance", post(utterance))
+        .merge(voice)
 }
 
 // ---------- session-authed (web UI) ----------
@@ -69,20 +76,32 @@ async fn mint_code(user: AuthUser, State(s): State<AppState>) -> Result<Json<Val
         ));
     }
     // Human-typeable code: 6 digits, 5-minute expiry, one use.
-    let code: u32 = rand::random::<u32>() % 900_000 + 100_000;
+    // INSERT OR IGNORE + retry — never overwrite someone else's live code.
     let now = util::now_unix();
-    s.db.exec(
-        "INSERT INTO pairing_codes(code,user_id,created_at,expires_at)
-         VALUES(?1,?2,?3,?4)
-         ON CONFLICT(code) DO UPDATE SET user_id=?2, created_at=?3, expires_at=?4, used=0",
-        vec![
-            P::T(code.to_string()),
-            P::I(user.id),
-            P::I(now),
-            P::I(now + PAIRING_TTL_SECS),
-        ],
-    )
-    .await?;
+    let mut code = 0u32;
+    for _ in 0..8 {
+        let candidate: u32 = rand::random::<u32>() % 900_000 + 100_000;
+        let n = s
+            .db
+            .exec(
+                "INSERT OR IGNORE INTO pairing_codes(code,user_id,created_at,expires_at)
+                 VALUES(?1,?2,?3,?4)",
+                vec![
+                    P::T(candidate.to_string()),
+                    P::I(user.id),
+                    P::I(now),
+                    P::I(now + PAIRING_TTL_SECS),
+                ],
+            )
+            .await?;
+        if n == 1 {
+            code = candidate;
+            break;
+        }
+    }
+    if code == 0 {
+        return Err(ApiError::internal_msg("could not allocate a pairing code"));
+    }
     // Best-effort sweep of expired codes.
     let _ =
         s.db.exec(
@@ -162,7 +181,9 @@ async fn satellite_from_headers(s: &AppState, headers: &HeaderMap) -> Result<Sat
         .ok_or_else(|| ApiError::Unauthorized)?;
     let row =
         s.db.q1(
-            "SELECT id,name,user_id FROM satellites WHERE token_hash = ?1 AND revoked = 0",
+            "SELECT s.id, s.name, s.user_id FROM satellites s
+             JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ?1 AND s.revoked = 0 AND u.disabled_at IS NULL",
             vec![P::T(token_hash(token))],
             |r| {
                 Ok((
@@ -191,17 +212,32 @@ struct PairBody {
     name: String,
 }
 
-async fn pair(State(s): State<AppState>, Json(b): Json<PairBody>) -> Result<Json<Value>, ApiError> {
+async fn pair(
+    State(s): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(b): Json<PairBody>,
+) -> Result<Json<Value>, ApiError> {
+    // Brute-force guard: 6-digit codes are guessable — throttle attempts
+    // per source IP like login and setup claim.
+    if !s
+        .rate_limit
+        .check(&format!("pair:{}", addr.ip()), 10, Duration::from_secs(60))
+    {
+        return Err(ApiError::RateLimited);
+    }
     let code = b.code.trim();
     let name = b.name.trim();
     if name.is_empty() || name.chars().count() > 80 {
         return Err(ApiError::BadRequest("name must be 1-80 chars".into()));
     }
     let now = util::now_unix();
-    let row =
-        s.db.q1(
-            "SELECT user_id FROM pairing_codes
-             WHERE code = ?1 AND used = 0 AND expires_at > ?2",
+    // Burn the code atomically — one use, even under concurrent redemptions.
+    let row = s
+        .db
+        .q1(
+            "UPDATE pairing_codes SET used = 1
+             WHERE code = ?1 AND used = 0 AND expires_at > ?2
+             RETURNING user_id",
             vec![P::T(code.to_string()), P::I(now)],
             |r| r.get::<_, i64>(0),
         )
@@ -211,12 +247,6 @@ async fn pair(State(s): State<AppState>, Json(b): Json<PairBody>) -> Result<Json
             "invalid or expired pairing code".into(),
         ));
     };
-    // Burn the code before issuing the token — one use, even on retry.
-    s.db.exec(
-        "UPDATE pairing_codes SET used = 1 WHERE code = ?1",
-        vec![P::T(code.to_string())],
-    )
-    .await?;
 
     let id = util::new_id();
     let token = format!("sat_{}", util::new_id());
