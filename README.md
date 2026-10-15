@@ -146,6 +146,31 @@ Provider API keys and the Home Assistant token are encrypted in the
 database. See `docs/SECURITY.md` for the security model and honest
 limitations (memory, chat history and other data are **not** encrypted).
 
+## Usage and spending caps
+
+Every chat round and speech-to-text call is metered in the database with
+the token counts the provider reports. The OpenAI-compatible adapter asks
+for them with `stream_options.include_usage`. When a provider reports
+nothing, an estimate is recorded and marked as such. Costs come from prices
+you enter under **System → Usage and budgets**. No prices are built in,
+because they change. Local endpoints (loopback/LAN) are always free and
+never blocked. A cloud model with no price is listed as unpriced in
+diagnostics, because a budget can't bound what it can't price.
+
+Budgets are monthly, using the calendar month in the household timezone.
+They apply to the whole household, one provider, or one module (`web`,
+`satellite`, later `discord`). At the soft limit (80% by default) you get
+one warning per budget per month. At the limit, paid calls are refused
+with the actual numbers, and local models keep working. The limit is
+checked before every tool round, so a long tool loop can't run past it.
+
+API, owner only:
+
+- `GET /api/usage?month=YYYY-MM`
+- `GET/PUT/DELETE /api/usage/prices`
+- `GET/POST /api/usage/budgets`
+- `DELETE /api/usage/budgets/{id}`
+
 ## Architecture
 
 ```

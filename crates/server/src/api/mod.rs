@@ -12,6 +12,7 @@ pub mod media;
 pub mod memory_api;
 pub mod satellites;
 pub mod settings;
+pub mod usage_api;
 
 use crate::state::AppState;
 use axum::Router;
@@ -29,4 +30,5 @@ pub fn routes() -> Router<AppState> {
         .merge(events::routes())
         .merge(diagnostics::routes())
         .merge(media::routes())
+        .merge(usage_api::routes())
 }

@@ -109,6 +109,11 @@ pub enum Message {
     AlarmLocalReport {
         fired: Vec<LocalAlarmFiring>,
     },
+
+    /// Any message type this build does not know. Lets older peers ignore
+    /// newer additive messages instead of failing to parse the frame.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +250,16 @@ mod tests {
         assert!(
             matches!(back.message, Message::AlarmLocalReport { ref fired } if fired.len() == 1)
         );
+    }
+
+    #[test]
+    fn unknown_message_types_parse_as_unknown() {
+        let json = r#"{"request_id":"r1","protocol_version":1,"device_id":null,
+            "deadline_unix":null,"idempotency_key":null,
+            "type":"some_future_message","payload":{"x":1}}"#;
+        let env: Envelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.request_id, "r1");
+        assert!(matches!(env.message, Message::Unknown));
     }
 
     #[test]

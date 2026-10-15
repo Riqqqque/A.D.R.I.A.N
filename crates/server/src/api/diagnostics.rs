@@ -75,18 +75,23 @@ async fn diagnostics(user: AuthUser, State(s): State<AppState>) -> Result<Json<V
     let facts = counts("SELECT COUNT(*) FROM facts WHERE deleted_at IS NULL").await;
 
     let flags = s.setup_flags().await?;
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     if flags["provider_configured"] == json!(false) {
-        warnings.push("no AI provider configured — chat is unavailable");
+        warnings.push("no AI provider configured — chat is unavailable".into());
     }
     if flags["ha_configured"] == json!(false) {
-        warnings.push("Home Assistant is not connected — device control is unavailable");
+        warnings.push("Home Assistant is not connected — device control is unavailable".into());
     }
     if flags["audio_endpoint_configured"] == json!(false) {
-        warnings.push("no audio endpoint — alarms cannot make sound yet");
+        warnings.push("no audio endpoint — alarms cannot make sound yet".into());
+    }
+    for p in crate::usage::unpriced(&s).await.unwrap_or_default() {
+        warnings.push(format!(
+            "usage for {p} is unpriced — enter its price under System so budgets can bound it"
+        ));
     }
     warnings.push(
-        "preview build: the local database and backups are stored unencrypted — see docs/SECURITY.md",
+        "memory, chat history and backups are stored unencrypted (stored secrets are encrypted) — see docs/SECURITY.md".into(),
     );
 
     Ok(Json(json!({

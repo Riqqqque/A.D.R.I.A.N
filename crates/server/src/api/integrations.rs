@@ -51,6 +51,7 @@ async fn list_providers(
             "id": r.id, "kind": r.kind, "label": r.label, "base_url": r.base_url,
             "model": r.model, "enabled": r.enabled, "is_default": r.is_default,
             "has_key": has_key, "timeout_secs": r.timeout_secs,
+            "local": providers::base_is_local(&r.base_url),
         }));
     }
     Ok(Json(json!({"providers": out})))

@@ -75,6 +75,8 @@ pub struct ToolSpec {
 pub enum ChatEvent {
     Text(String),
     ToolCall(ToolCall),
+    /// Token counts the provider reported for this call (sent before Done).
+    Usage(crate::usage::Usage),
     Done,
     Failed(String),
 }
@@ -192,11 +194,12 @@ pub fn base_is_local(base_url: &str) -> bool {
 /// compatible local server (e.g. faster-whisper, whisper.cpp OpenAI shim).
 /// Returns an honest error when the endpoint doesn't support it.
 pub async fn transcribe_wav(
-    db: &Db,
-    sb: &SecretBox,
-    http: reqwest::Client,
+    state: &crate::state::AppState,
+    user_id: Option<i64>,
+    module: &str,
     wav: Vec<u8>,
 ) -> Result<String, ApiError> {
+    let (db, sb, http) = (&state.db, &state.secret_box, state.http.clone());
     let rows = load_provider_rows(db).await?;
     let row = rows
         .iter()
@@ -206,13 +209,14 @@ pub async fn transcribe_wav(
         .ok_or_else(|| {
             ApiError::NotConfigured("no AI provider configured for speech-to-text".into())
         })?;
+    for w in crate::usage::check(state, &row, module).await? {
+        tracing::info!(warning = %w, "budget");
+    }
+    let audio_seconds = wav_seconds(&wav);
     let key = secret_for(db, sb, &row.secret_name)
         .await?
         .unwrap_or_default();
-    let stt_model = match row.kind.as_str() {
-        "openai_responses" => "whisper-1".to_string(),
-        _ => row.model.clone(),
-    };
+    let stt_model = stt_model_name(&row);
     let url = format!(
         "{}/audio/transcriptions",
         row.base_url.trim_end_matches('/')
@@ -253,12 +257,62 @@ pub async fn transcribe_wav(
         .unwrap_or("")
         .trim()
         .to_string();
+    let metered = ProviderRow {
+        model: stt_model_name(&row),
+        ..row.clone()
+    };
+    crate::usage::record(
+        state,
+        &metered,
+        "stt",
+        module,
+        user_id,
+        &crate::usage::Usage::default(),
+        audio_seconds,
+    )
+    .await;
     if text.is_empty() {
         return Err(ApiError::internal_msg(
             "stt endpoint returned an empty transcript",
         ));
     }
     Ok(text)
+}
+
+fn stt_model_name(row: &ProviderRow) -> String {
+    match row.kind.as_str() {
+        "openai_responses" => "whisper-1".to_string(),
+        _ => row.model.clone(),
+    }
+}
+
+/// Duration of a PCM WAV from its header (0 when it cannot be read).
+fn wav_seconds(wav: &[u8]) -> f64 {
+    if wav.len() < 44 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return 0.0;
+    }
+    let (mut channels, mut rate, mut bits) = (0u16, 0u32, 0u16);
+    let mut i = 12;
+    while i + 8 <= wav.len() {
+        let id = &wav[i..i + 4];
+        let len = u32::from_le_bytes([wav[i + 4], wav[i + 5], wav[i + 6], wav[i + 7]]) as usize;
+        let body = i + 8;
+        if id == b"fmt " && body + 16 <= wav.len() {
+            channels = u16::from_le_bytes([wav[body + 2], wav[body + 3]]);
+            rate = u32::from_le_bytes([wav[body + 4], wav[body + 5], wav[body + 6], wav[body + 7]]);
+            bits = u16::from_le_bytes([wav[body + 14], wav[body + 15]]);
+        } else if id == b"data" {
+            let bytes_per_sec = rate as f64 * channels as f64 * (bits as f64 / 8.0);
+            let data = len.min(wav.len().saturating_sub(body));
+            return if bytes_per_sec > 0.0 {
+                data as f64 / bytes_per_sec
+            } else {
+                0.0
+            };
+        }
+        i = body.saturating_add(len).saturating_add(len & 1);
+    }
+    0.0
 }
 
 async fn secret_for(

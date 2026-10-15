@@ -76,6 +76,8 @@ export interface Provider {
   is_default: boolean;
   has_key: boolean;
   timeout_secs: number;
+  /** Loopback/LAN endpoint: free and never budget-limited. */
+  local: boolean;
 }
 
 export interface HaStatus {
@@ -106,4 +108,49 @@ export interface LedgerRow {
   outcome: string;
   detail: string;
   created_at: number;
+}
+
+export interface UsageRow {
+  provider_id: string;
+  provider: string;
+  model: string;
+  capability: 'chat' | 'stt';
+  module: string;
+  calls: number;
+  input_tokens: number;
+  cached_tokens: number;
+  output_tokens: number;
+  audio_seconds: number;
+  cost_micros: number;
+  unpriced_calls: number;
+  estimated_calls: number;
+  local: boolean;
+}
+
+export interface Budget {
+  id: string;
+  scope: 'global' | 'provider' | 'module';
+  scope_id: string;
+  monthly_limit_micros: number;
+  soft_pct: number;
+  enabled: boolean;
+  spent_micros: number;
+}
+
+export interface UsageSummary {
+  month: string;
+  total_cost_micros: number;
+  rows: UsageRow[];
+  budgets: Budget[];
+  unpriced: string[];
+}
+
+export interface ModelPrice {
+  provider_id: string;
+  model: string;
+  input_per_mtok_micros: number;
+  cached_per_mtok_micros: number | null;
+  output_per_mtok_micros: number;
+  audio_per_minute_micros: number;
+  updated_at: number;
 }
