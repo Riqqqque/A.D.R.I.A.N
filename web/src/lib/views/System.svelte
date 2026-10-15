@@ -2,6 +2,7 @@
   import { get, post, put } from '../api';
   import { session } from '../session.svelte';
   import type { Diagnostics, LedgerRow } from '../types';
+  import Usage from './Usage.svelte';
 
   let diag = $state<Diagnostics | null>(null);
   let ledger = $state<LedgerRow[]>([]);
@@ -122,6 +123,8 @@
     </div>
     <p class="dim small">strict-local blocks cloud provider calls. Public URL should be reachable by Home Assistant media players.</p>
   </div>
+
+  <Usage />
 
   <div class="panel">
     <h2>Action ledger</h2>

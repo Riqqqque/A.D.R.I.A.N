@@ -212,6 +212,49 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE endpoints;
     ALTER TABLE endpoints_v6 RENAME TO endpoints;
     "#,
+    // v7: metered provider usage, user-entered prices, monthly budgets.
+    // Money is integer micro-USD. cost_micros is NULL when a cloud model has
+    // no price row (it cannot be bounded by a budget until one is entered).
+    r#"
+    CREATE TABLE usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at INTEGER NOT NULL,
+        provider_id TEXT NOT NULL,
+        provider_label TEXT NOT NULL,
+        model TEXT NOT NULL,
+        capability TEXT NOT NULL CHECK(capability IN ('chat','stt')),
+        module TEXT NOT NULL DEFAULT 'web',
+        user_id INTEGER,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        cached_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        audio_seconds REAL NOT NULL DEFAULT 0,
+        cost_micros INTEGER,
+        estimated INTEGER NOT NULL DEFAULT 0,
+        local INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX usage_events_at ON usage_events(at);
+    CREATE TABLE model_prices (
+        provider_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        input_per_mtok INTEGER NOT NULL DEFAULT 0,
+        cached_per_mtok INTEGER,
+        output_per_mtok INTEGER NOT NULL DEFAULT 0,
+        audio_per_minute INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (provider_id, model)
+    );
+    CREATE TABLE budgets (
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL CHECK(scope IN ('global','provider','module')),
+        scope_id TEXT NOT NULL DEFAULT '',
+        monthly_limit_micros INTEGER NOT NULL CHECK(monthly_limit_micros >= 0),
+        soft_pct INTEGER NOT NULL DEFAULT 80 CHECK(soft_pct BETWEEN 1 AND 100),
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        UNIQUE(scope, scope_id)
+    );
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {

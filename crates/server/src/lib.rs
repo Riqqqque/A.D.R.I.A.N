@@ -13,6 +13,7 @@ pub mod scheduler;
 pub mod secrets;
 pub mod state;
 pub mod tools;
+pub mod usage;
 pub mod util;
 pub mod web;
 

@@ -185,7 +185,17 @@ impl ChatProvider for OpenAiResponses {
                         yield ChatEvent::Failed(msg);
                         return;
                     }
-                    Some("response.completed") | Some("response.incomplete") => {}
+                    Some("response.completed") | Some("response.incomplete") => {
+                        if let Some(u) = v.get("response").and_then(|r| r.get("usage")) {
+                            let n = |x: Option<&Value>| x.and_then(|v| v.as_i64()).unwrap_or(0);
+                            yield ChatEvent::Usage(crate::usage::Usage {
+                                input: n(u.get("input_tokens")),
+                                cached: n(u.get("input_tokens_details").and_then(|d| d.get("cached_tokens"))),
+                                output: n(u.get("output_tokens")),
+                                estimated: false,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }

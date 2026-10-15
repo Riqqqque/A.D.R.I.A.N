@@ -10,7 +10,7 @@ use crate::providers::{ChatEvent, ChatMessage, ChatRequest};
 use crate::state::AppState;
 use crate::tools::{self, ToolCtx, fastpath};
 use crate::util;
-use crate::{memory, providers};
+use crate::{memory, providers, usage};
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
@@ -254,11 +254,27 @@ pub async fn run_turn(
             return;
         }
     };
+    let module = usage::module_for(user);
     let messages = build_messages(state, user, cid).await;
     let ctx = ToolCtx { state, user };
     let mut history = messages;
     let mut final_text = String::new();
     for _round in 0..MAX_TOOL_ROUNDS {
+        // Checked every round so a long tool loop cannot overrun a budget.
+        match usage::check(state, &row, module).await {
+            Ok(warnings) => {
+                for w in warnings {
+                    emit(tx, "notice", json!({"message": w}));
+                }
+            }
+            Err(e) => {
+                let text = e.to_string();
+                emit(tx, "error", json!({"message": text}));
+                emit(tx, "done", json!({"conversation_id": cid}));
+                return;
+            }
+        }
+        let sent_chars: usize = history.iter().map(|m| m.content.len()).sum();
         let req = ChatRequest {
             messages: history.clone(),
             tools: if provider.capabilities().tools {
@@ -271,6 +287,7 @@ pub async fn run_turn(
         let mut round_text = String::new();
         let mut calls: Vec<crate::providers::ToolCall> = Vec::new();
         let mut failed: Option<String> = None;
+        let mut reported: Option<usage::Usage> = None;
         while let Some(ev) = stream.next().await {
             match ev {
                 ChatEvent::Text(t) => {
@@ -278,12 +295,24 @@ pub async fn run_turn(
                     emit(tx, "delta", json!({"text": t}));
                 }
                 ChatEvent::ToolCall(c) => calls.push(c),
+                ChatEvent::Usage(u) => reported = Some(u),
                 ChatEvent::Done => break,
                 ChatEvent::Failed(msg) => {
                     failed = Some(msg);
                     break;
                 }
             }
+        }
+        // Meter the round. Providers that report nothing get a flagged
+        // estimate; a failure before any output is assumed unbilled.
+        if reported.is_some() || !round_text.is_empty() || !calls.is_empty() {
+            let out_chars = round_text.len()
+                + calls
+                    .iter()
+                    .map(|c| c.name.len() + c.arguments.to_string().len())
+                    .sum::<usize>();
+            let u = reported.unwrap_or_else(|| usage::Usage::estimate(sent_chars, out_chars));
+            usage::record(state, &row, "chat", module, Some(user.id), &u, 0.0).await;
         }
         if let Some(msg) = failed {
             emit(

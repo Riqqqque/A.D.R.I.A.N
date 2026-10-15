@@ -20,7 +20,7 @@ reproducible with the commands shown).
 |---|---|---|---|---|---|
 | A-FMT | `cargo fmt --all --check` | clean | clean | toolchain output | PASS |
 | A-CLIPPY | `cargo clippy --workspace` | 0 warnings | 0 warnings | toolchain output | PASS |
-| A-UNIT | `cargo test --workspace` | all pass | 40/40 pass (3 protocol, 4 satellite, 19 server lib, 7 HTTP integration, 7 WS session); 1 live TLS test ignored by default, run separately as C-TLS-SAT | toolchain output | PASS |
+| A-UNIT | `cargo test --workspace` | all pass | 45/45 pass (4 protocol, 4 satellite, 23 server lib, 7 HTTP integration, 1 usage integration, 7 WS session); 1 live TLS test ignored by default, run separately as C-TLS-SAT | toolchain output | PASS |
 | A-MSRV | `cargo +1.88.0 check --workspace --all-targets` | compiles on the declared `rust-version` | compiles | toolchain output | PASS |
 | A-WAKE-BUILD | `cargo check -p adrian-satellite --features wake-word` | compiles | compiles | toolchain output | PASS |
 | A-FE-CHECK | `cd web && npm run check` | 0 errors, 0 warnings | 0 errors, 0 warnings (a11y warnings from previous report all fixed — controls wrapped in labels) | svelte-check output | PASS |
@@ -78,6 +78,21 @@ reproducible with the commands shown).
 | C-LOCAL-FIRST | report before the server delivered; plus reports for another endpoint's alarm and an unknown occurrence | first recorded and the alarm advanced; others ignored | `1 recorded`, alarm `done`, nothing written for the foreign alarm | ws_session test `local_firing_before_server_delivery_advances_the_alarm` | PASS |
 | C-STORE | satellite replica store: grace while connected, ring-once, resync after a local firing, persistence, stale drop | no double ring; state survives restart | as expected | satellite unit tests in `replicas.rs` | PASS |
 
+## Usage metering, budgets, UI boot (2026-10-14)
+
+| ID | Procedure | Expected | Observed | Evidence | Result |
+|---|---|---|---|---|---|
+| D-USAGE | chat against a mock OpenAI-compatible server streaming text + a usage chunk | request asks for `include_usage`; tokens recorded | 120 in / 20 cached / 7 out recorded, local provider cost 0 | `usage_flow` test | PASS |
+| D-PRICE | price entered via API, usage recorded for a cloud provider | cost from price table | 3,400 micro-USD for 600 uncached + 400 cached + 250 out at $2/$0.50/$8 per 1M | `usage_flow` test + `cost_uses_cached_price_and_rounds_up` | PASS |
+| D-SOFT | spend crosses 80% of a household budget | one warning, then silence for the month | one warning (85%), second check empty | `usage_flow` test | PASS |
+| D-HARD | spend over the limit, cloud provider default | chat refused before any network call | SSE error "…budget…used up ($x of $y)…", no usage row added | `usage_flow` test | PASS |
+| D-LOCAL | same exhausted budget, local provider default | local chat still works | reply streamed, mock hit | `usage_flow` test | PASS |
+| D-MONTH | month window across DST and year end in America/Denver | local calendar month | March = 07:00Z..06:00Z next month; December rolls to January | `month_window_follows_local_time_across_dst` | PASS |
+| D-BADMONTH | `GET /api/usage?month=2026-13` | 400, no panic | 400 (found a panic first; fixed to use the fallible date constructor) | `usage_flow` test | PASS |
+| D-PROTO | unknown message type on the wire | parses as `Unknown`, ignored | parsed as `Unknown` | `unknown_message_types_parse_as_unknown` | PASS |
+| D-UI-BOOT | load the built UI in a real browser | app starts | **was broken**: the CSP header blocked SvelteKit's inline boot script (`script-src 'self'`), so the UI never rendered in a browser. Fixed by hashing the inline script into the CSP at startup; UI now loads, signs in, and the System page shows the usage panel with live data | live server + built-in browser; unit test `csp_allows_exactly_the_inline_boot_script` | PASS (after fix) |
+| D-LOGIN-MSG | open the UI while signed out | plain sign-in form | was "could not reach the server: unauthenticated"; now the form only | live browser | PASS (after fix) |
+
 ## Not run / skipped — needs real external resources
 
 | ID | Item | Why |
@@ -89,9 +104,10 @@ reproducible with the commands shown).
 | N-5 | Satellite wake word, hot-unplug behavior, pre-wake privacy, false-wake metrics | wake word implemented (rustpotter, opt-in `wake-word` feature + `.rpw` model config; 2s local rolling buffer, silence endpointing) and hot-unplug re-init implemented — but neither exercised against real audio hardware/model → **NOT RUN** |
 | N-9 | Real STT round-trip (OpenAI whisper / local whisper server) and real mic capture + TTS playback | pipeline verified against a mock local `/audio/transcriptions` endpoint; no real STT service or mic session exercised → **NOT RUN** |
 | N-11 | DPAPI key on another Windows account/machine, and restoring a backup there | secrets unreadable, clear "re-enter" error | covered by code path, not exercised across accounts → **NOT RUN** |
+| N-13 | Usage reporting from real OpenAI / DeepSeek / llama.cpp streams (`include_usage`, Responses `response.completed` usage) | parsing verified against a mock only; a server that rejects `stream_options` was not seen → **NOT RUN** |
 | N-12 | Satellite actually ringing a replica (tone + SAPI) on hardware, and the tray/console output during it | store logic unit-tested; audio output not exercised → **NOT RUN** |
 | N-10 | Satellite streaming session protocol (WS), tray UI, satellite-as-alarm-endpoint | WS protocol + alarm endpoint implemented and tested (B-WS-*, B-SAT-ALARM); tray icon implemented (Windows pump thread) but not visually exercised → **SUPERSEDED** (tray visual check pending) |
-| N-6 | Browser smoke test of full UI flows | UI serves and all backing APIs verified via curl/integration tests; full click-through not instrumented → **SKIPPED** |
+| N-6 | Browser smoke test of full UI flows (partly done: boot, sign-in, System page; other pages not clicked through) | UI serves and all backing APIs verified via curl/integration tests; full click-through not instrumented → **SKIPPED** |
 | N-7 | Scheduler restart dedup while an alarm was `ringing` at shutdown | covered by the reconcile integration test (delivery row blocks refire; recurring reschedules); no manual crash drill → **SUPERSEDED by A-RECONCILE** |
 | N-8 | Rate-limiting lockout | covered by unit test → **SUPERSEDED by A-RATELIMIT** |
 

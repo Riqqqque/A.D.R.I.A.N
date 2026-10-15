@@ -314,13 +314,8 @@ async fn utterance(
     let state = Arc::new(s);
 
     ensure_stt_allowed(&state).await?;
-    let transcript = providers::transcribe_wav(
-        &state.db,
-        &state.secret_box,
-        state.http.clone(),
-        body.to_vec(),
-    )
-    .await?;
+    let transcript =
+        providers::transcribe_wav(&state, Some(sat.user_id), "satellite", body.to_vec()).await?;
     let user = sat_auth_user(&state, &sat).await?;
 
     let conv_id =
@@ -702,20 +697,14 @@ async fn finish_utterance(
         return;
     }
     let wav = pcm_s16le_to_wav(&cap.pcm, cap.sample_rate);
-    let transcript = match providers::transcribe_wav(
-        &state.db,
-        &state.secret_box,
-        state.http.clone(),
-        wav,
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            send_ack(tx, "stt", false, format!("stt failed: {e}"));
-            return;
-        }
-    };
+    let transcript =
+        match providers::transcribe_wav(state, Some(sat.user_id), "satellite", wav).await {
+            Ok(t) => t,
+            Err(e) => {
+                send_ack(tx, "stt", false, format!("stt failed: {e}"));
+                return;
+            }
+        };
     {
         let mut env = proto::Envelope::new(proto::Message::Transcript {
             text: transcript.clone(),

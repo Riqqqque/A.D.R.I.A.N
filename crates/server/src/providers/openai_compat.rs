@@ -97,6 +97,8 @@ impl ChatProvider for OpenAiCompat {
                 }
             })).collect::<Vec<_>>(),
             "tool_choice": "auto",
+            // Ask for a final usage chunk (OpenAI, DeepSeek, llama.cpp).
+            "stream_options": {"include_usage": true},
         });
         let url = format!("{}/chat/completions", self.base_url);
         let http = self.http.clone();
@@ -122,6 +124,7 @@ impl ChatProvider for OpenAiCompat {
             // Accumulate streamed tool-call fragments keyed by index.
             let mut calls: HashMap<i64, (String, String, String)> = HashMap::new();
             let mut finish: Option<String> = None;
+            let mut usage: Option<crate::usage::Usage> = None;
             while let Some(item) = data.next().await {
                 let payload = match item {
                     Ok(p) => p,
@@ -142,6 +145,18 @@ impl ChatProvider for OpenAiCompat {
                         err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")
                     ));
                     return;
+                }
+                // The usage chunk has an empty `choices` array.
+                if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+                    let n = |x: Option<&Value>| x.and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cached = n(u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+                        .max(n(u.get("prompt_cache_hit_tokens")));
+                    usage = Some(crate::usage::Usage {
+                        input: n(u.get("prompt_tokens")),
+                        cached,
+                        output: n(u.get("completion_tokens")),
+                        estimated: false,
+                    });
                 }
                 let Some(choice) = v
                     .get("choices")
@@ -190,6 +205,9 @@ impl ChatProvider for OpenAiCompat {
                     name,
                     arguments,
                 });
+            }
+            if let Some(u) = usage {
+                yield ChatEvent::Usage(u);
             }
             yield ChatEvent::Done;
             let _ = finish;

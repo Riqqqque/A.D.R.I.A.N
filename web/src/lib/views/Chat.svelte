@@ -86,6 +86,8 @@
               detail: f.data.detail ? String(f.data.detail) : undefined
             }
           ];
+        } else if (f.event === 'notice') {
+          mine.text += `\n\n(${String(f.data.message ?? '')})`;
         } else if (f.event === 'error') {
           mine.text += `\n\n${String(f.data.message ?? 'error')}`;
         } else if (f.event === 'done') {

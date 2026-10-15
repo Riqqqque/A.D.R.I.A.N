@@ -1,4 +1,4 @@
-import { get, setCsrf } from './api';
+import { ApiError, get, setCsrf } from './api';
 import type { MeResponse, SetupFlags, User } from './types';
 
 export type Phase = 'loading' | 'setup' | 'login' | 'app';
@@ -20,7 +20,9 @@ class Session {
       }
       await this.loadMe();
     } catch (e) {
-      this.error = e instanceof Error ? e.message : String(e);
+      // 401 just means "not signed in yet"; anything else is a real problem.
+      const signedOut = e instanceof ApiError && (e.code === 'unauthorized' || e.code === 'http_401');
+      this.error = signedOut ? '' : e instanceof Error ? e.message : String(e);
       this.phase = 'login';
     }
   }
