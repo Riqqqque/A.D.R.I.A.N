@@ -132,6 +132,7 @@ async fn remove(
         vec![P::T(id.clone())],
     )
     .await?;
+    s.emit("endpoint", json!({"event": "removed", "id": id}));
     Ok(Json(json!({"ok": true})))
 }
 
@@ -164,7 +165,7 @@ async fn test(
             let base = s
                 .get_setting("public_url")
                 .await?
-                .unwrap_or_else(|| format!("http://{}", s.config.bind));
+                .unwrap_or_else(|| s.config.base_url());
             let url = format!("{}/media/{token}", base.trim_end_matches('/'));
             match s.ha.play_media(entity, &url, Some(0.7)).await {
                 Ok(()) => Ok(Json(json!({
@@ -184,6 +185,7 @@ async fn test(
             let mut env = adrian_protocol::Envelope::new(adrian_protocol::Message::Speak {
                 media_url: format!("/media/{token}"),
                 text: Some(format!("Test — {name}")),
+                alarm: None,
             });
             env.request_id = delivery.clone();
             // Arm before sending so a fast ack cannot be missed.

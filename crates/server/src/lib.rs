@@ -10,6 +10,7 @@ pub mod ha;
 pub mod memory;
 pub mod providers;
 pub mod scheduler;
+pub mod secrets;
 pub mod state;
 pub mod tools;
 pub mod util;
@@ -33,8 +34,11 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>, error::ApiErro
         .user_agent(concat!("adrian/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(error::ApiError::internal)?;
+    let secret_box = Arc::new(secrets::SecretBox::load_or_create(
+        &secrets::SecretBox::key_path(&config.data_dir),
+    )?);
     let (events, _) = tokio::sync::broadcast::channel(256);
-    let ha = ha::HaManager::new(db.clone(), http.clone(), events.clone());
+    let ha = ha::HaManager::new(db.clone(), http.clone(), events.clone(), secret_box.clone());
     let state = Arc::new(AppState {
         config,
         db,
@@ -45,6 +49,7 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>, error::ApiErro
         audio: audio::AudioRegistry::new().into(),
         satellites: api::satellites::SatelliteHub::new().into(),
         ha,
+        secret_box,
         started: std::time::Instant::now(),
     });
     Ok(state)
@@ -54,7 +59,12 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>, error::ApiErro
 /// one-use setup-token bootstrap.
 pub async fn start_services(state: &Arc<AppState>) -> Result<(), error::ApiError> {
     auth::bootstrap(&state.db, &state.config.data_dir).await?;
+    let sealed = state.seal_legacy_secrets().await?;
+    if sealed > 0 {
+        tracing::info!(count = sealed, "encrypted legacy plaintext secrets");
+    }
     state.scheduler.clone().start(state.clone());
+    scheduler::replicas::spawn_sync_on_changes(state.clone());
     Arc::new(state.ha.clone()).spawn();
     // Periodic housekeeping: expired/revoked sessions.
     let gc_db = state.db.clone();

@@ -112,8 +112,11 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-fn session_cookie(value: &str, max_age_secs: i64) -> String {
-    format!("{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}")
+fn session_cookie(value: &str, max_age_secs: i64, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{secure}"
+    )
 }
 
 /// First-boot: mint the one-use setup token if the system is unclaimed.
@@ -302,7 +305,10 @@ async fn setup_claim(
 
     let uid = created?;
     Ok((
-        [(SET_COOKIE, session_cookie(&session_id, SESSION_TTL_SECS))],
+        [(
+            SET_COOKIE,
+            session_cookie(&session_id, SESSION_TTL_SECS, s.config.tls.is_some()),
+        )],
         Json(json!({
             "ok": true,
             "csrf": csrf,
@@ -371,7 +377,10 @@ async fn login(
     )
     .await?;
     Ok((
-        [(SET_COOKIE, session_cookie(&session_id, SESSION_TTL_SECS))],
+        [(
+            SET_COOKIE,
+            session_cookie(&session_id, SESSION_TTL_SECS, s.config.tls.is_some()),
+        )],
         Json(json!({
             "ok": true,
             "csrf": csrf,
@@ -388,7 +397,7 @@ async fn logout(user: AuthUser, State(s): State<AppState>) -> Result<Response, A
     )
     .await?;
     Ok((
-        [(SET_COOKIE, session_cookie("", 0))],
+        [(SET_COOKIE, session_cookie("", 0, s.config.tls.is_some()))],
         Json(json!({"ok": true})),
     )
         .into_response())

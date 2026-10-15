@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+pub mod replicas;
+
 #[derive(Clone)]
 pub struct SchedulerHandle {
     notify: Arc<Notify>,
@@ -687,6 +689,25 @@ async fn claim_and_deliver(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Next occurrence of a recurring alarm strictly after `now`; `None` for
+/// one-shot alarms (which are then done).
+fn next_occurrence_after(alarm: &AlarmRow, now: i64) -> Option<i64> {
+    if alarm.recurrence == "none" {
+        return None;
+    }
+    let (Some(hhmm), Ok(tz)) = (alarm.local_time.clone(), TimeZone::get(&alarm.timezone)) else {
+        return None;
+    };
+    next_clock_time(
+        &tz,
+        &hhmm,
+        &alarm.recurrence,
+        jiff::Timestamp::from_second(now).unwrap_or_else(|_| jiff::Timestamp::now()),
+    )
+    .ok()
+    .map(|z| z.timestamp().as_second())
+}
+
 async fn finish(
     state: &AppState,
     alarm: &AlarmRow,
@@ -696,19 +717,7 @@ async fn finish(
     detail: &str,
 ) {
     let now = util::now_unix();
-    // Recurrence: compute next occurrence after now, else mark done.
-    let mut next: Option<i64> = None;
-    if alarm.recurrence != "none"
-        && let (Some(hhmm), Ok(tz)) = (alarm.local_time.clone(), TimeZone::get(&alarm.timezone))
-        && let Ok(z) = next_clock_time(
-            &tz,
-            &hhmm,
-            &alarm.recurrence,
-            jiff::Timestamp::from_second(now).unwrap_or_else(|_| jiff::Timestamp::now()),
-        )
-    {
-        next = Some(z.timestamp().as_second());
-    }
+    let next = next_occurrence_after(alarm, now);
     let new_status = if next.is_some() { "scheduled" } else { "done" };
     let aid = alarm.id.clone();
     let did = delivery_id.to_string();
@@ -796,7 +805,7 @@ async fn deliver(state: &AppState, alarm: AlarmRow, delivery_id: String, occurre
                     .await
                     .ok()
                     .flatten()
-                    .unwrap_or_else(|| format!("http://{}", state.config.bind));
+                    .unwrap_or_else(|| state.config.base_url());
                 let url = format!("{}/media/{token}", base.trim_end_matches('/'));
                 match state.ha.play_media(&entity, &url, Some(alarm.volume)).await {
                     Ok(()) => (
@@ -859,12 +868,18 @@ async fn deliver(state: &AppState, alarm: AlarmRow, delivery_id: String, occurre
             } else {
                 // Push playback over the live session; the satellite fetches
                 // the tokenized media URL and acks with request_id=delivery.
+                // The alarm reference lets a satellite that already rang this
+                // occurrence from its local replica ack without ringing twice.
                 let mut env = adrian_protocol::Envelope::new(adrian_protocol::Message::Speak {
                     media_url: format!("/media/{token}"),
                     text: Some(if alarm.label.is_empty() {
                         "Alarm".into()
                     } else {
                         alarm.label.clone()
+                    }),
+                    alarm: Some(adrian_protocol::AlarmRef {
+                        alarm_id: alarm.id.clone(),
+                        occurrence_unix: occurrence,
                     }),
                 });
                 env.request_id = delivery_id.clone();
@@ -1000,6 +1015,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             bind: "127.0.0.1:0".parse().unwrap(),
             web_dir: dir.path().to_path_buf(),
+            tls: None,
         };
         let state = crate::build_state(config).await.unwrap();
         let now = util::now_unix();

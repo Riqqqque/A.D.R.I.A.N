@@ -1,7 +1,9 @@
 //! WebSocket satellite session tests: bearer auth, protocol envelopes,
 //! binary PCM capture, and alarm delivery pushed to a connected satellite.
 
-use adrian_protocol::{Envelope, Message, PROTOCOL_VERSION, SessionEndReason};
+use adrian_protocol::{
+    AlarmReplica, Envelope, LocalAlarmFiring, Message, PROTOCOL_VERSION, SessionEndReason,
+};
 use adrian_server::{Config, build_router, build_state, start_services};
 use axum::body::Body;
 use axum::extract::connect_info::ConnectInfo;
@@ -69,6 +71,7 @@ async fn harness() -> Harness {
         data_dir: dir.path().to_path_buf(),
         bind: "127.0.0.1:0".parse().unwrap(),
         web_dir: dir.path().join("web"),
+        tls: None,
     };
     let state = build_state(config).await.unwrap();
     start_services(&state).await.unwrap();
@@ -161,7 +164,33 @@ async fn ws_connect(
     Ok(ws)
 }
 
+/// Next envelope, skipping alarm replica syncs (pushed on connect and after
+/// every alarm change; see `recv_sync`).
 async fn recv_env(
+    ws: &mut (impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin),
+    timeout: Duration,
+) -> Envelope {
+    loop {
+        let env = recv_any(ws, timeout).await;
+        if !matches!(env.message, Message::AlarmReplicaSync { .. }) {
+            return env;
+        }
+    }
+}
+
+/// Next alarm replica sync, skipping anything else.
+async fn recv_sync(
+    ws: &mut (impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin),
+    timeout: Duration,
+) -> Vec<AlarmReplica> {
+    loop {
+        if let Message::AlarmReplicaSync { alarms } = recv_any(ws, timeout).await.message {
+            return alarms;
+        }
+    }
+}
+
+async fn recv_any(
     ws: &mut (impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin),
     timeout: Duration,
 ) -> Envelope {
@@ -324,10 +353,18 @@ async fn satellite_alarm_is_delivered_over_ws() {
 
     // The scheduler pushes a Speak envelope addressed to the delivery id.
     let speak = recv_env(&mut ws, Duration::from_secs(15)).await;
-    let Message::Speak { media_url, .. } = &speak.message else {
+    let Message::Speak {
+        media_url, alarm, ..
+    } = &speak.message
+    else {
         panic!("expected speak, got {:?}", speak.message);
     };
     assert!(media_url.starts_with("/media/"));
+    let alarm = alarm
+        .as_ref()
+        .expect("alarm deliveries carry the alarm ref");
+    assert_eq!(alarm.alarm_id, "wsal");
+    assert_eq!(alarm.occurrence_unix, now - 1);
 
     // Ack it like the real satellite would.
     let mut ack = Envelope::new(Message::Ack {
@@ -425,4 +462,203 @@ async fn satellite_alarm_offline_is_failed_not_silent() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Create a satellite endpoint for the harness satellite; returns its id.
+async fn satellite_endpoint(h: &Harness) -> String {
+    let router = build_router(h.state.clone());
+    let (s, _, res) = json_request(
+        &router,
+        "POST",
+        "/api/endpoints",
+        Some(json!({
+            "name": "Sat",
+            "kind": "satellite",
+            "satellite_id": h.satellite_id,
+        })),
+        Some(&h.cookie),
+        Some(&h.csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    res["id"].as_str().unwrap().to_string()
+}
+
+async fn insert_alarm(h: &Harness, id: &str, due: i64, endpoint_id: &str) {
+    h.state
+        .db
+        .exec(
+            "INSERT INTO alarms(id,owner_id,label,kind,timezone,recurrence,next_due_utc,endpoint_id,status,created_at,updated_at)
+             VALUES(?1,1,'wake up','alarm','UTC','none',?2,?3,'scheduled',1,1)",
+            vec![
+                adrian_server::db::P::T(id.into()),
+                adrian_server::db::P::I(due),
+                adrian_server::db::P::T(endpoint_id.into()),
+            ],
+        )
+        .await
+        .unwrap();
+}
+
+async fn delivery(h: &Harness, alarm_id: &str) -> Option<(String, String)> {
+    h.state
+        .db
+        .q1(
+            "SELECT status, detail FROM alarm_deliveries WHERE alarm_id = ?1",
+            vec![adrian_server::db::P::T(alarm_id.into())],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .await
+        .unwrap()
+}
+
+async fn report_ack<S>(ws: &mut S, fired: Vec<LocalAlarmFiring>) -> String
+where
+    S: StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>>
+        + futures_util::Sink<WsMsg, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
+{
+    let env = Envelope::new(Message::AlarmLocalReport { fired });
+    let rid = env.request_id.clone();
+    send_env(ws, env).await.unwrap();
+    loop {
+        let e = recv_env(ws, Duration::from_secs(10)).await;
+        if e.request_id == rid {
+            let Message::Ack { ok, detail } = e.message else {
+                panic!("expected ack, got {:?}", e.message);
+            };
+            assert!(ok, "{detail:?}");
+            return detail.unwrap_or_default();
+        }
+    }
+}
+
+#[tokio::test]
+async fn replicas_sync_on_connect_and_on_cancel() {
+    let h = harness().await;
+    let ep = satellite_endpoint(&h).await;
+    let due = adrian_server::util::now_unix() + 3600;
+    insert_alarm(&h, "rep1", due, &ep).await;
+
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    let alarms = recv_sync(&mut ws, Duration::from_secs(10)).await;
+    assert_eq!(alarms.len(), 1, "{alarms:?}");
+    assert_eq!(alarms[0].alarm_id, "rep1");
+    assert_eq!(alarms[0].occurrence_unix, due);
+    assert_eq!(alarms[0].label, "wake up");
+
+    // Canceling through the API pushes a new, empty set.
+    let router = build_router(h.state.clone());
+    let (s, _, res) = json_request(
+        &router,
+        "DELETE",
+        "/api/alarms/rep1",
+        None,
+        Some(&h.cookie),
+        Some(&h.csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    let alarms = recv_sync(&mut ws, Duration::from_secs(10)).await;
+    assert!(alarms.is_empty(), "{alarms:?}");
+}
+
+#[tokio::test]
+async fn local_firing_corrects_a_failed_offline_delivery() {
+    let h = harness().await;
+    let ep = satellite_endpoint(&h).await;
+    let due = adrian_server::util::now_unix() - 1;
+    insert_alarm(&h, "off1", due, &ep).await;
+    h.state.scheduler.wake();
+
+    // Satellite offline: the server records a failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some((status, _)) = delivery(&h, "off1").await
+            && status != "delivering"
+        {
+            assert_eq!(status, "failed");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delivery never finished"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // It rang locally; on reconnect it reports and the ledger is corrected.
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    let detail = report_ack(
+        &mut ws,
+        vec![LocalAlarmFiring {
+            alarm_id: "off1".into(),
+            occurrence_unix: due,
+            fired_at_unix: due,
+        }],
+    )
+    .await;
+    assert_eq!(detail, "1 recorded");
+    let (status, detail) = delivery(&h, "off1").await.unwrap();
+    assert_eq!(status, "played");
+    assert!(detail.contains("locally"), "{detail}");
+}
+
+#[tokio::test]
+async fn local_firing_before_server_delivery_advances_the_alarm() {
+    let h = harness().await;
+    let ep = satellite_endpoint(&h).await;
+    // Future due time: the server has not delivered it yet (as when it was
+    // down at due time and the satellite reports first).
+    let due = adrian_server::util::now_unix() + 3600;
+    insert_alarm(&h, "early1", due, &ep).await;
+    // An alarm routed elsewhere must not be touchable by this satellite.
+    h.state
+        .db
+        .exec(
+            "INSERT INTO endpoints(id,name,kind,config,created_at)
+             VALUES('ep-other','Other','browser','{}',1)",
+            vec![],
+        )
+        .await
+        .unwrap();
+    insert_alarm(&h, "other1", due, "ep-other").await;
+
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    let detail = report_ack(
+        &mut ws,
+        vec![
+            LocalAlarmFiring {
+                alarm_id: "early1".into(),
+                occurrence_unix: due,
+                fired_at_unix: due,
+            },
+            LocalAlarmFiring {
+                alarm_id: "other1".into(),
+                occurrence_unix: due,
+                fired_at_unix: due,
+            },
+            // Unknown occurrence of a routed alarm: ignored.
+            LocalAlarmFiring {
+                alarm_id: "early1".into(),
+                occurrence_unix: due + 60,
+                fired_at_unix: due,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(detail, "1 recorded");
+    let (status, _) = delivery(&h, "early1").await.unwrap();
+    assert_eq!(status, "played");
+    let alarm_status: String = h
+        .state
+        .db
+        .q1("SELECT status FROM alarms WHERE id='early1'", vec![], |r| {
+            r.get(0)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alarm_status, "done");
+    assert!(delivery(&h, "other1").await.is_none());
 }

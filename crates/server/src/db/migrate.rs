@@ -33,8 +33,8 @@ const MIGRATIONS: &[&str] = &[
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
-    -- Server-side only. PREVIEW: stored unencrypted at rest; see docs —
-    -- no encryption claim is made for this build.
+    -- Server-side only. Values are sealed by crate::secrets (enc:v1:);
+    -- rows from older builds are re-sealed at startup.
     CREATE TABLE secrets (
         name TEXT PRIMARY KEY,
         value TEXT NOT NULL,

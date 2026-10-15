@@ -7,6 +7,7 @@ pub mod openai_responses;
 
 use crate::db::{Db, P};
 use crate::error::ApiError;
+use crate::secrets::SecretBox;
 use futures_util::Stream;
 use serde_json::Value;
 use std::pin::Pin;
@@ -192,6 +193,7 @@ pub fn base_is_local(base_url: &str) -> bool {
 /// Returns an honest error when the endpoint doesn't support it.
 pub async fn transcribe_wav(
     db: &Db,
+    sb: &SecretBox,
     http: reqwest::Client,
     wav: Vec<u8>,
 ) -> Result<String, ApiError> {
@@ -204,7 +206,9 @@ pub async fn transcribe_wav(
         .ok_or_else(|| {
             ApiError::NotConfigured("no AI provider configured for speech-to-text".into())
         })?;
-    let key = secret_for(db, &row.secret_name).await?.unwrap_or_default();
+    let key = secret_for(db, sb, &row.secret_name)
+        .await?
+        .unwrap_or_default();
     let stt_model = match row.kind.as_str() {
         "openai_responses" => "whisper-1".to_string(),
         _ => row.model.clone(),
@@ -257,23 +261,26 @@ pub async fn transcribe_wav(
     Ok(text)
 }
 
-async fn secret_for(db: &Db, name: &Option<String>) -> Result<Option<String>, ApiError> {
-    match name {
-        Some(n) => {
-            db.q1(
-                "SELECT value FROM secrets WHERE name = ?1",
-                vec![P::T(n.clone())],
-                |r| r.get(0),
-            )
-            .await
-        }
-        None => Ok(None),
-    }
+async fn secret_for(
+    db: &Db,
+    sb: &SecretBox,
+    name: &Option<String>,
+) -> Result<Option<String>, ApiError> {
+    let Some(n) = name else { return Ok(None) };
+    let stored: Option<String> = db
+        .q1(
+            "SELECT value FROM secrets WHERE name = ?1",
+            vec![P::T(n.clone())],
+            |r| r.get(0),
+        )
+        .await?;
+    stored.map(|v| sb.open(n, &v)).transpose()
 }
 
 /// Build the default enabled provider (or a specific one by id).
 pub async fn load_provider(
     db: &Db,
+    sb: &SecretBox,
     http: reqwest::Client,
     id: Option<&str>,
 ) -> Result<(Arc<dyn ChatProvider>, ProviderRow), ApiError> {
@@ -297,7 +304,7 @@ pub async fn load_provider(
             row.label
         )));
     }
-    let key = secret_for(db, &row.secret_name).await?;
+    let key = secret_for(db, sb, &row.secret_name).await?;
     let needs_key = row.kind == "openai_responses" || row.base_url.contains("deepseek");
     if needs_key && key.as_deref().unwrap_or("").is_empty() {
         return Err(ApiError::NotConfigured(format!(

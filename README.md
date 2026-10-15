@@ -9,15 +9,17 @@ SQLite database.
 
 **Status: Gate A preview + early Gate B.** The server, web UI, provider
 adapters, Home Assistant integration, memory, alarm scheduler, and the
-satellite pairing, streaming voice sessions, satellite alarm playback, tray
-UI, and backup restore are implemented and tested. Wake word is implemented
-behind an opt-in feature + local model file (see below).
+satellite pairing, streaming voice sessions, satellite alarm playback, local
+alarm replicas on satellites, tray UI, backup restore, optional built-in TLS,
+and encryption of stored secrets are implemented and tested. Wake word is
+implemented behind an opt-in feature + local model file (see below).
 See `TEST_REPORT.md` for what is actually verified versus skipped.
 
 ## Requirements
 
-- Rust stable (developed on 1.94, MSVC toolchain) + a C compiler
-  (Visual Studio Build Tools on Windows) for bundled SQLite.
+- Rust 1.88 or newer (minimum checked with `cargo +1.88.0 check`; developed
+  on 1.94, MSVC toolchain) + a C compiler (Visual Studio Build Tools on
+  Windows) for bundled SQLite.
 - Node.js 18+ (developed on Node 24) for the frontend build.
 - Optional: a Home Assistant instance with a long-lived access token.
 - Optional: an OpenAI, DeepSeek, or local OpenAI-compatible inference endpoint.
@@ -91,11 +93,30 @@ re-initializes the default device instead of killing the client.
 Wake word (opt-in): build with `cargo build --release -p adrian-satellite
 --features wake-word` and set `wake_word.model_path` (a rustpotter `.rpw`
 model, e.g. built with `rustpotter-cli` from a few recordings) plus an
-optional `threshold` in `%APPDATA%drian\satellite\config.json`.
+optional `threshold` in `%APPDATA%\adrian\satellite\config\config.json`.
 Spotting is fully local on a 2-second rolling buffer; detection opens a
 capture that auto-endpoints on ~0.9 s of trailing silence. Note: the
 feature pulls the candle ML stack. No model ships with the repo, so this
 path is compiled but not exercised on hardware in the test report.
+
+Local alarm replicas: every scheduled alarm routed to a satellite endpoint
+is mirrored to that satellite (`AlarmReplicaSync`, pushed on connect and
+after every alarm change) and kept in `replicas.json` next to its config.
+The server still delivers alarms. The satellite rings a replica itself (a
+synthesized tone plus the spoken label, three rounds) only when it cannot
+reach the server at due time, or when the server has not delivered it 60 s
+after due. On reconnect it reports what it rang (`AlarmLocalReport`) and the
+delivery ledger records that it rang locally (output not confirmed) instead
+of a failure. Alarm
+`Speak` messages carry the alarm id and occurrence, so a satellite that
+already rang an occurrence acks a late server delivery without ringing
+twice. Only the next occurrence of a recurring alarm is replicated, and
+replicas more than 6 h overdue are dropped without ringing.
+
+If the server uses a self-signed or private-CA certificate, pass it when
+pairing: `adrian-satellite pair --server https://host:8787 --code 123456
+--ca C:\path\to\cert.pem`. The path is stored as `ca_cert` in the
+satellite config and trusted in addition to the system roots.
 
 Fallback: the one-shot WAV path `POST /api/satellite/utterance` remains for
 simple integrations.
@@ -107,11 +128,23 @@ simple integrations.
 | `ADRIAN_DATA_DIR` | `./data` | database, backups, setup token |
 | `ADRIAN_BIND` | `127.0.0.1:8787` | bind address (`0.0.0.0:8787` for LAN) |
 | `ADRIAN_WEB_DIR` | `web/build` | built frontend location |
+| `ADRIAN_TLS_CERT` / `ADRIAN_TLS_KEY` | unset | PEM certificate chain and private key; when both are set the server speaks HTTPS only |
+| `ADRIAN_KEY_FILE` | `<data dir>/secret.key` | key that encrypts stored secrets (DPAPI-wrapped on Windows) |
 | `RUST_LOG` | `info,adrian=debug` | log filter |
 
-There is no built-in TLS. For LAN use, prefer a TLS-terminating reverse
-proxy. See `docs/SECURITY.md` for the security model and honest limitations
-(including: data at rest is **not** encrypted in this build).
+TLS is off by default. For LAN use, set `ADRIAN_TLS_CERT`/`ADRIAN_TLS_KEY` or
+put a TLS-terminating reverse proxy in front. With built-in TLS the session
+cookie is marked `Secure` and default media URLs use `https://`. A
+self-signed certificate for testing must be a leaf certificate
+(`basicConstraints=CA:FALSE`), for example:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj "/CN=adrian" -addext "subjectAltName=DNS:adrian.local,IP:192.168.1.10" -addext "basicConstraints=critical,CA:FALSE" -addext "extendedKeyUsage=serverAuth"
+```
+
+Provider API keys and the Home Assistant token are encrypted in the
+database. See `docs/SECURITY.md` for the security model and honest
+limitations (memory, chat history and other data are **not** encrypted).
 
 ## Architecture
 

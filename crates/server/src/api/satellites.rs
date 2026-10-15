@@ -314,8 +314,13 @@ async fn utterance(
     let state = Arc::new(s);
 
     ensure_stt_allowed(&state).await?;
-    let transcript =
-        providers::transcribe_wav(&state.db, state.http.clone(), body.to_vec()).await?;
+    let transcript = providers::transcribe_wav(
+        &state.db,
+        &state.secret_box,
+        state.http.clone(),
+        body.to_vec(),
+    )
+    .await?;
     let user = sat_auth_user(&state, &sat).await?;
 
     let conv_id =
@@ -452,6 +457,16 @@ impl SatelliteHub {
         }
     }
 
+    /// Ids of all connected satellites.
+    pub fn connected_ids(&self) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// True while a session for this satellite is connected.
     pub fn connected(&self, satellite_id: &str) -> bool {
         self.sessions
@@ -552,6 +567,7 @@ async fn session_loop(s: AppState, sat: Satellite, sock: WebSocket) {
     });
 
     let state = Arc::new(s);
+    crate::scheduler::replicas::sync(&state, &sat.id).await;
     let conv_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut capture: Option<Capture> = None;
     let mut seen_keys: HashSet<String> = HashSet::new();
@@ -639,6 +655,21 @@ async fn session_loop(s: AppState, sat: Satellite, sock: WebSocket) {
                             }),
                         );
                     }
+                    proto::Message::AlarmLocalReport { fired } => {
+                        match crate::scheduler::replicas::record_local_firings(
+                            &state, &sat.id, &sat.name, &fired,
+                        )
+                        .await
+                        {
+                            Ok(n) => {
+                                // The satellite clears its pending report on
+                                // this ack; recorded firings (and ones the
+                                // server rejected) are both settled.
+                                send_ack(&tx, &env.request_id, true, format!("{n} recorded"));
+                            }
+                            Err(e) => send_ack(&tx, &env.request_id, false, e.to_string()),
+                        }
+                    }
                     proto::Message::PairRequest { .. } => {
                         let mut e = proto::Envelope::new(proto::Message::PairRejected {
                             reason: "pairing uses POST /api/satellite/pair".into(),
@@ -671,7 +702,14 @@ async fn finish_utterance(
         return;
     }
     let wav = pcm_s16le_to_wav(&cap.pcm, cap.sample_rate);
-    let transcript = match providers::transcribe_wav(&state.db, state.http.clone(), wav).await {
+    let transcript = match providers::transcribe_wav(
+        &state.db,
+        &state.secret_box,
+        state.http.clone(),
+        wav,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
             send_ack(tx, "stt", false, format!("stt failed: {e}"));
@@ -734,6 +772,7 @@ async fn finish_utterance(
         } else {
             format!("error: {error}")
         }),
+        alarm: None,
     });
     env.device_id = Some(sat.id.clone());
     send_env(tx, env);

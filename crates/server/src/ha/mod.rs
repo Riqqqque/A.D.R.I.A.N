@@ -25,6 +25,7 @@ pub struct HaManager {
     db: Db,
     http: reqwest::Client,
     events: broadcast::Sender<ServerEvent>,
+    secret_box: Arc<crate::secrets::SecretBox>,
     reload: Arc<Notify>,
     status: Arc<RwLock<HaStatus>>,
 }
@@ -92,11 +93,17 @@ pub struct LightOutcome {
 }
 
 impl HaManager {
-    pub fn new(db: Db, http: reqwest::Client, events: broadcast::Sender<ServerEvent>) -> Self {
+    pub fn new(
+        db: Db,
+        http: reqwest::Client,
+        events: broadcast::Sender<ServerEvent>,
+        secret_box: Arc<crate::secrets::SecretBox>,
+    ) -> Self {
         Self {
             db,
             http,
             events,
+            secret_box,
             reload: Arc::new(Notify::new()),
             status: Arc::new(RwLock::new(HaStatus {
                 configured: false,
@@ -194,11 +201,12 @@ impl HaManager {
             .db
             .q1(
                 "SELECT value FROM secrets WHERE name = ?1",
-                vec![P::T(secret)],
+                vec![P::T(secret.clone())],
                 |r| r.get::<_, String>(0),
             )
             .await?
             .ok_or_else(|| ApiError::NotConfigured("home assistant token missing".into()))?;
+        let token = self.secret_box.open(&secret, &token)?;
         Ok(Some((url, token)))
     }
 

@@ -20,11 +20,15 @@ argon2 = "0.6.0"
 async-stream = "0.3.6"
 axum = { version = "0.8.9", features = ["ws"] }
 axum-extra = { version = "0.12.6", features = ["cookie"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
 futures-util = "0.3.34"
 jiff = "0.2.37"
 rand = "0.10.2"
 reqwest = { version = "0.13.5", features = ["json", "stream", "multipart"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11.0"
@@ -42,3 +46,6 @@ http-body-util = "0.1.5"
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

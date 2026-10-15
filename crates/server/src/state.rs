@@ -30,6 +30,8 @@ pub struct AppState {
     /// Live satellite websocket sessions for server → device pushes.
     pub satellites: Arc<crate::api::satellites::SatelliteHub>,
     pub ha: crate::ha::HaManager,
+    /// Seals/opens rows of the `secrets` table.
+    pub secret_box: Arc<crate::secrets::SecretBox>,
     pub started: Instant,
 }
 
@@ -72,28 +74,65 @@ impl AppState {
     }
 
     pub async fn set_secret(&self, name: &str, value: &str) -> Result<(), ApiError> {
+        let sealed = self.secret_box.seal(name, value)?;
         self.db
             .exec(
                 "INSERT INTO secrets(name,value,created_at) VALUES(?1,?2,?3)
                  ON CONFLICT(name) DO UPDATE SET value = excluded.value",
-                vec![
-                    P::T(name.to_string()),
-                    P::T(value.to_string()),
-                    P::I(util::now_unix()),
-                ],
+                vec![P::T(name.to_string()), P::T(sealed), P::I(util::now_unix())],
             )
             .await?;
         Ok(())
     }
 
     pub async fn get_secret(&self, name: &str) -> Result<Option<String>, ApiError> {
-        self.db
+        let stored: Option<String> = self
+            .db
             .q1(
                 "SELECT value FROM secrets WHERE name = ?1",
                 vec![P::T(name.to_string())],
                 |r| r.get(0),
             )
-            .await
+            .await?;
+        stored.map(|v| self.secret_box.open(name, &v)).transpose()
+    }
+
+    /// Whether a secret row exists, without decrypting it.
+    pub async fn has_secret(&self, name: &str) -> Result<bool, ApiError> {
+        Ok(self
+            .db
+            .q1(
+                "SELECT 1 FROM secrets WHERE name = ?1",
+                vec![P::T(name.to_string())],
+                |r| r.get::<_, i64>(0),
+            )
+            .await?
+            .is_some())
+    }
+
+    /// Encrypt any secrets written before encryption at rest existed.
+    pub async fn seal_legacy_secrets(&self) -> Result<usize, ApiError> {
+        let rows = self
+            .db
+            .q("SELECT name, value FROM secrets", vec![], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .await?;
+        let mut sealed = 0;
+        for (name, value) in rows {
+            if crate::secrets::SecretBox::is_sealed(&value) {
+                continue;
+            }
+            let v = self.secret_box.seal(&name, &value)?;
+            self.db
+                .exec(
+                    "UPDATE secrets SET value = ?1 WHERE name = ?2 AND value = ?3",
+                    vec![P::T(v), P::T(name), P::T(value)],
+                )
+                .await?;
+            sealed += 1;
+        }
+        Ok(sealed)
     }
 
     /// Which first-run pieces are configured — drives honest empty states.

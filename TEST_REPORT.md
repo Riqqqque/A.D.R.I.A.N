@@ -1,4 +1,8 @@
-# Test report — Gate A + early Gate B
+# Test report — Gate A + Gate B + local alarm replicas
+
+**Update 2026-10-14:** secrets encryption at rest, optional built-in TLS, and
+satellite local alarm replicas added. Rows `C-*` below cover them; `A-UNIT`
+and `A-CLIPPY` were re-run on the same toolchain plus a 1.88 MSRV check.
 
 **Commits:** `1529f82` … `de88194`+ (see `git log`; this file is amended into the satellite commit)
 **Date:** 2026-09-17
@@ -16,7 +20,9 @@ reproducible with the commands shown).
 |---|---|---|---|---|---|
 | A-FMT | `cargo fmt --all --check` | clean | clean | toolchain output | PASS |
 | A-CLIPPY | `cargo clippy --workspace` | 0 warnings | 0 warnings | toolchain output | PASS |
-| A-UNIT | `cargo test --workspace` | all pass | 28/28 pass (2 protocol, 15 server lib, 7 HTTP integration, 4 WS session) | toolchain output | PASS |
+| A-UNIT | `cargo test --workspace` | all pass | 40/40 pass (3 protocol, 4 satellite, 19 server lib, 7 HTTP integration, 7 WS session); 1 live TLS test ignored by default, run separately as C-TLS-SAT | toolchain output | PASS |
+| A-MSRV | `cargo +1.88.0 check --workspace --all-targets` | compiles on the declared `rust-version` | compiles | toolchain output | PASS |
+| A-WAKE-BUILD | `cargo check -p adrian-satellite --features wake-word` | compiles | compiles | toolchain output | PASS |
 | A-FE-CHECK | `cd web && npm run check` | 0 errors, 0 warnings | 0 errors, 0 warnings (a11y warnings from previous report all fixed — controls wrapped in labels) | svelte-check output | PASS |
 | A-FE-BUILD | `cd web && npm run build` | static output emitted | `web/build/index.html` + `_app/` written | build log | PASS |
 | A-SAT-BUILD | `cargo check -p adrian-satellite` | compiles | compiles (real client: cpal mic, global-hotkey PTT, reqwest transport, tts output) | toolchain output | PASS |
@@ -57,6 +63,21 @@ reproducible with the commands shown).
 | B-SAT-ALARM-OFF | same with satellite offline | honest failure | delivery row `failed`, detail "not connected" | ws_session test `satellite_alarm_offline_is_failed_not_silent` | PASS |
 | B-RESTORE | backup → mutate → `POST /api/diagnostics/restore` | original state returns; queries keep working | marker value restored; post-restore `/api/diagnostics` healthy; traversal + missing file rejected | integration test `backup_restore_roundtrip` | PASS |
 
+## Secrets, TLS, local alarm replicas
+
+| ID | Procedure | Expected | Observed | Evidence | Result |
+|---|---|---|---|---|---|
+| C-SECRETS | seal/open roundtrip, key reload from file, wrong key and wrong secret name | roundtrip ok; other key or name rejected | as expected | unit tests `seal_open_roundtrip_and_key_reload`, `wrong_name_or_key_is_rejected` | PASS |
+| C-SECRETS-STATE | `set_secret` + a legacy plaintext row, then `seal_legacy_secrets` | every stored value sealed, `get_secret` returns plaintext | both rows sealed, both read back | unit test `state_seals_new_and_legacy_secrets` | PASS |
+| C-DPAPI | key file on Windows | not the raw 32-byte key | DPAPI blob written and unwrapped by the same user | unit test `key_file_is_dpapi_wrapped` | PASS (same user only; see N-11) |
+| C-TLS | server with `ADRIAN_TLS_CERT`/`ADRIAN_TLS_KEY` (self-signed leaf, temp data dir, port 18787) | HTTPS works, plain HTTP refused, cookie `Secure` | `GET /api/setup/status` over HTTPS ok; plain HTTP got no response; setup claim cookie ends `; Secure`; only one of the two vars set → startup refused | live server | PASS |
+| C-TLS-SAT | satellite `http_client` / `ws_connector` against that server | untrusted without the CA; trusted with `--ca` over HTTPS and WSS | no CA → error; with CA → 200 and WSS handshake reaches the 401 device-token check | `cargo test -p adrian-satellite -- --ignored` with `ADRIAN_TEST_TLS_URL`/`ADRIAN_TEST_TLS_CA` | PASS |
+| C-REPLICA-SYNC | satellite alarm scheduled, satellite connects; then the alarm is canceled via API | sync with the alarm on connect; empty sync after cancel | as expected | ws_session test `replicas_sync_on_connect_and_on_cancel` | PASS |
+| C-REPLICA-REF | alarm `Speak` to a satellite | carries alarm id + occurrence | present | ws_session test `satellite_alarm_is_delivered_over_ws` | PASS |
+| C-LOCAL-FIX | offline delivery fails, satellite reconnects and reports a local firing | delivery row becomes `played`, detail says locally | `failed` → `played` with detail "rang locally on satellite … audibility not confirmed" | ws_session test `local_firing_corrects_a_failed_offline_delivery` | PASS |
+| C-LOCAL-FIRST | report before the server delivered; plus reports for another endpoint's alarm and an unknown occurrence | first recorded and the alarm advanced; others ignored | `1 recorded`, alarm `done`, nothing written for the foreign alarm | ws_session test `local_firing_before_server_delivery_advances_the_alarm` | PASS |
+| C-STORE | satellite replica store: grace while connected, ring-once, resync after a local firing, persistence, stale drop | no double ring; state survives restart | as expected | satellite unit tests in `replicas.rs` | PASS |
+
 ## Not run / skipped — needs real external resources
 
 | ID | Item | Why |
@@ -67,6 +88,8 @@ reproducible with the commands shown).
 | N-4 | Prompt-injection resistance vs a live model | needs N-1 → **NOT RUN** (server-side policy is model-independent and shared) |
 | N-5 | Satellite wake word, hot-unplug behavior, pre-wake privacy, false-wake metrics | wake word implemented (rustpotter, opt-in `wake-word` feature + `.rpw` model config; 2s local rolling buffer, silence endpointing) and hot-unplug re-init implemented — but neither exercised against real audio hardware/model → **NOT RUN** |
 | N-9 | Real STT round-trip (OpenAI whisper / local whisper server) and real mic capture + TTS playback | pipeline verified against a mock local `/audio/transcriptions` endpoint; no real STT service or mic session exercised → **NOT RUN** |
+| N-11 | DPAPI key on another Windows account/machine, and restoring a backup there | secrets unreadable, clear "re-enter" error | covered by code path, not exercised across accounts → **NOT RUN** |
+| N-12 | Satellite actually ringing a replica (tone + SAPI) on hardware, and the tray/console output during it | store logic unit-tested; audio output not exercised → **NOT RUN** |
 | N-10 | Satellite streaming session protocol (WS), tray UI, satellite-as-alarm-endpoint | WS protocol + alarm endpoint implemented and tested (B-WS-*, B-SAT-ALARM); tray icon implemented (Windows pump thread) but not visually exercised → **SUPERSEDED** (tray visual check pending) |
 | N-6 | Browser smoke test of full UI flows | UI serves and all backing APIs verified via curl/integration tests; full click-through not instrumented → **SKIPPED** |
 | N-7 | Scheduler restart dedup while an alarm was `ringing` at shutdown | covered by the reconcile integration test (delivery row blocks refire; recurring reschedules); no manual crash drill → **SUPERSEDED by A-RECONCILE** |

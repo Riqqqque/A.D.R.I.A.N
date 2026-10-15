@@ -44,7 +44,7 @@ async fn list_providers(
     let mut out = Vec::new();
     for r in rows {
         let has_key = match &r.secret_name {
-            Some(n) => s.get_secret(n).await?.is_some(),
+            Some(n) => s.has_secret(n).await?,
             None => false,
         };
         out.push(json!({
@@ -213,7 +213,8 @@ async fn test_provider(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     user.require_owner()?;
-    let (provider, row) = providers::load_provider(&s.db, s.http.clone(), Some(&id)).await?;
+    let (provider, row) =
+        providers::load_provider(&s.db, &s.secret_box, s.http.clone(), Some(&id)).await?;
     match provider.test().await {
         Ok(msg) => Ok(Json(json!({
             "ok": true, "detail": msg, "kind": row.kind, "model": row.model,
@@ -248,7 +249,7 @@ async fn get_ha(_user: AuthUser, State(s): State<AppState>) -> Result<Json<Value
         Some((url, secret, enabled, last_ok, last_err)) => json!({
             "configured": true,
             "url": url,
-            "has_token": s.get_secret(secret).await?.is_some(),
+            "has_token": s.has_secret(secret).await?,
             "enabled": *enabled != 0,
             "last_ok_at": last_ok,
             "last_error": last_err,

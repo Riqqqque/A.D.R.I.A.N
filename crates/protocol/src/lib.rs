@@ -71,6 +71,10 @@ pub enum Message {
     Speak {
         media_url: String,
         text: Option<String>,
+        /// Set when this is an alarm delivery, so the satellite can match it
+        /// to its local replica.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alarm: Option<AlarmRef>,
     },
     /// Satellite -> server: lifecycle status update.
     Status {
@@ -84,13 +88,26 @@ pub enum Message {
     },
 
     // ---- alarms ----
-    /// Server -> satellite: persist a local alarm replica (later gate).
+    /// Server -> satellite: persist or replace one local alarm replica.
     AlarmReplicaUpsert {
         alarm: AlarmReplica,
     },
+    /// Server -> satellite: drop a local alarm replica.
     AlarmReplicaCancel {
         alarm_id: String,
         occurrence_unix: i64,
+    },
+    /// Server -> satellite: the complete, authoritative replica set for this
+    /// satellite. Replicas not listed are dropped. Sent on connect and after
+    /// every alarm change.
+    AlarmReplicaSync {
+        alarms: Vec<AlarmReplica>,
+    },
+    /// Satellite -> server: replicas the satellite rang locally because the
+    /// server did not deliver them. Sent on every connect (possibly empty)
+    /// and after each local firing; the server acks with this request_id.
+    AlarmLocalReport {
+        fired: Vec<LocalAlarmFiring>,
     },
 }
 
@@ -114,8 +131,8 @@ pub enum SatelliteState {
     Disconnected,
 }
 
-/// A durable alarm replica pushed to a capable satellite so a critical alarm
-/// can fire locally even if the server is unreachable (Gate C deliverable).
+/// A durable alarm replica pushed to a satellite so an alarm can still ring
+/// locally when the satellite cannot reach the server at due time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmReplica {
     pub alarm_id: String,
@@ -125,6 +142,21 @@ pub struct AlarmReplica {
     pub volume: f32,
     pub label: String,
     pub schedule_version: u64,
+}
+
+/// Identifies one occurrence of an alarm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlarmRef {
+    pub alarm_id: String,
+    pub occurrence_unix: i64,
+}
+
+/// One locally rung alarm occurrence, reported back for the delivery ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAlarmFiring {
+    pub alarm_id: String,
+    pub occurrence_unix: i64,
+    pub fired_at_unix: i64,
 }
 
 impl Envelope {
@@ -179,6 +211,40 @@ mod tests {
         assert_eq!(back.request_id, env.request_id);
         assert_eq!(back.device_id.as_deref(), Some("sat-1"));
         assert!(matches!(back.message, Message::Status { .. }));
+    }
+
+    #[test]
+    fn alarm_replica_messages_roundtrip() {
+        let env = Envelope::new(Message::AlarmReplicaSync {
+            alarms: vec![AlarmReplica {
+                alarm_id: "a1".into(),
+                occurrence_unix: 1_800_000_000,
+                sound_id: "builtin:tone".into(),
+                volume: 0.7,
+                label: "Wake up".into(),
+                schedule_version: 3,
+            }],
+        });
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"alarm_replica_sync\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back.message, Message::AlarmReplicaSync { ref alarms } if alarms.len() == 1)
+        );
+
+        let env = Envelope::new(Message::AlarmLocalReport {
+            fired: vec![LocalAlarmFiring {
+                alarm_id: "a1".into(),
+                occurrence_unix: 1_800_000_000,
+                fired_at_unix: 1_800_000_001,
+            }],
+        });
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"alarm_local_report\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back.message, Message::AlarmLocalReport { ref fired } if fired.len() == 1)
+        );
     }
 
     #[test]

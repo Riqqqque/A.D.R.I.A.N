@@ -25,6 +25,11 @@ Apache-2.0 licensed. No GPL components are used in this build.
 | async-stream | 0.3 | SSE stream construction |
 | tokio-util | 0.7 | runtime helpers |
 | thiserror | 2.0 | error types |
+| chacha20poly1305 | 0.10 | encryption of stored secrets |
+| base64 | 0.22 | encoding of sealed secrets |
+| axum-server | 0.8 (`tls-rustls`) | built-in HTTPS listener |
+| rustls | 0.23 (`aws_lc_rs`) | TLS crypto provider selection |
+| windows-sys | 0.61 (Windows only) | DPAPI wrapping of the secrets key |
 
 Dev: `tempfile`, `http-body-util` (tests only).
 
@@ -49,6 +54,12 @@ serde, serde_json, thiserror only.
 | tts | 0.26 | local speech synthesis (SAPI on Windows) |
 | global-hotkey | 0.7 | push-to-talk key (Ctrl+Alt+Space) |
 | directories | 6.0 | per-user config dir resolution |
+| tokio-tungstenite | 0.28 | websocket session (rustls) |
+| rustls / rustls-native-certs / rustls-pki-types | 0.23 / 0.8 / 1.15 | trusting a pinned server CA |
+| tray-icon, windows-sys | 0.21, 0.61 (Windows only) | tray icon |
+| rustpotter, half | 3.0, 2.4 (optional `wake-word`) | local wake-word spotting |
+
+Dev: `tempfile` (tests only).
 
 ## npm — frontend (`web/`)
 

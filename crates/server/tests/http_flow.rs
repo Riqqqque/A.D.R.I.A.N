@@ -22,6 +22,7 @@ async fn harness() -> Harness {
         data_dir: dir.path().to_path_buf(),
         bind: "127.0.0.1:0".parse().unwrap(),
         web_dir: dir.path().join("web"),
+        tls: None,
     };
     let state = build_state(config).await.unwrap();
     start_services(&state).await.unwrap();
@@ -182,6 +183,7 @@ async fn data_survives_restart() {
             data_dir: data_dir.clone(),
             bind: "127.0.0.1:0".parse().unwrap(),
             web_dir: dir.path().join("web"),
+            tls: None,
         };
         let state = build_state(config).await.unwrap();
         start_services(&state).await.unwrap();
@@ -223,6 +225,7 @@ async fn data_survives_restart() {
         data_dir: data_dir.clone(),
         bind: "127.0.0.1:0".parse().unwrap(),
         web_dir: dir.path().join("web"),
+        tls: None,
     };
     let state = build_state(config).await.unwrap();
     start_services(&state).await.unwrap();

@@ -7,5 +7,6 @@ data/
 *.db-shm
 *.db-wal
 SETUP_TOKEN.txt
+secret.key
 server-run.log
 .tmp/

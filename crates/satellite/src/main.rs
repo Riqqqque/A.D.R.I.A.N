@@ -7,7 +7,7 @@
 //!
 //! Pairing is one-use-code based: `adrian-satellite pair --server <url>
 //! --code <6 digits> --name "Desk PC"` redeems a code minted in the web UI
-//! and stores a device token in %APPDATA%\adrian\satellite\config.json.
+//! and stores a device token in %APPDATA%\adrian\satellite\config\config.json.
 
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -17,7 +17,7 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
+mod replicas;
 mod tray;
 #[cfg(feature = "wake-word")]
 mod wake;
@@ -56,6 +57,11 @@ struct Config {
     /// wake-word` and a trained rustpotter `.rpw` model file. Audio never
     /// leaves the device; spotting runs locally on a rolling buffer.
     wake_word: Option<WakeWordCfg>,
+    /// Extra PEM CA certificate to trust, for a server using a self-signed
+    /// or private-CA certificate (`ADRIAN_TLS_CERT`). System roots are
+    /// always trusted too.
+    #[serde(default)]
+    ca_cert: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -233,31 +239,167 @@ fn speak(text: &str) {
     });
 }
 
+/// Speak and wait until speech finishes (bounded to 60 s).
+fn speak_blocking(text: &str) {
+    match tts::Tts::default() {
+        Ok(mut t) => {
+            if let Err(e) = t.speak(text, true) {
+                eprintln!("tts error: {e}");
+                return;
+            }
+            for _ in 0..600 {
+                if !t.is_speaking().unwrap_or(false) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        Err(e) => eprintln!("tts init error: {e}"),
+    }
+}
+
 /// Play server audio (alarm tone etc.) on the default output device.
 fn play_bytes(bytes: Vec<u8>) {
+    std::thread::spawn(move || play_bytes_blocking(bytes));
+}
+
+fn play_bytes_blocking(bytes: Vec<u8>) {
+    let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+        eprintln!("no default audio output device");
+        return;
+    };
+    let Ok(sink) = rodio::Sink::try_new(&handle) else {
+        eprintln!("could not create playback sink");
+        return;
+    };
+    match rodio::Decoder::new(Cursor::new(bytes)) {
+        Ok(decoder) => {
+            sink.append(decoder);
+            sink.sleep_until_end();
+        }
+        Err(e) => eprintln!("audio decode failed: {e}"),
+    }
+}
+
+/// Ring a local alarm replica: tone + spoken label, three rounds.
+fn ring_local(alarm: adrian_protocol::AlarmReplica) {
     std::thread::spawn(move || {
-        let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
-            eprintln!("no default audio output device");
-            return;
-        };
-        let Ok(sink) = rodio::Sink::try_new(&handle) else {
-            eprintln!("could not create playback sink");
-            return;
-        };
-        match rodio::Decoder::new(Cursor::new(bytes)) {
-            Ok(decoder) => {
-                sink.append(decoder);
-                sink.sleep_until_end();
-            }
-            Err(e) => eprintln!("audio decode failed: {e}"),
+        let tone = replicas::tone_wav(alarm.volume);
+        for _ in 0..3 {
+            play_bytes_blocking(tone.clone());
+            speak_blocking(&alarm.label);
         }
     });
 }
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Shared local-alarm state: the replica store, whether a server session is
+/// up, and a signal that something rang locally and should be reported.
+struct AlarmCtx {
+    store: replicas::ReplicaStore,
+    connected: AtomicBool,
+    fired: Notify,
+}
+
+/// Check replicas once a second and ring the ones the server has not
+/// delivered.
+fn spawn_replica_watchdog(alarms: Arc<AlarmCtx>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let connected = alarms.connected.load(Ordering::Relaxed);
+            let due = alarms.store.take_due(now_unix(), connected);
+            if due.is_empty() {
+                continue;
+            }
+            for a in due {
+                println!(
+                    "ringing local alarm '{}' ({})",
+                    a.label,
+                    if connected {
+                        "server did not deliver it"
+                    } else {
+                        "server unreachable"
+                    }
+                );
+                ring_local(a);
+            }
+            alarms.fired.notify_one();
+        }
+    });
+}
+
+/// Report unacknowledged local firings; the ack settles them.
+fn send_local_report(
+    out: &mpsc::UnboundedSender<WsMsg>,
+    cfg: &Config,
+    alarms: &AlarmCtx,
+    in_flight: &mut HashMap<String, Vec<adrian_protocol::LocalAlarmFiring>>,
+) {
+    let fired = alarms.store.pending_report();
+    let env = adrian_protocol::Envelope::new(adrian_protocol::Message::AlarmLocalReport {
+        fired: fired.clone(),
+    });
+    in_flight.insert(env.request_id.clone(), fired);
+    env_msg(out, env, &cfg.satellite_id);
+}
+
 // ---------- server calls ----------
 
-async fn pair(server: &str, code: &str, name: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+fn read_ca(path: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("cannot read CA certificate {path}"))
+}
+
+/// HTTP client trusting system roots plus the configured CA, if any.
+fn http_client(ca_cert: Option<&str>) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder();
+    if let Some(path) = ca_cert {
+        let cert = reqwest::Certificate::from_pem(&read_ca(path)?)
+            .with_context(|| format!("bad CA certificate {path}"))?;
+        b = b.add_root_certificate(cert);
+    }
+    b.build().context("cannot build HTTP client")
+}
+
+/// Websocket TLS connector for a configured CA; `None` keeps the default
+/// (system roots).
+fn ws_connector(ca_cert: Option<&str>) -> Result<Option<tokio_tungstenite::Connector>> {
+    use rustls_pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
+    let Some(path) = ca_cert else { return Ok(None) };
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+    let pem = read_ca(path)?;
+    let mut added = 0;
+    for cert in CertificateDer::pem_slice_iter(&pem) {
+        roots
+            .add(cert.with_context(|| format!("bad CA certificate {path}"))?)
+            .with_context(|| format!("bad CA certificate {path}"))?;
+        added += 1;
+    }
+    if added == 0 {
+        bail!("no certificates found in {path}");
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("TLS setup")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(tls))))
+}
+
+async fn pair(server: &str, code: &str, name: &str, ca_cert: Option<String>) -> Result<()> {
+    let client = http_client(ca_cert.as_deref())?;
     let res = client
         .post(format!(
             "{}/api/satellite/pair",
@@ -280,6 +422,7 @@ async fn pair(server: &str, code: &str, name: &str) -> Result<()> {
         name: v["name"].as_str().unwrap_or(name).to_string(),
         conversation_id: None,
         wake_word: None,
+        ca_cert,
     };
     if cfg.device_token.is_empty() {
         bail!("server did not return a device token");
@@ -293,7 +436,7 @@ async fn pair(server: &str, code: &str, name: &str) -> Result<()> {
 }
 
 async fn status(cfg: &Config) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = http_client(cfg.ca_cert.as_deref())?;
     let res = client
         .get(format!("{}/api/satellite/status", cfg.server_url))
         .bearer_auth(&cfg.device_token)
@@ -375,12 +518,20 @@ fn handle_speak(
         let mut detail = String::new();
         if !media_url.is_empty() {
             let url = format!("{}{}", cfg.server_url, media_url);
-            match reqwest::Client::new()
-                .get(url)
-                .bearer_auth(&cfg.device_token)
-                .send()
-                .await
-            {
+            let client = match http_client(cfg.ca_cert.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    send_ack(
+                        &out,
+                        &cfg.satellite_id,
+                        &request_id,
+                        false,
+                        format!("{e:#}"),
+                    );
+                    return;
+                }
+            };
+            match client.get(url).bearer_auth(&cfg.device_token).send().await {
                 Ok(res) if res.status().is_success() => match res.bytes().await {
                     Ok(b) => play_bytes(b.to_vec()),
                     Err(e) => {
@@ -446,6 +597,7 @@ struct SessionCtx<'a> {
     status_tx: &'a tokio::sync::watch::Sender<String>,
     quit: &'a Notify,
     wake_rx: &'a mut Option<mpsc::UnboundedReceiver<()>>,
+    alarms: &'a Arc<AlarmCtx>,
 }
 
 async fn session(ctx: &mut SessionCtx<'_>) -> Result<SessionOutcome> {
@@ -459,6 +611,7 @@ async fn session(ctx: &mut SessionCtx<'_>) -> Result<SessionOutcome> {
         status_tx,
         quit,
         wake_rx,
+        alarms,
     } = ctx;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -471,21 +624,23 @@ async fn session(ctx: &mut SessionCtx<'_>) -> Result<SessionOutcome> {
             .parse()
             .context("bad token")?,
     );
-    let (sock, _resp) = match tokio_tungstenite::connect_async(req).await {
-        Ok(r) => r,
-        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
-            let code = resp.status();
-            if code == 401 || code == 403 {
-                bail!("device token rejected ({code}) — re-pair this satellite");
+    let connector = ws_connector(cfg.ca_cert.as_deref())?;
+    let (sock, _resp) =
+        match tokio_tungstenite::connect_async_tls_with_config(req, None, false, connector).await {
+            Ok(r) => r,
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                let code = resp.status();
+                if code == 401 || code == 403 {
+                    bail!("device token rejected ({code}) — re-pair this satellite");
+                }
+                eprintln!("session connect failed: http {code}");
+                return Ok(SessionOutcome::Reconnect);
             }
-            eprintln!("session connect failed: http {code}");
-            return Ok(SessionOutcome::Reconnect);
-        }
-        Err(e) => {
-            eprintln!("session connect failed: {e}");
-            return Ok(SessionOutcome::Reconnect);
-        }
-    };
+            Err(e) => {
+                eprintln!("session connect failed: {e}");
+                return Ok(SessionOutcome::Reconnect);
+            }
+        };
     println!("connected — hold Ctrl+Alt+Space to talk");
     let _ = status_tx.send("connected".into());
 
@@ -505,6 +660,11 @@ async fn session(ctx: &mut SessionCtx<'_>) -> Result<SessionOutcome> {
         adrian_protocol::SatelliteState::Listening,
         None,
     );
+    // Always report on connect (possibly empty) so the server settles any
+    // alarm that rang here while it was unreachable.
+    alarms.connected.store(true, Ordering::Relaxed);
+    let mut reports = HashMap::new();
+    send_local_report(&out_tx, cfg, alarms, &mut reports);
 
     let mut capture: Option<Capture> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -524,7 +684,15 @@ async fn session(ctx: &mut SessionCtx<'_>) -> Result<SessionOutcome> {
                             }
                         };
                         match env.message {
-                            adrian_protocol::Message::Speak { media_url, text } => {
+                            adrian_protocol::Message::Speak { media_url, text, alarm } => {
+                                if let Some(a) = &alarm {
+                                    if alarms.store.already_fired(a) {
+                                        send_ack(&out_tx, &cfg.satellite_id, &env.request_id, true,
+                                            "already rang locally from the alarm replica (audibility not confirmed)");
+                                        continue;
+                                    }
+                                    alarms.store.delivered_by_server(a);
+                                }
                                 handle_speak(cfg.clone(), media_url, text, env.request_id, out_tx.clone());
                             }
                             adrian_protocol::Message::Transcript { text, is_final } => {
@@ -533,6 +701,11 @@ async fn session(ctx: &mut SessionCtx<'_>) -> Result<SessionOutcome> {
                                 }
                             }
                             adrian_protocol::Message::Ack { ok, detail } => {
+                                if let Some(fired) = reports.remove(&env.request_id)
+                                    && ok
+                                {
+                                    alarms.store.settle_report(&fired);
+                                }
                                 if !ok {
                                     eprintln!("server nack: {}", detail.unwrap_or_default());
                                 }
@@ -540,10 +713,16 @@ async fn session(ctx: &mut SessionCtx<'_>) -> Result<SessionOutcome> {
                             adrian_protocol::Message::PairRejected { reason } => {
                                 eprintln!("pair rejected: {reason}");
                             }
-                            adrian_protocol::Message::AlarmReplicaUpsert { .. }
-                            | adrian_protocol::Message::AlarmReplicaCancel { .. } => {
-                                send_ack(&out_tx, &cfg.satellite_id, &env.request_id, false,
-                                    "local alarm replicas not implemented");
+                            adrian_protocol::Message::AlarmReplicaSync { alarms: list } => {
+                                alarms.store.replace_all(list);
+                            }
+                            adrian_protocol::Message::AlarmReplicaUpsert { alarm } => {
+                                alarms.store.upsert(alarm);
+                                send_ack(&out_tx, &cfg.satellite_id, &env.request_id, true, "stored");
+                            }
+                            adrian_protocol::Message::AlarmReplicaCancel { alarm_id, occurrence_unix } => {
+                                alarms.store.cancel(&alarm_id, occurrence_unix);
+                                send_ack(&out_tx, &cfg.satellite_id, &env.request_id, true, "removed");
                             }
                             _ => {}
                         }
@@ -633,6 +812,9 @@ async fn session(ctx: &mut SessionCtx<'_>) -> Result<SessionOutcome> {
                     let _ = status_tx.send("no microphone".into());
                 }
             }
+            _ = alarms.fired.notified() => {
+                send_local_report(&out_tx, cfg, alarms, &mut reports);
+            }
             _ = quit.notified() => {
                 let _ = out_tx.send(WsMsg::Close(None));
                 break SessionOutcome::Shutdown;
@@ -644,6 +826,7 @@ async fn session(ctx: &mut SessionCtx<'_>) -> Result<SessionOutcome> {
         }
     };
 
+    alarms.connected.store(false, Ordering::Relaxed);
     writer.abort();
     Ok(outcome)
 }
@@ -764,6 +947,14 @@ async fn run(cfg: Config) -> Result<()> {
         eprintln!("wake_word configured but binary lacks `--features wake-word` — ignoring");
     }
 
+    let replica_path = config_path()?.with_file_name("replicas.json");
+    let alarms = Arc::new(AlarmCtx {
+        store: replicas::ReplicaStore::open(replica_path),
+        connected: AtomicBool::new(false),
+        fired: Notify::new(),
+    });
+    spawn_replica_watchdog(alarms.clone());
+
     let mut backoff = Duration::from_secs(1);
     loop {
         // Wake detections only need to inject a synthetic "press" — the
@@ -778,6 +969,7 @@ async fn run(cfg: Config) -> Result<()> {
             status_tx: &status_tx,
             quit: &quit,
             wake_rx: &mut wake_rx,
+            alarms: &alarms,
         };
         match session(&mut ctx).await? {
             SessionOutcome::Shutdown => {
@@ -822,7 +1014,12 @@ async fn main() -> Result<()> {
             let name = arg("--name").unwrap_or_else(|| {
                 std::env::var("COMPUTERNAME").unwrap_or_else(|_| "satellite".into())
             });
-            pair(&server, &code, &name).await
+            let ca = arg("--ca").map(|p| {
+                std::fs::canonicalize(&p)
+                    .map(|c| c.to_string_lossy().into_owned())
+                    .unwrap_or(p)
+            });
+            pair(&server, &code, &name, ca).await
         }
         Some("run") => {
             let mut cfg = load_config()?;
@@ -848,7 +1045,7 @@ async fn main() -> Result<()> {
             eprintln!(
                 "adrian-satellite {}\n\
                  usage:\n\
-                 \x20 pair --server <url> --code <6 digits> [--name <name>]\n\
+                 \x20 pair --server <url> --code <6 digits> [--name <name>] [--ca <cert.pem>]\n\
                  \x20 run [--server <url>]     voice client (PTT + optional wake word)\n\
                  \x20 status                   check device token\n\
                  \x20 say \"<text>\"             test speech output",
@@ -856,5 +1053,54 @@ async fn main() -> Result<()> {
             );
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    /// Live check against a running TLS server with a private CA:
+    /// `ADRIAN_TEST_TLS_URL=https://127.0.0.1:18787 ADRIAN_TEST_TLS_CA=cert.pem
+    /// cargo test -p adrian-satellite -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn trusts_configured_ca_over_https_and_wss() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let url = std::env::var("ADRIAN_TEST_TLS_URL").unwrap();
+        let ca = std::env::var("ADRIAN_TEST_TLS_CA").unwrap();
+
+        // Without the CA the self-signed server must be rejected.
+        assert!(
+            http_client(None)
+                .unwrap()
+                .get(format!("{url}/api/setup/status"))
+                .send()
+                .await
+                .is_err()
+        );
+        let res = http_client(Some(&ca))
+            .unwrap()
+            .get(format!("{url}/api/setup/status"))
+            .send()
+            .await
+            .unwrap();
+        assert!(res.status().is_success());
+
+        // The TLS handshake succeeds; the server then refuses the missing
+        // device token at the HTTP layer.
+        let req = ws_url(&url).into_client_request().unwrap();
+        let err = tokio_tungstenite::connect_async_tls_with_config(
+            req,
+            None,
+            false,
+            ws_connector(Some(&ca)).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == 401),
+            "{err}"
+        );
     }
 }
