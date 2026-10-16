@@ -15,6 +15,19 @@ and encryption of stored secrets are implemented and tested. Wake word is
 implemented behind an opt-in feature + local model file (see below).
 See `TEST_REPORT.md` for what is actually verified versus skipped.
 
+## Modules
+
+A.D.R.I.A.N. is a suite. Each module lives in its own repository and follows the same rules:
+- **Self-hosted,** installable by anyone with one script.
+- **Private by default.**
+- **Read-only toward your other services** unless you allow more.
+- **Spending capped.**
+
+| Module | What it is | Repository |
+|---|---|---|
+| Household server (this repo) | Web UI, AI chat with tools, Home Assistant, memory, alarms, Windows voice satellites | here |
+| Discord voice | Voice assistant for Discord voice channels: "Hey Adrian", music, timers, games, media | [Riqqqque/adrian-discord-voice](https://github.com/Riqqqque/adrian-discord-voice) |
+
 ## Requirements
 
 - Rust 1.88 or newer (minimum checked with `cargo +1.88.0 check`; developed
