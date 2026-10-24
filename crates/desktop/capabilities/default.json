@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window: its own commands and events, and moving/minimizing/closing itself.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-hide",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close"
+  ]
+}

@@ -1,0 +1,29 @@
+[package]
+name = "adrian-desktop"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A.D.R.I.A.N. on Windows: always-listening voice, the orb window, and PC control."
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+adrian-pc-control = { path = "../pc-control" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "=2.11.6", features = ["tray-icon"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3.34"
+cpal = "0.16.0"
+global-hotkey = "0.7.0"
+directories = "6.0.0"
+rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.58.0", features = ["Win32_Media_Audio", "Win32_System_Com"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58.0", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Shell"] }
