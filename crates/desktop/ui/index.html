@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A.D.R.I.A.N.</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="orb"></canvas>
+
+  <header class="titlebar" data-tauri-drag-region>
+    <span class="brand" data-tauri-drag-region>A.D.R.I.A.N.</span>
+    <span class="chip" id="chip" data-mode="idle" data-tauri-drag-region><span class="dot"></span><span id="chipText">Starting</span></span>
+    <span class="winbtns">
+      <button type="button" id="btnSettings" class="winbtn" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+      </button>
+      <button type="button" id="btnMin" class="winbtn" title="Minimize" aria-label="Minimize"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12"/></svg></button>
+      <button type="button" id="btnHide" class="winbtn close" title="Close (she keeps running in the tray)" aria-label="Close to tray"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7 7 17"/></svg></button>
+    </span>
+  </header>
+
+  <main class="stage">
+    <section class="transcript" aria-live="polite">
+      <p class="you" id="you" hidden></p>
+      <p class="her" id="her" hidden></p>
+      <p class="hint" id="hint">Say <b>“Hey Adrian”</b>, hold <kbd>Ctrl</kbd>&nbsp;<kbd>Alt</kbd>&nbsp;<kbd>Space</kbd>, or type below.</p>
+      <button type="button" class="offline" id="offline" hidden>Not connected. Open settings</button>
+    </section>
+
+    <form class="composer" id="ask" autocomplete="off">
+      <input id="askText" type="text" placeholder="Ask A.D.R.I.A.N. anything" maxlength="2000" aria-label="Type a question">
+      <button type="submit" id="btnSend" class="round send" title="Send" aria-label="Send" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
+      </button>
+      <button type="button" id="btnTalk" class="round mic" title="Hold to talk" aria-label="Hold to talk">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
+      </button>
+      <button type="button" id="btnStop" class="round stop" title="Stop her" aria-label="Stop her" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+      </button>
+    </form>
+  </main>
+
+  <section class="sheet" id="settings" role="dialog" aria-modal="true" aria-labelledby="sheetTitle" hidden>
+    <header class="sheet-head" data-tauri-drag-region>
+      <h2 id="sheetTitle" data-tauri-drag-region>Settings</h2>
+      <button type="button" id="btnClose" class="winbtn" title="Close settings" aria-label="Close settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7 7 17"/></svg></button>
+    </header>
+
+    <div class="sheet-body">
+      <section class="card">
+        <div class="row">
+          <span class="dot big" id="connDot"></span>
+          <div class="grow">
+            <div class="title" id="connTitle">Connection</div>
+            <div class="sub" id="connSub"></div>
+          </div>
+        </div>
+        <details id="connDetails">
+          <summary>Server and pairing</summary>
+          <label class="field">Server address
+            <input id="server" type="text" placeholder="homeserver:8791" spellcheck="false">
+          </label>
+          <label class="field">Pairing token
+            <input id="token" type="password" placeholder="sat_…" spellcheck="false" autocomplete="off">
+          </label>
+        </details>
+      </section>
+
+      <section class="card">
+        <div class="title">Microphone</div>
+        <div class="meter"><span id="micMeter"></span></div>
+        <label class="field slider">Sensitivity <span class="value" id="micHint">Automatic</span>
+          <input id="mic" type="range" min="0" max="60" step="1">
+        </label>
+        <div class="sub">Automatic adjusts to the room. Move it right if she triggers on background noise.</div>
+      </section>
+
+      <section class="card">
+        <div class="title">What she may do on this PC</div>
+        <div class="list" id="toggles"></div>
+      </section>
+
+      <section class="card">
+        <div class="title">Shortcuts</div>
+        <div class="sub">Extra things she can open by name, one per line: <code>studio = C:\path\to\file.lnk</code></div>
+        <textarea id="shortcuts" rows="3" spellcheck="false" aria-label="Shortcuts"></textarea>
+      </section>
+      <p class="error" id="error" hidden></p>
+    </div>
+
+    <footer class="sheet-foot">
+      <button type="button" id="btnCancel" class="btn">Cancel</button>
+      <button type="button" id="btnSave" class="btn primary">Save</button>
+    </footer>
+  </section>
+
+  <script src="orb.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
