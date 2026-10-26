@@ -72,7 +72,24 @@ Then, in the UI:
   owner-only in-place restore (`POST /api/diagnostics/restore`, keeps a
   `.pre-restore` copy and rolls back on failure).
 
-## Voice satellite (Windows)
+## PC app for the Discord bot (Windows)
+
+`crates/desktop` is the A.D.R.I.A.N. PC app that works with the Discord voice
+bot ([adrian-discord-voice](https://github.com/Riqqqque/adrian-discord-voice)):
+always listening for "Hey Adrian", her voice through your speakers, PC control
+through `crates/pc-control`, and a tray mode that stays out of the way of games.
+Setup (turning it on in the bot, building, pairing, the installer in
+`crates/desktop/packaging/Install.ps1`) is in the bot's
+[docs/pc-app.md](https://github.com/Riqqqque/adrian-discord-voice/blob/main/docs/pc-app.md).
+
+```sh
+cargo build --release -p adrian-desktop
+powershell -ExecutionPolicy Bypass -File crates\desktop\packaging\Install.ps1 -Server myserver:8791 -Token sat_xxxx
+```
+
+## Voice satellite for this server (Windows)
+
+The older satellite below pairs with this household server instead of the bot.
 
 ```sh
 cargo build --release -p adrian-satellite
