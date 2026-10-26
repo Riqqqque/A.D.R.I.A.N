@@ -4,13 +4,14 @@
 #
 #   powershell -ExecutionPolicy Bypass -File crates\desktop\packaging\Install.ps1 -Server myserver:8791 -Token sat_xxxx
 #
-# -App      the built app (default: target\release\adrian-desktop.exe in this repo)
+# -App      the app (default: ADRIAN.exe next to this script, as in the release
+#           download, else target\release\adrian-desktop.exe in this repo)
 # -Server   the bot's address and satellite port, e.g. myserver:8791
 # -Token    the sat_ token from `sudo adrian satellite add NAME OWNER_ID`
 # -NoStartup  don't start it with Windows
 # -Uninstall  remove the app and its shortcuts (settings are kept)
 param(
-    [string]$App = (Join-Path $PSScriptRoot '..\..\..\target\release\adrian-desktop.exe'),
+    [string]$App = $(if (Test-Path (Join-Path $PSScriptRoot 'ADRIAN.exe')) { Join-Path $PSScriptRoot 'ADRIAN.exe' } else { Join-Path $PSScriptRoot '..\..\..\target\release\adrian-desktop.exe' }),
     [string]$Server,
     [string]$Token,
     [switch]$NoStartup,
