@@ -160,6 +160,27 @@ fn push_to_talk(state: tauri::State<'_, AppState>, down: bool) {
     }
 }
 
+#[derive(Serialize, Clone, PartialEq)]
+struct Devices {
+    mic: String,
+    speakers: String,
+}
+
+fn devices(shared: &Shared) -> Devices {
+    let (mic, speakers) = shared
+        .devices
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    Devices { mic, speakers }
+}
+
+/// The mic and speakers in use; the page follows "devices" events after this.
+#[tauri::command]
+fn audio_devices(state: tauri::State<'_, AppState>) -> Devices {
+    devices(&state.shared)
+}
+
 /// The page asks once at load; after that it follows "draw" events.
 #[tauri::command]
 fn orb_drawing(app: AppHandle) -> bool {
@@ -297,7 +318,8 @@ fn main() {
             send_text,
             stop_talking,
             push_to_talk,
-            orb_drawing
+            orb_drawing,
+            audio_devices
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -406,6 +428,7 @@ fn main() {
                 let (handle, shared) = (handle.clone(), shared.clone());
                 std::thread::spawn(move || {
                     let mut drawing = None;
+                    let mut shown_devices: Option<Devices> = None;
                     let mut quiet = None;
                     let mut minimized_since: Option<std::time::Instant> = None;
                     for tick in 0u64.. {
@@ -444,6 +467,16 @@ fn main() {
                                 }
                                 (false, _) => minimized_since = None,
                                 _ => {}
+                            }
+                            // Speakers or mic switched: tell the settings page.
+                            if window.is_some() {
+                                let d = devices(&shared);
+                                if shown_devices.as_ref() != Some(&d) {
+                                    let _ = handle.emit("devices", d.clone());
+                                    shown_devices = Some(d);
+                                }
+                            } else {
+                                shown_devices = None;
                             }
                             let on = window.is_some() && orb_on_screen(&handle);
                             if drawing != Some(on) {

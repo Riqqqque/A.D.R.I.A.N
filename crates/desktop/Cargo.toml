@@ -26,4 +26,6 @@ rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs
 windows = { version = "0.58.0", features = ["Win32_Media_Audio", "Win32_System_Com"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58.0", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Shell"] }
+# COM callbacks (#[implement]) refer to windows-core by name.
+windows-core = "0.58.0"
+windows = { version = "0.58.0", features = ["implement", "Win32_Foundation", "Win32_Media_Audio", "Win32_Security_Cryptography", "Win32_System_Com", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem"] }
