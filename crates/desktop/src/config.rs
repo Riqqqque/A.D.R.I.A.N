@@ -15,6 +15,8 @@ pub struct Settings {
     /// Mic loudness needed to count as talking (0.005-0.1). 0: automatic.
     pub mic_threshold: f32,
     pub pc: Policy,
+    /// Don't install new versions by themselves (only say there is one).
+    pub updates_off: bool,
 }
 
 pub fn path() -> Option<PathBuf> {

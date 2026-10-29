@@ -150,6 +150,13 @@
     $('connDetails').open = showConnection || !current.paired || !current.server_url;
     $('mic').value = Math.round(current.mic_threshold * 600);
     $('micHint').textContent = micLabel($('mic').value);
+    $('autoUpdate').checked = current.auto_update;
+    const u = current.update;
+    $('updateInfo').textContent =
+      u.state === 'ready' ? `Version ${u.version}. ${u.latest} is downloaded and installs the next time she's idle in the tray.`
+      : u.state === 'available' ? `Version ${u.version}. ${u.latest} is out: turn on automatic updates, or download it from GitHub.`
+      : u.state === 'error' ? `Version ${u.version}. The last update check failed: ${u.message}`
+      : `Version ${u.version}${u.latest && u.latest === u.version ? ', up to date' : ''}.`;
     const list = $('toggles');
     list.textContent = '';
     for (const [key, label, sub] of PERMS) {
@@ -203,7 +210,7 @@
     save.disabled = true;
     save.textContent = 'Saving';
     try {
-      await invoke('save_settings', { serverUrl: $('server').value, token: $('token').value || null, micThreshold: Number($('mic').value) / 600, pc });
+      await invoke('save_settings', { serverUrl: $('server').value, token: $('token').value || null, micThreshold: Number($('mic').value) / 600, pc, autoUpdate: $('autoUpdate').checked });
       closeSettings();
     } catch (err) {
       $('error').textContent = String(err);

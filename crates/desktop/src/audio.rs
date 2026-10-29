@@ -105,6 +105,12 @@ impl Shared {
         self.epoch.elapsed().as_millis() as u64
     }
 
+    /// She was heard in the last `ms` milliseconds.
+    pub fn spoke_within(&self, ms: u64) -> bool {
+        let last = self.last_out_ms.load(Ordering::Relaxed);
+        last != 0 && self.now_ms().saturating_sub(last) < ms
+    }
+
     /// Her voice is playing, or just stopped.
     pub fn playing(&self) -> bool {
         let last = self.last_out_ms.load(Ordering::Relaxed);
