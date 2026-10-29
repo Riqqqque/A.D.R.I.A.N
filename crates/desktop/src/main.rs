@@ -10,6 +10,7 @@ mod config;
 mod link;
 mod quiet;
 mod single;
+mod update;
 
 use adrian_pc_control::{Pc, Policy};
 use audio::Shared;
@@ -49,6 +50,8 @@ struct SettingsView {
     mic_threshold: f32,
     pc: Policy,
     settings_file: String,
+    auto_update: bool,
+    update: update::UpdateView,
 }
 
 #[derive(Serialize, Clone)]
@@ -59,6 +62,10 @@ struct Frame {
     mic: f32,
     mic_error: Option<String>,
 }
+
+/// After she speaks, the server takes what's said next as for her (no "Hey
+/// Adrian") for this long; the orb shows "listening" in that window.
+const FOLLOW_UP_MS: u64 = 20_000;
 
 /// How long the window may sit minimized before it's closed to the tray.
 const MINIMIZED_TO_TRAY: Duration = Duration::from_secs(120);
@@ -86,6 +93,8 @@ fn get_settings(state: tauri::State<'_, AppState>) -> SettingsView {
         settings_file: config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
+        auto_update: !s.updates_off,
+        update: update::status(),
     }
 }
 
@@ -105,6 +114,7 @@ fn save_settings(
     token: Option<String>,
     mic_threshold: f32,
     pc: Policy,
+    auto_update: Option<bool>,
 ) -> Result<(), String> {
     if config::normalize_url(&server_url).is_none() {
         return Err("Enter the server address, like homeserver:8791.".into());
@@ -123,6 +133,9 @@ fn save_settings(
     }
     s.mic_threshold = mic_threshold.clamp(0.0, 0.1);
     s.pc = pc;
+    if let Some(on) = auto_update {
+        s.updates_off = !on;
+    }
     config::save(&s)?;
     state
         .shared
@@ -286,8 +299,30 @@ fn main() {
         }
         return;
     }
+    if args.get(1).map(String::as_str) == Some("--update-now") {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        match update::now() {
+            Ok(m) => println!("{m}"),
+            Err(e) => {
+                eprintln!("update failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    update::clean_up();
     // Already running: bring that window up instead of starting a second copy.
-    let Some(show_signal) = single::claim() else {
+    // Right after an update the old copy is still closing: give it a moment.
+    let after_update = args.iter().any(|a| a == "--after-update");
+    let mut show_signal = single::claim();
+    for _ in 0..40 {
+        if show_signal.is_some() || !after_update {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        show_signal = single::claim();
+    }
+    let Some(show_signal) = show_signal else {
         return;
     };
     // At login it starts in the tray; opened by hand, the window shows.
@@ -425,7 +460,7 @@ fn main() {
                 });
             }
             {
-                let (handle, shared) = (handle.clone(), shared.clone());
+                let (handle, shared, thinking) = (handle.clone(), shared.clone(), thinking.clone());
                 std::thread::spawn(move || {
                     let mut drawing = None;
                     let mut shown_devices: Option<Devices> = None;
@@ -491,9 +526,14 @@ fn main() {
                         let mic = f32::from_bits(shared.mic_level.load(Ordering::Relaxed));
                         let (mode, level) = if shared.playing() || out > 0.03 {
                             ("speaking", out)
-                        } else if shared.talking.load(Ordering::Relaxed)
-                            || shared.ptt.load(Ordering::Relaxed)
+                        } else if shared.ptt.load(Ordering::Relaxed)
+                            || (shared.talking.load(Ordering::Relaxed)
+                                && shared.spoke_within(FOLLOW_UP_MS))
                         {
+                            // Only when she's really listening to you: push-to-talk, or
+                            // talking right after her answer. Any loud sound opens the
+                            // mic gate (music, a cough); the server ignores those, so
+                            // the orb shouldn't light up for them either.
                             ("listening", mic)
                         } else if thinking.load(Ordering::Relaxed) {
                             ("thinking", 0.0)
@@ -515,6 +555,35 @@ fn main() {
             }
             if needs_setup || !background {
                 show(&handle);
+            }
+            // New versions from GitHub, installed while she's idle in the tray.
+            {
+                let (h1, h2, h3, shared) = (
+                    handle.clone(),
+                    handle.clone(),
+                    handle.clone(),
+                    shared.clone(),
+                );
+                let thinking = thinking.clone();
+                std::thread::spawn(move || {
+                    update::run(
+                        move || {
+                            !h1.state::<AppState>()
+                                .settings
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .updates_off
+                        },
+                        move || {
+                            h2.get_webview_window("main").is_none()
+                                && !shared.playing()
+                                && !shared.talking.load(Ordering::Relaxed)
+                                && !shared.ptt.load(Ordering::Relaxed)
+                                && !thinking.load(Ordering::Relaxed)
+                        },
+                        move || h3.exit(0),
+                    )
+                });
             }
             // Opened again (Start menu, desktop icon): show the window.
             {

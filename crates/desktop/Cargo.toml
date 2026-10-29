@@ -1,6 +1,6 @@
 [package]
 name = "adrian-desktop"
-version = "0.1.0"
+version = "0.15.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,6 +21,9 @@ cpal = "0.16.0"
 global-hotkey = "0.7.0"
 directories = "6.0.0"
 rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+# Self-update from GitHub releases (TLS through the aws-lc-rs provider installed in main).
+ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "json"] }
+sha2 = "0.10.9"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.58.0", features = ["Win32_Media_Audio", "Win32_System_Com"] }
