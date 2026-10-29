@@ -399,9 +399,11 @@ pub fn start(shared: Arc<Shared>, up: UnboundedSender<Up>) {
                             match rx.recv_timeout(Duration::from_secs(1)) {
                                 Ok(Ctl::Failed(e)) => break Some(e),
                                 Ok(Ctl::DefaultChanged) => {
-                                    // Windows sends a few of these per switch: take them all,
-                                    // then reopen on the new devices. Her queued audio carries on.
-                                    while rx.recv_timeout(Duration::from_millis(250)).is_ok() {}
+                                    // Windows sends a few of these per switch: give it a
+                                    // moment (a fixed one: while she plays, wake-ups keep
+                                    // arriving), then reopen on the new devices. Her queued
+                                    // audio carries on there.
+                                    std::thread::sleep(Duration::from_millis(250));
                                     break None;
                                 }
                                 Ok(Ctl::Wake) => {
