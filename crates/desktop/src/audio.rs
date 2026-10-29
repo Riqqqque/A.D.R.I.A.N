@@ -38,10 +38,12 @@ const DUCK: f32 = 0.3;
 /// Most audio held for playback before old audio is dropped (seconds).
 const MAX_BUFFER_SECS: usize = 8;
 
-/// To the device thread: a stream failed, or she has something to say.
+/// To the device thread: a stream failed, she has something to say, or
+/// Windows' default speakers or mic changed.
 enum Ctl {
     Failed(String),
     Wake,
+    DefaultChanged,
 }
 
 /// The speakers are let go after this much silence, so the app isn't
@@ -74,6 +76,8 @@ pub struct Shared {
     pub mic_error: Mutex<Option<String>>,
     /// Wakes the device thread to start the speakers.
     wake: Mutex<Option<mpsc::Sender<Ctl>>>,
+    /// The mic and speakers in use (names), for the settings page.
+    pub devices: Mutex<(String, String)>,
 }
 
 impl Shared {
@@ -93,6 +97,7 @@ impl Shared {
             threshold: AtomicU32::new(threshold.to_bits()),
             mic_error: Mutex::new(None),
             wake: Mutex::new(None),
+            devices: Mutex::new((String::new(), String::new())),
         })
     }
 
@@ -369,26 +374,36 @@ pub fn start(shared: Arc<Shared>, up: UnboundedSender<Up>) {
             })
             .expect("gate thread");
     }
+    // Follow Windows' default speakers and mic as they change.
+    watch::start(shared.clone());
     // Devices. The mic always runs; the speakers only while she has audio.
     std::thread::Builder::new()
         .name("adrian-audio".into())
         .spawn(move || {
+            let mut retry = Duration::from_millis(300);
             loop {
                 let (tx, rx) = mpsc::channel::<Ctl>();
                 *shared.wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
-                match open_streams(&shared, mic_tx.clone(), tx) {
+                let failure = match open_streams(&shared, mic_tx.clone(), tx) {
                     Ok((_mic, speakers)) => {
                         *shared.mic_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        retry = Duration::from_millis(300);
                         let mut on = false;
                         let mut last_sound = Instant::now();
-                        // Something queued before the streams existed.
+                        // Something queued before the streams existed (or before a switch).
                         let pending = !shared.out.lock().map(|q| q.is_empty()).unwrap_or(true);
                         if pending && speakers.play().is_ok() {
                             on = true;
                         }
-                        let failure = loop {
+                        loop {
                             match rx.recv_timeout(Duration::from_secs(1)) {
-                                Ok(Ctl::Failed(e)) => break e,
+                                Ok(Ctl::Failed(e)) => break Some(e),
+                                Ok(Ctl::DefaultChanged) => {
+                                    // Windows sends a few of these per switch: take them all,
+                                    // then reopen on the new devices. Her queued audio carries on.
+                                    while rx.recv_timeout(Duration::from_millis(250)).is_ok() {}
+                                    break None;
+                                }
                                 Ok(Ctl::Wake) => {
                                     last_sound = Instant::now();
                                     if !on && speakers.play().is_ok() {
@@ -406,15 +421,20 @@ pub fn start(shared: Arc<Shared>, up: UnboundedSender<Up>) {
                                     }
                                 }
                                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                    break "audio stopped".into();
+                                    break Some("audio stopped".into());
                                 }
                             }
-                        };
-                        *shared.mic_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(failure);
+                        }
                     }
-                    Err(e) => *shared.mic_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e),
+                    Err(e) => Some(e),
+                };
+                // A device switch reopens right away; a failure (unplugged, busy)
+                // retries soon, then less often while nothing works.
+                if let Some(e) = failure {
+                    *shared.mic_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                    std::thread::sleep(retry);
+                    retry = (retry * 2).min(Duration::from_secs(5));
                 }
-                std::thread::sleep(Duration::from_secs(2));
             }
         })
         .expect("audio thread");
@@ -428,6 +448,10 @@ fn open_streams(
     let host = cpal::default_host();
     let input = host.default_input_device().ok_or("No microphone found.")?;
     let output = host.default_output_device().ok_or("No speakers found.")?;
+    *shared.devices.lock().unwrap_or_else(|e| e.into_inner()) = (
+        input.name().unwrap_or_default(),
+        output.name().unwrap_or_default(),
+    );
     let in_cfg = input.default_input_config().map_err(|e| e.to_string())?;
     let out_cfg = output.default_output_config().map_err(|e| e.to_string())?;
 
@@ -550,6 +574,91 @@ where
         None,
     )
     .map_err(|e| format!("Speakers: {e}"))
+}
+
+/// Windows tells us when the default speakers or mic change; the device
+/// thread then reopens its streams there. A notification, not polling.
+#[cfg(windows)]
+mod watch {
+    use super::{Ctl, Shared};
+    use std::sync::Arc;
+    use windows::Win32::Media::Audio::{
+        DEVICE_STATE, EDataFlow, ERole, IMMDeviceEnumerator, IMMNotificationClient,
+        IMMNotificationClient_Impl, MMDeviceEnumerator, eConsole,
+    };
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    };
+    use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
+    use windows::core::{PCWSTR, implement};
+
+    #[implement(IMMNotificationClient)]
+    struct Client(Arc<Shared>);
+
+    impl IMMNotificationClient_Impl for Client_Impl {
+        fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn OnDeviceAdded(&self, _: &PCWSTR) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn OnDeviceRemoved(&self, _: &PCWSTR) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn OnDefaultDeviceChanged(
+            &self,
+            _: EDataFlow,
+            role: ERole,
+            _: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            // The default-device role is what cpal opens (communications is separate).
+            let tx = (role == eConsole)
+                .then(|| self.0.wake.lock().ok().and_then(|w| w.clone()))
+                .flatten();
+            if let Some(tx) = tx {
+                let _ = tx.send(Ctl::DefaultChanged);
+            }
+            Ok(())
+        }
+        fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Registers on a thread of its own (COM's multithreaded apartment, apart
+    /// from cpal's) and keeps the registration for the life of the app.
+    pub fn start(shared: Arc<Shared>) {
+        let _ = std::thread::Builder::new()
+            .name("adrian-devices".into())
+            .spawn(move || {
+                // SAFETY: plain COM setup on this thread; the enumerator and the
+                // client stay alive below because this thread never ends.
+                let kept = unsafe {
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(
+                        &MMDeviceEnumerator,
+                        None,
+                        CLSCTX_ALL,
+                    ) else {
+                        return;
+                    };
+                    let client: IMMNotificationClient = Client(shared).into();
+                    if en.RegisterEndpointNotificationCallback(&client).is_err() {
+                        return;
+                    }
+                    (en, client)
+                };
+                loop {
+                    std::thread::park();
+                    let _ = &kept;
+                }
+            });
+    }
+}
+
+#[cfg(not(windows))]
+mod watch {
+    pub fn start(_: std::sync::Arc<super::Shared>) {}
 }
 
 #[cfg(test)]

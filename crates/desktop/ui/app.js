@@ -47,6 +47,12 @@
       render();
     }
   });
+  // The mic and speakers she's using: Windows' defaults, followed as they change.
+  const showDevices = (d) => {
+    if (d && (d.mic || d.speakers)) $('devices').textContent = `Using ${d.mic || 'no mic'} and ${d.speakers || 'no speakers'} (the Windows defaults; she follows them when they change).`;
+  };
+  listen('devices', (e) => showDevices(e.payload));
+  invoke('audio_devices').then(showDevices);
   listen('status', (e) => {
     Object.assign(st, { connected: e.payload.connected, text: e.payload.text });
     render();
