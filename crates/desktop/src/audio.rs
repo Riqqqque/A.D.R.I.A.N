@@ -68,6 +68,14 @@ pub struct Shared {
     out_rms: AtomicU32,
     /// Someone is talking over her: play her quieter until the server stops her.
     duck: AtomicBool,
+    /// The server is working on or saying an answer (its "thinking" mode).
+    pub answering: AtomicBool,
+    /// From the server's `state` messages: her voice is audible (music isn't
+    /// counted), and until when (ms since `epoch`) she takes words without
+    /// her name. Older servers don't send them (`has_state` stays false).
+    voice: AtomicBool,
+    listen_until_ms: AtomicU64,
+    has_state: AtomicBool,
     pub mic_level: AtomicU32,
     pub talking: AtomicBool,
     pub ptt: AtomicBool,
@@ -91,6 +99,10 @@ impl Shared {
             out_level: AtomicU32::new(0),
             out_rms: AtomicU32::new(0),
             duck: AtomicBool::new(false),
+            answering: AtomicBool::new(false),
+            voice: AtomicBool::new(false),
+            listen_until_ms: AtomicU64::new(0),
+            has_state: AtomicBool::new(false),
             mic_level: AtomicU32::new(0),
             talking: AtomicBool::new(false),
             ptt: AtomicBool::new(false),
@@ -109,6 +121,45 @@ impl Shared {
     pub fn spoke_within(&self, ms: u64) -> bool {
         let last = self.last_out_ms.load(Ordering::Relaxed);
         last != 0 && self.now_ms().saturating_sub(last) < ms
+    }
+
+    /// The server says her voice started or stopped.
+    pub fn set_voice(&self, on: bool) {
+        self.has_state.store(true, Ordering::Relaxed);
+        self.voice.store(on, Ordering::Relaxed);
+    }
+
+    /// The server says how much longer she listens without her name.
+    pub fn set_listening(&self, ms: u64) {
+        self.has_state.store(true, Ordering::Relaxed);
+        let until = if ms == 0 { 0 } else { self.now_ms() + ms };
+        self.listen_until_ms.store(until, Ordering::Relaxed);
+    }
+
+    /// Lost the server: nothing is said or listened to until it reports again.
+    pub fn clear_state(&self) {
+        self.voice.store(false, Ordering::Relaxed);
+        self.listen_until_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// What's playing is her voice (or a sound), not just music. Older
+    /// servers don't say, so then it's whatever plays during an answer.
+    pub fn her_voice(&self) -> bool {
+        if self.has_state.load(Ordering::Relaxed) {
+            self.voice.load(Ordering::Relaxed)
+        } else {
+            self.answering.load(Ordering::Relaxed)
+        }
+    }
+
+    /// She'd take what you say now as meant for her, without her name. Older
+    /// servers don't say: then it's the 20 s after her voice was last heard.
+    pub fn listening(&self) -> bool {
+        if self.has_state.load(Ordering::Relaxed) {
+            self.now_ms() < self.listen_until_ms.load(Ordering::Relaxed)
+        } else {
+            self.spoke_within(20_000)
+        }
     }
 
     /// Her voice is playing, or just stopped.
@@ -371,10 +422,13 @@ pub fn start(shared: Arc<Shared>, up: UnboundedSender<Up>) {
                             GateEvent::Nothing => {}
                         }
                         shared.talking.store(gate.is_open(), Ordering::Relaxed);
-                        // Cutting in: drop her voice now; the server stops her a moment later.
-                        shared
-                            .duck
-                            .store(gate.is_open() && playing, Ordering::Relaxed);
+                        // Cutting in on her answer: drop her voice now; the server stops
+                        // her a moment later. Music alone is never turned down for a
+                        // noise or side talk.
+                        shared.duck.store(
+                            gate.is_open() && playing && shared.her_voice(),
+                            Ordering::Relaxed,
+                        );
                     }
                 }
             })

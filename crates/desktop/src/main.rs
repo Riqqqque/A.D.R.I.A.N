@@ -63,10 +63,6 @@ struct Frame {
     mic_error: Option<String>,
 }
 
-/// After she speaks, the server takes what's said next as for her (no "Hey
-/// Adrian") for this long; the orb shows "listening" in that window.
-const FOLLOW_UP_MS: u64 = 20_000;
-
 /// How long the window may sit minimized before it's closed to the tray.
 const MINIMIZED_TO_TRAY: Duration = Duration::from_secs(120);
 
@@ -427,7 +423,7 @@ fn main() {
             // Server events → window, and her state ~20 times a second.
             let thinking = Arc::new(AtomicBool::new(false));
             {
-                let (handle, thinking) = (handle.clone(), thinking.clone());
+                let (handle, shared, thinking) = (handle.clone(), shared.clone(), thinking.clone());
                 tauri::async_runtime::spawn(async move {
                     while let Some(ev) = ev_rx.recv().await {
                         match ev {
@@ -448,7 +444,10 @@ fn main() {
                                     .unwrap_or_else(|e| e.into_inner()) = v.clone();
                                 let _ = handle.emit("status", v);
                             }
-                            Event::Thinking(on) => thinking.store(on, Ordering::Relaxed),
+                            Event::Thinking(on) => {
+                                thinking.store(on, Ordering::Relaxed);
+                                shared.answering.store(on, Ordering::Relaxed);
+                            }
                             Event::Transcript { who, text, last } => {
                                 let _ = handle.emit(
                                     "transcript",
@@ -524,11 +523,11 @@ fn main() {
                         }
                         let out = f32::from_bits(shared.out_level.load(Ordering::Relaxed));
                         let mic = f32::from_bits(shared.mic_level.load(Ordering::Relaxed));
-                        let (mode, level) = if shared.playing() || out > 0.03 {
+                        // Her own music isn't her talking: the orb only speaks with her voice.
+                        let (mode, level) = if (shared.playing() || out > 0.03) && shared.her_voice() {
                             ("speaking", out)
                         } else if shared.ptt.load(Ordering::Relaxed)
-                            || (shared.talking.load(Ordering::Relaxed)
-                                && shared.spoke_within(FOLLOW_UP_MS))
+                            || (shared.talking.load(Ordering::Relaxed) && shared.listening())
                         {
                             // Only when she's really listening to you: push-to-talk, or
                             // talking right after her answer. Any loud sound opens the

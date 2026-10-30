@@ -82,6 +82,7 @@ pub async fn run(
             Err(Fail::Other(e)) => (format!("Can't reach the server: {e}"), true),
         };
         shared.stop_reply();
+        shared.clear_state();
         let _ = events.send(Event::Thinking(false));
         let _ = events.send(Event::Status {
             connected: false,
@@ -156,6 +157,10 @@ async fn session(
                             }
                             "denied" => return Err(Fail::Denied(s("reason"))),
                             "mode" => { let _ = events.send(Event::Thinking(s("mode") == "thinking")); }
+                            "state" => {
+                                if let Some(v) = m.get("speaking").and_then(Value::as_bool) { shared.set_voice(v); }
+                                if let Some(v) = m.get("listenMs").and_then(Value::as_f64) { shared.set_listening(v.max(0.0) as u64); }
+                            }
                             "transcript" => {
                                 let last = m.get("final").and_then(Value::as_bool).unwrap_or(true);
                                 let _ = events.send(Event::Transcript { who: s("who"), text: s("text"), last });
