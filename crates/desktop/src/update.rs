@@ -4,15 +4,17 @@
 //! it once to prove it starts and is that version, and waits until she's idle
 //! in the tray (no window, not talking, not listening) to swap the file and
 //! start the new copy. The copy it replaced stays as ADRIAN.old.exe, the way
-//! back, until the new one has been up for a while. Turned off in settings, it
-//! only says that a new version exists.
+//! back, until the new one has really worked: the server has welcomed it and
+//! it has been up for a few minutes. Turned off in settings, it only says that
+//! a new version exists.
 
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, LazyLock, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 const REPO: &str = "Riqqqque/adrian-discord-voice";
@@ -66,6 +68,12 @@ pub static STATUS: Mutex<Option<UpdateView>> = Mutex::new(None);
 
 /// Set by `check_now`, read by the wait between checks.
 static CHECK_NOW: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+/// When this run started, for how long it has been up.
+static STARTED: LazyLock<Instant> = LazyLock::new(Instant::now);
+/// The server has welcomed this run. It stays set: `Shared::online` goes false
+/// with every dropped link, which doesn't undo that this version got through.
+static WELCOMED: AtomicBool = AtomicBool::new(false);
 
 /// Cut the wait for the next check short: automatic updates were just turned on.
 pub fn check_now() {
@@ -311,6 +319,9 @@ fn swap(new: &Path, here: &Path, step: impl Fn()) -> Result<(), String> {
 /// Swap the files and start the new copy; the caller exits right after.
 fn install(new: &Path, here: &Path) -> Result<(), String> {
     swap(new, here, || {})?;
+    // ADRIAN.old.exe is this copy now, the new one's way back: a first welcome
+    // landing before this copy exits has to leave it alone.
+    WELCOMED.store(true, Ordering::Relaxed);
     std::process::Command::new(here)
         .args(["--background", "--after-update"])
         .spawn()
@@ -353,8 +364,31 @@ fn remove_download(here: &Path) {
     }
 }
 
-fn remove_old_copy(here: &Path) {
-    let _ = std::fs::remove_file(here.with_extension("old.exe"));
+/// Whether this version has really worked, so the copy it replaced can go. That
+/// copy is the only way back, and starting proves little: it takes a welcome
+/// from the server and `FIRST_CHECK` of staying up, whichever comes later. With
+/// no welcome (never paired, server down) it stays for a later run to settle.
+fn proven(welcomed: bool, up: Duration) -> bool {
+    welcomed && up >= FIRST_CHECK
+}
+
+fn settle_old_copy(here: &Path, welcomed: bool, up: Duration) {
+    if proven(welcomed, up) {
+        let _ = std::fs::remove_file(here.with_extension("old.exe"));
+    }
+}
+
+/// The server welcomed this PC. Past `FIRST_CHECK` this is the moment the old
+/// copy goes, since `run` may not wake for hours; before that `run` sees it when
+/// the wait ends. Only the first welcome acts, and `install` uses that up: a
+/// welcome while this copy swaps itself out mustn't take the way back it made.
+pub fn welcomed() {
+    if WELCOMED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(here) = std::env::current_exe() {
+        settle_old_copy(&here, true, STARTED.elapsed());
+    }
 }
 
 /// Runs for the life of the app. `enabled` reads the setting; `idle` says
@@ -363,9 +397,11 @@ pub fn run(enabled: impl Fn() -> bool, idle: impl Fn() -> bool, quit: impl Fn())
     let Ok(here) = std::env::current_exe() else {
         return;
     };
+    LazyLock::force(&STARTED);
     std::thread::sleep(FIRST_CHECK);
-    // Up this long, this version works: the copy it replaced can go.
-    remove_old_copy(&here);
+    // Only here, not in the loop: after a failed install that file can be the
+    // only copy left.
+    settle_old_copy(&here, WELCOMED.load(Ordering::Relaxed), FIRST_CHECK);
     let agent = agent();
     loop {
         set("checking", None, None);
@@ -534,11 +570,29 @@ mod tests {
         remove_download(&here);
         assert!(!new.exists());
         assert!(old.exists());
-        // Proven by uptime: now the old copy goes too.
-        remove_old_copy(&here);
+        // Up long enough, but no welcome yet: it stays.
+        settle_old_copy(&here, false, FIRST_CHECK);
+        assert!(old.exists());
+        // Welcomed too: now the old copy goes.
+        settle_old_copy(&here, true, FIRST_CHECK);
         assert!(!old.exists());
         assert!(here.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_old_copy_waits_for_a_welcome_and_the_full_wait() {
+        let early = FIRST_CHECK - Duration::from_secs(1);
+        let long = 1000 * FIRST_CHECK;
+        // A welcome right after start: the wait still has to run out.
+        assert!(!proven(true, early));
+        assert!(proven(true, FIRST_CHECK));
+        // Never paired, or the server is down: uptime alone proves nothing.
+        assert!(!proven(false, early));
+        assert!(!proven(false, FIRST_CHECK));
+        assert!(!proven(false, long));
+        // A welcome long after start: it goes then.
+        assert!(proven(true, long));
     }
 
     fn view(state: &str) -> UpdateView {
