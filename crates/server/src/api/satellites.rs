@@ -750,6 +750,18 @@ async fn session_loop(s: AppState, sat: Satellite, sock: WebSocket) {
     writer.abort();
 }
 
+/// What a satellite says for a finished turn. Whatever she got to say stands,
+/// because it may report actions that really happened.
+fn spoken_reply(reply: String, error: &str) -> String {
+    if error.is_empty() {
+        reply
+    } else if reply.trim().is_empty() {
+        format!("error: {error}")
+    } else {
+        format!("{reply} Then something went wrong.")
+    }
+}
+
 /// Buffered PCM → WAV → STT → assistant turn → `Speak` reply, pushed back
 /// over the session channel.
 async fn finish_utterance(
@@ -829,11 +841,7 @@ async fn finish_utterance(
     }
     let mut env = proto::Envelope::new(proto::Message::Speak {
         media_url: String::new(),
-        text: Some(if error.is_empty() {
-            reply
-        } else {
-            format!("error: {error}")
-        }),
+        text: Some(spoken_reply(reply, &error)),
         alarm: None,
     });
     env.device_id = Some(sat.id.clone());
@@ -892,6 +900,17 @@ mod tests {
             name: "PC".into(),
             user_id: 1,
         }
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_what_she_already_said() {
+        assert_eq!(spoken_reply("Done.".into(), ""), "Done.");
+        assert_eq!(
+            spoken_reply(" ".into(), "no provider"),
+            "error: no provider"
+        );
+        let said = spoken_reply("Timer set.".into(), "no provider");
+        assert!(said.starts_with("Timer set."), "{said}");
     }
 
     #[tokio::test]

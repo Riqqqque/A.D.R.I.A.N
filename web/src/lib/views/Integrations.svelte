@@ -119,8 +119,12 @@
     error = '';
     notice = '';
     try {
-      const r = await post<{ imported: number }>('/api/integrations/ha/import', {});
-      notice = `Imported ${r.imported} entities. Authorize lights under Devices.`;
+      const r = await post<{ imported: number; areas_error: string | null }>(
+        '/api/integrations/ha/import',
+        {}
+      );
+      notice = `Imported ${r.imported} lights. Authorize them under Devices.`;
+      if (r.areas_error) error = `Areas were not updated: ${r.areas_error}`;
       await load();
       await session.refreshFlags();
     } catch (e) {
@@ -198,7 +202,7 @@
   {/if}
   <div class="row" style="margin-top:.6rem">
     <button class="ghost" onclick={testHa} disabled={!ha?.configured}>Test connection</button>
-    <button class="ghost" onclick={importEntities} disabled={!ha?.connected}>Import entities</button>
+    <button class="ghost" onclick={importEntities} disabled={!ha?.connected}>Import lights</button>
   </div>
-  <p class="dim small">Tokens stay server-side. Entity import only registers devices — nothing becomes controllable until you allowlist it under Devices.</p>
+  <p class="dim small">Tokens stay server-side. Import only registers lights — nothing becomes controllable until you allowlist it under Devices.</p>
 </div>

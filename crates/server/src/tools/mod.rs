@@ -5,7 +5,7 @@
 
 pub mod fastpath;
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, Cap};
 use crate::db::P;
 use crate::error::ApiError;
 use crate::providers::{ToolCall, ToolSpec};
@@ -17,6 +17,8 @@ use std::sync::Arc;
 pub struct ToolCtx<'a> {
     pub state: &'a Arc<AppState>,
     pub user: &'a AuthUser,
+    /// What the person said this turn, in their own words.
+    pub message: &'a str,
 }
 
 pub struct ToolOutcome {
@@ -67,7 +69,8 @@ pub fn specs() -> Vec<ToolSpec> {
             name: "remember".into(),
             description:
                 "Persist an explicit user fact/preference. Stored durably with owner, scope \
-                 and timestamp — survives restarts."
+                 and timestamp — survives restarts. Household scope needs the user to ask \
+                 for it; the result reports the scope used."
                     .into(),
             parameters: schema(
                 json!({
@@ -188,7 +191,8 @@ async fn list_lights(ctx: &ToolCtx<'_>) -> ToolOutcome {
         .db
         .q(
             "SELECT entity_id, name, area, state FROM entities
-             WHERE allowed = 1 AND domain = 'light' ORDER BY name",
+             WHERE allowed = 1 AND domain = 'light' AND state <> 'removed'
+             ORDER BY name",
             vec![],
             |r| {
                 Ok(json!({
@@ -245,6 +249,7 @@ async fn control_light_inner(
     ctx: &ToolCtx<'_>,
     args: &Value,
 ) -> Result<(Value, Option<Value>), ApiError> {
+    ctx.user.require(Cap::Lights)?;
     let entity_id = arg_str(args, "entity_id")?;
     let action = arg_str(args, "action")?;
     if !matches!(action, "turn_on" | "turn_off" | "toggle") {
@@ -259,17 +264,17 @@ async fn control_light_inner(
         return Err(ApiError::BadRequest("brightness_pct must be 1-100".into()));
     }
     // Permission: entity must be imported, be a light, and be allowlisted.
-    let allowed = ctx
+    let light = ctx
         .state
         .db
         .q1(
-            "SELECT allowed FROM entities WHERE entity_id = ?1 AND domain = 'light'",
+            "SELECT allowed, name FROM entities WHERE entity_id = ?1 AND domain = 'light'",
             vec![P::T(entity_id.to_string())],
-            |r| r.get::<_, i64>(0),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         )
         .await?;
-    match allowed {
-        Some(1) => {}
+    let name = match light {
+        Some((1, name)) => name,
         Some(_) => {
             return Err(ApiError::Forbidden(format!(
                 "light '{entity_id}' is imported but not authorized — enable it under Devices"
@@ -280,7 +285,7 @@ async fn control_light_inner(
                 "entity '{entity_id}' is not a known authorized light"
             )));
         }
-    }
+    };
     let result = ctx
         .state
         .ha
@@ -290,6 +295,7 @@ async fn control_light_inner(
         json!({
             "ok": true,
             "entity_id": entity_id,
+            "name": name,
             "action": action,
             "confirmed": result.confirmed,
             "observed_state": result.observed_state,
@@ -316,7 +322,7 @@ async fn remember(ctx: &ToolCtx<'_>, args: &Value) -> ToolOutcome {
     };
     let scope = arg_str_opt(args, "scope").unwrap_or("private");
     // Guests may only write private-scope facts for themselves.
-    let scope = if ctx.user.role == "guest" {
+    let scope = if ctx.user.role == "guest" || !asks_for_household(ctx.message) {
         "private"
     } else {
         scope
@@ -331,6 +337,19 @@ async fn remember(ctx: &ToolCtx<'_>, args: &Value) -> ToolOutcome {
             ui: None,
         },
     }
+}
+
+/// Whether the person, in their own words this turn, spoke of the household.
+/// Household facts reach everyone's prompt, so the model's `scope` argument
+/// alone can't publish one: it may be repeating what it read in another fact.
+/// A plain word list, on purpose; a false "no" only keeps a fact private.
+fn asks_for_household(message: &str) -> bool {
+    message.split(|c: char| !c.is_alphanumeric()).any(|word| {
+        matches!(
+            word.to_lowercase().as_str(),
+            "household" | "family" | "everyone" | "everybody"
+        )
+    })
 }
 
 async fn recall(ctx: &ToolCtx<'_>, args: &Value) -> ToolOutcome {
@@ -349,7 +368,8 @@ async fn recall(ctx: &ToolCtx<'_>, args: &Value) -> ToolOutcome {
                 "ok": true,
                 "facts": facts.iter().map(|f| json!({
                     "id": f.id, "text": f.text, "scope": f.scope,
-                    "owner": f.owner, "updated_at": f.updated_at,
+                    "owner": f.owner, "edited_by": f.edited_by,
+                    "updated_at": f.updated_at,
                 })).collect::<Vec<_>>(),
             }),
             ui: None,
@@ -362,6 +382,12 @@ async fn recall(ctx: &ToolCtx<'_>, args: &Value) -> ToolOutcome {
 }
 
 async fn set_alarm(ctx: &ToolCtx<'_>, args: &Value) -> ToolOutcome {
+    if let Err(e) = ctx.user.require(Cap::Alarms) {
+        return ToolOutcome {
+            for_model: json!({"ok": false, "error": e.to_string()}),
+            ui: None,
+        };
+    }
     let spec = scheduler::AlarmSpec {
         label: arg_str_opt(args, "label").unwrap_or(""),
         kind: if arg_i64_opt(args, "in_minutes").is_some()
@@ -376,7 +402,7 @@ async fn set_alarm(ctx: &ToolCtx<'_>, args: &Value) -> ToolOutcome {
         in_minutes: arg_i64_opt(args, "in_minutes"),
         recurrence: arg_str_opt(args, "recurrence").unwrap_or("none"),
         endpoint_id: arg_str_opt(args, "endpoint_id"),
-        volume: args.get("volume").and_then(|v| v.as_f64()).unwrap_or(0.7),
+        volume: 0.7,
         snooze_minutes: 9,
     };
     match scheduler::create(ctx.state, ctx.user.id, spec).await {
@@ -425,6 +451,12 @@ async fn list_alarms(ctx: &ToolCtx<'_>) -> ToolOutcome {
 }
 
 async fn cancel_alarm(ctx: &ToolCtx<'_>, args: &Value) -> ToolOutcome {
+    if let Err(e) = ctx.user.require(Cap::Alarms) {
+        return ToolOutcome {
+            for_model: json!({"ok": false, "error": e.to_string()}),
+            ui: None,
+        };
+    }
     let id = match arg_str(args, "alarm_id") {
         Ok(i) => i.to_string(),
         Err(e) => {
@@ -474,5 +506,221 @@ async fn list_audio_endpoints(ctx: &ToolCtx<'_>) -> ToolOutcome {
             for_model: json!({"ok": false, "error": e.to_string()}),
             ui: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn state_with_user(role: &str) -> (Arc<AppState>, AuthUser, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::Config {
+            data_dir: dir.path().to_path_buf(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            web_dir: dir.path().to_path_buf(),
+            tls: None,
+            trusted_proxy: None,
+        };
+        let state = crate::build_state(config).await.unwrap();
+        state
+            .db
+            .exec(
+                "INSERT INTO users(id,username,display_name,password_hash,role,created_at)
+                 VALUES(1,'someone','Someone','x',?1,1)",
+                vec![P::T(role.to_string())],
+            )
+            .await
+            .unwrap();
+        let user = AuthUser {
+            id: 1,
+            username: "someone".into(),
+            role: role.into(),
+            session_id: "s".into(),
+            csrf: String::new(),
+        };
+        (state, user, dir)
+    }
+
+    async fn call(
+        state: &Arc<AppState>,
+        user: &AuthUser,
+        message: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let ctx = ToolCtx {
+            state,
+            user,
+            message,
+        };
+        let call = ToolCall {
+            id: "c".into(),
+            name: name.into(),
+            arguments,
+        };
+        dispatch(&ctx, &call).await.for_model
+    }
+
+    async fn saved_scope(state: &AppState, id: &Value) -> String {
+        state
+            .db
+            .q1(
+                "SELECT scope FROM facts WHERE id = ?1",
+                vec![P::I(id.as_i64().unwrap())],
+                |r| r.get(0),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_household_scope_takes_the_persons_own_words() {
+        let (state, user, _d) = state_with_user("member").await;
+        let household = json!({"text": "the code is 1234", "scope": "household"});
+
+        // The model asked for household; the person never did.
+        let r = call(
+            &state,
+            &user,
+            "note the door code",
+            "remember",
+            household.clone(),
+        )
+        .await;
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["scope"], "private", "the model is told what was used");
+        assert_eq!(saved_scope(&state, &r["fact_id"]).await, "private");
+
+        for said in [
+            "tell the family the door code",
+            "remember for everyone: the door code",
+            "Save it for the household.",
+        ] {
+            let r = call(&state, &user, said, "remember", household.clone()).await;
+            assert_eq!(
+                saved_scope(&state, &r["fact_id"]).await,
+                "household",
+                "{said}"
+            );
+        }
+
+        // Saying it doesn't make it household unless the model asked.
+        let private = json!({"text": "my own note"});
+        let r = call(&state, &user, "tell everyone", "remember", private).await;
+        assert_eq!(saved_scope(&state, &r["fact_id"]).await, "private");
+
+        // A word that only contains the keyword is not asking.
+        let r = call(
+            &state,
+            &user,
+            "my unfamily note",
+            "remember",
+            household.clone(),
+        )
+        .await;
+        assert_eq!(saved_scope(&state, &r["fact_id"]).await, "private");
+    }
+
+    #[tokio::test]
+    async fn a_guest_never_writes_household_facts() {
+        let (state, user, _d) = state_with_user("guest").await;
+        let args = json!({"text": "note", "scope": "household"});
+        let r = call(&state, &user, "tell the family", "remember", args).await;
+        assert_eq!(saved_scope(&state, &r["fact_id"]).await, "private");
+    }
+
+    /// A light, a speaker and someone's alarm for the rights tests.
+    async fn seed_things_to_act_on(state: &AppState) {
+        for sql in [
+            "INSERT INTO entities(entity_id,name,domain,state,allowed,updated_at)
+             VALUES('light.desk','Desk','light','on',1,1)",
+            "INSERT INTO endpoints(id,name,kind,created_at) VALUES('e','Speaker','browser',1)",
+            "INSERT INTO alarms(id,owner_id,timezone,endpoint_id,created_at,updated_at)
+             VALUES('a',1,'UTC','e',1,1)",
+        ] {
+            state.db.exec(sql, vec![]).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_guest_cannot_act_through_tools() {
+        let (state, user, _d) = state_with_user("guest").await;
+        seed_things_to_act_on(&state).await;
+
+        let light = json!({"entity_id": "light.desk", "action": "turn_off"});
+        let r = call(&state, &user, "", "control_light", light).await;
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].to_string().contains("no access"), "{r}");
+        let r = call(&state, &user, "", "set_alarm", json!({"in_minutes": 5})).await;
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].to_string().contains("no access"), "{r}");
+        let r = call(&state, &user, "", "cancel_alarm", json!({"alarm_id": "a"})).await;
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].to_string().contains("no access"), "{r}");
+
+        let alarms = state
+            .db
+            .q("SELECT status FROM alarms", vec![], |r| {
+                r.get::<_, String>(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(alarms, ["scheduled"], "nothing was added or canceled");
+    }
+
+    #[tokio::test]
+    async fn a_member_gets_past_the_rights_check() {
+        let (state, user, _d) = state_with_user("member").await;
+        seed_things_to_act_on(&state).await;
+        // No Home Assistant here, so the light fails later, for that reason.
+        let light = json!({"entity_id": "light.desk", "action": "turn_off"});
+        let r = call(&state, &user, "", "control_light", light).await;
+        assert!(r["error"].to_string().contains("not configured"), "{r}");
+        let r = call(&state, &user, "", "cancel_alarm", json!({"alarm_id": "a"})).await;
+        assert_eq!(r["ok"], true, "{r}");
+    }
+
+    #[tokio::test]
+    async fn removed_lights_are_not_listed() {
+        let (state, user, _d) = state_with_user("member").await;
+        state
+            .db
+            .exec(
+                "INSERT INTO entities(entity_id,name,domain,state,allowed,updated_at)
+                 VALUES('light.desk','Desk','light','on',1,1),
+                       ('light.gone','Gone','light','removed',1,1)",
+                vec![],
+            )
+            .await
+            .unwrap();
+        let r = call(&state, &user, "", "list_lights", json!({})).await;
+        let lights = r["lights"].as_array().unwrap();
+        assert_eq!(lights.len(), 1, "{r}");
+        assert_eq!(lights[0]["entity_id"], "light.desk");
+    }
+
+    #[tokio::test]
+    async fn a_model_cannot_pick_the_alarm_volume() {
+        let (state, user, _d) = state_with_user("member").await;
+        state
+            .db
+            .exec(
+                "INSERT INTO endpoints(id,name,kind,created_at) VALUES('e','Speaker','browser',1)",
+                vec![],
+            )
+            .await
+            .unwrap();
+        let args = json!({"in_minutes": 5, "volume": 1.0});
+        let r = call(&state, &user, "", "set_alarm", args).await;
+        assert_eq!(r["ok"], true, "{r}");
+        let volume: f64 = state
+            .db
+            .q1("SELECT volume FROM alarms", vec![], |r| r.get(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(volume, 0.7);
     }
 }

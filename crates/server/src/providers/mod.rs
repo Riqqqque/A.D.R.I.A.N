@@ -239,14 +239,19 @@ pub async fn transcribe_wav(
         .ok_or_else(|| {
             ApiError::NotConfigured("no AI provider configured for speech-to-text".into())
         })?;
-    for w in crate::usage::check(state, &row, module).await? {
+    // Checked and metered as the speech model, which can differ from the
+    // provider's chat model.
+    let metered = ProviderRow {
+        model: stt_model_name(&row),
+        ..row.clone()
+    };
+    for w in crate::usage::check(state, &metered, module).await? {
         tracing::info!(warning = %w, "budget");
     }
     let audio_seconds = wav_seconds(&wav);
     let key = secret_for(db, sb, &row.secret_name)
         .await?
         .unwrap_or_default();
-    let stt_model = stt_model_name(&row);
     let url = format!(
         "{}/audio/transcriptions",
         row.base_url.trim_end_matches('/')
@@ -257,7 +262,7 @@ pub async fn transcribe_wav(
         .map_err(|e| ApiError::internal_msg(format!("multipart: {e}")))?;
     let form = reqwest::multipart::Form::new()
         .part("file", part)
-        .text("model", stt_model);
+        .text("model", metered.model.clone());
     let mut req = http
         .post(&url)
         .timeout(Duration::from_secs(row.timeout_secs.max(30)))
@@ -287,10 +292,6 @@ pub async fn transcribe_wav(
         .unwrap_or("")
         .trim()
         .to_string();
-    let metered = ProviderRow {
-        model: stt_model_name(&row),
-        ..row.clone()
-    };
     crate::usage::record(
         state,
         &metered,
@@ -309,7 +310,7 @@ pub async fn transcribe_wav(
     Ok(text)
 }
 
-fn stt_model_name(row: &ProviderRow) -> String {
+pub fn stt_model_name(row: &ProviderRow) -> String {
     match row.kind.as_str() {
         "openai_responses" => "whisper-1".to_string(),
         _ => row.model.clone(),

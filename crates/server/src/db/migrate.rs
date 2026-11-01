@@ -255,6 +255,29 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE(scope, scope_id)
     );
     "#,
+    // v8: the registry keeps lights only. Nothing else here is usable, and
+    // the rest of a home's state is not every login's business. Speakers
+    // don't come from this table.
+    r#"
+    DELETE FROM entities WHERE domain <> 'light';
+    "#,
+    // v9: fact history. Each edit keeps the text it replaced and who replaced
+    // it, and the fact names its last editor. A tombstone keeps no text, so
+    // old ones lose theirs here; the facts_au trigger clears their search
+    // entries.
+    r#"
+    CREATE TABLE fact_versions (
+        fact_id INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        editor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        edited_at INTEGER NOT NULL,
+        PRIMARY KEY (fact_id, version)
+    );
+    CREATE INDEX fact_versions_edited_at ON fact_versions(edited_at);
+    ALTER TABLE facts ADD COLUMN edited_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+    UPDATE facts SET text = '' WHERE deleted_at IS NOT NULL;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -402,6 +425,56 @@ mod tests {
             .execute("DELETE FROM endpoints WHERE id='e'", [])
             .unwrap_err();
         assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
+    }
+
+    #[test]
+    fn the_registry_drops_everything_but_lights() {
+        let conn = at_v5();
+        for (id, domain) in [("light.desk", "light"), ("lock.front_door", "lock")] {
+            conn.execute(
+                "INSERT INTO entities(entity_id,name,domain,allowed,updated_at)
+                 VALUES(?1,?1,?2,1,1)",
+                [id, domain],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+
+        let kept: Vec<String> = conn
+            .prepare("SELECT entity_id FROM entities")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(kept, ["light.desk"]);
+    }
+
+    #[test]
+    fn old_tombstones_lose_their_text_and_search_entry() {
+        let conn = at_v5();
+        conn.execute(
+            "INSERT INTO facts(id,owner_id,text,source,created_at,updated_at,deleted_at)
+             VALUES(1,1,'the old secret','test',1,1,2)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let text: String = conn
+            .query_row("SELECT text FROM facts WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(text, "");
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH 'secret'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0);
     }
 
     /// With enforcement off during a migration, the check before commit is

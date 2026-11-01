@@ -112,8 +112,8 @@
 {#if error}<div class="banner">{error}</div>{/if}
 {#if entities.length === 0}
   <div class="notice">
-    No entities imported yet. Connect Home Assistant under
-    <strong>Integrations</strong> and run <em>Import entities</em>.
+    No lights imported yet. Connect Home Assistant under
+    <strong>Integrations</strong> and run <em>Import lights</em>.
   </div>
 {:else}
   <div class="panel">

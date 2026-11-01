@@ -67,8 +67,19 @@ async fn update(
     Path(id): Path<i64>,
     Json(b): Json<UpdateBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let fact = memory::update(&s.db, id, user.id, &b.text).await?;
+    let fact = memory::update(&s.db, id, user.id, &user.role, &b.text).await?;
     s.emit("memory", json!({"event": "updated", "id": id}));
+    let params = json!({"scope": fact.scope, "version": fact.version});
+    s.audit(
+        Some(user.id),
+        &user.username,
+        "memory_update",
+        &id.to_string(),
+        &params,
+        "ok",
+        "",
+    )
+    .await;
     Ok(Json(json!({"ok": true, "fact": fact})))
 }
 
@@ -77,7 +88,17 @@ async fn remove(
     State(s): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
-    memory::delete(&s.db, id, user.id).await?;
+    memory::delete(&s.db, id, user.id, &user.role).await?;
     s.emit("memory", json!({"event": "deleted", "id": id}));
+    s.audit(
+        Some(user.id),
+        &user.username,
+        "memory_delete",
+        &id.to_string(),
+        &json!({}),
+        "ok",
+        "",
+    )
+    .await;
     Ok(Json(json!({"ok": true})))
 }

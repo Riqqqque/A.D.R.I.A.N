@@ -1,6 +1,6 @@
 //! Shared application state and helpers used across handlers/services.
 
-use crate::auth::ratelimit::RateLimiter;
+use crate::auth::ratelimit::{RateLimiter, TurnGates};
 use crate::config::Config;
 use crate::db::{Db, P};
 use crate::error::ApiError;
@@ -23,6 +23,7 @@ pub struct AppState {
     pub config: Config,
     pub db: Db,
     pub rate_limit: Arc<RateLimiter>,
+    pub turns: Arc<TurnGates>,
     pub http: reqwest::Client,
     pub events: broadcast::Sender<ServerEvent>,
     pub scheduler: crate::scheduler::SchedulerHandle,

@@ -5,8 +5,9 @@
 //! such, when it reports none). Cost is computed from the user-entered
 //! `model_prices`; no prices are built in because they go stale. Local
 //! endpoints are free by rule and never blocked. A cloud model without a
-//! price row records a NULL cost and is reported as unpriced, because a
-//! budget cannot bound what it cannot price.
+//! price row records a NULL cost and is reported as unpriced, and while a
+//! budget covers it calls to it are refused, because a budget cannot bound
+//! what it cannot price.
 //!
 //! Budgets are monthly (calendar month in the household timezone) and scoped
 //! globally, per provider, or per module (`web`, `satellite`, later
@@ -233,7 +234,8 @@ fn describe(b: &Budget) -> String {
 
 /// Gate a paid call. Local providers always pass. Returns soft-limit
 /// warnings to show the user; errors with the real numbers when a budget
-/// covering this call is used up.
+/// covering this call is used up, and when `row`'s model has no price, since
+/// its spend would never count.
 pub async fn check(
     state: &AppState,
     row: &ProviderRow,
@@ -270,6 +272,12 @@ pub async fn check(
     if applicable.is_empty() {
         return Ok(vec![]);
     }
+    if price_for(state, row).await?.is_none() {
+        return Err(ApiError::Forbidden(format!(
+            "{} ({}) has no price, so a budget can't bound it. Enter its price under System, or switch to a local model.",
+            row.label, row.model
+        )));
+    }
     let tz = state.timezone().await.unwrap_or(TimeZone::UTC);
     let (start, end, label) = month_window(&tz, jiff::Timestamp::now());
     let mut warnings = Vec::new();
@@ -302,20 +310,41 @@ pub async fn check(
     Ok(warnings)
 }
 
-/// Enabled cloud providers whose current model has no price row.
+/// Enabled cloud providers whose current model has no price row, and, once a
+/// satellite is paired, whose speech model has none. Under a budget a call to
+/// that model is refused, so it can't show up below as having run.
 pub async fn unpriced(state: &AppState) -> Result<Vec<String>, ApiError> {
     let rows = providers::load_provider_rows(&state.db).await?;
+    let voice = state
+        .db
+        .q1(
+            "SELECT 1 FROM satellites WHERE revoked = 0 LIMIT 1",
+            vec![],
+            |r| r.get::<_, i64>(0),
+        )
+        .await?
+        .is_some();
     let mut out = Vec::new();
     for r in rows
         .iter()
         .filter(|r| r.enabled && !providers::base_is_local(&r.base_url))
     {
-        if price_for(state, r).await?.is_none() {
-            out.push(format!("{} ({})", r.label, r.model));
+        let mut models = vec![r.clone()];
+        if voice {
+            models.push(ProviderRow {
+                model: providers::stt_model_name(r),
+                ..r.clone()
+            });
+        }
+        for m in &models {
+            let name = format!("{} ({})", m.label, m.model);
+            if !out.contains(&name) && price_for(state, m).await?.is_none() {
+                out.push(name);
+            }
         }
     }
     // Models that actually ran this month without a price (e.g. the STT
-    // model, which differs from the provider's chat model).
+    // model, while no budget covers it).
     let tz = state.timezone().await.unwrap_or(TimeZone::UTC);
     let (start, end, _) = month_window(&tz, jiff::Timestamp::now());
     let seen = state

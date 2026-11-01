@@ -28,6 +28,7 @@ export interface Fact {
   created_at: number;
   updated_at: number;
   version: number;
+  edited_by: string | null;
 }
 
 export interface Entity {

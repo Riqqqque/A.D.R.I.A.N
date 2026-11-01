@@ -11,6 +11,8 @@
   let editText = $state('');
   let error = $state('');
   const isOwner = $derived(session.user?.role !== 'guest');
+  // Guests read household facts but change only their own; the server enforces it.
+  const canChange = (f: Fact) => isOwner || f.owner_id === session.user?.id;
 
   async function load() {
     try {
@@ -90,11 +92,13 @@
         <div class="row">
           <span class="grow">{f.text}</span>
           <span class="chip">{f.scope}</span>
-          <button class="small ghost" onclick={() => { editing = f.id; editText = f.text; }}>Edit</button>
-          <button class="small danger" onclick={() => remove(f)}>Delete</button>
+          {#if canChange(f)}
+            <button class="small ghost" onclick={() => { editing = f.id; editText = f.text; }}>Edit</button>
+            <button class="small danger" onclick={() => remove(f)}>Delete</button>
+          {/if}
         </div>
         <div class="small dim" style="margin-top:.15rem">
-          by {f.owner} · {f.source} · {fmt(f.updated_at)} · v{f.version}
+          by {f.owner}{f.edited_by && f.edited_by !== f.owner ? `, edited by ${f.edited_by}` : ''} · {f.source} · {fmt(f.updated_at)} · v{f.version}
         </div>
       {/if}
     </div>

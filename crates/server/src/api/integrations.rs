@@ -329,7 +329,14 @@ async fn test_ha(user: AuthUser, State(s): State<AppState>) -> Result<Json<Value
 
 async fn import_ha(user: AuthUser, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     user.require_owner()?;
-    let count = s.ha.import_entities().await?;
-    s.emit("entities", json!({"event": "imported", "count": count}));
-    Ok(Json(json!({"ok": true, "imported": count})))
+    let report = s.ha.import_entities().await?;
+    s.emit(
+        "entities",
+        json!({"event": "imported", "count": report.lights}),
+    );
+    Ok(Json(json!({
+        "ok": true,
+        "imported": report.lights,
+        "areas_error": report.areas_error,
+    })))
 }

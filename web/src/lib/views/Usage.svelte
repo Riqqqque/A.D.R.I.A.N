@@ -126,7 +126,7 @@
       <span class="chip ok">spent {usd(summary.total_cost_micros)}</span>
     </div>
     {#each summary.unpriced as u}
-      <p class="warn small" style="margin:.3rem 0">· {u} has no price yet, so budgets can't bound it. Add one below.</p>
+      <p class="warn small" style="margin:.3rem 0">· {u} has no price yet, so it's refused while a budget is set. Add one below.</p>
     {/each}
 
     {#if summary.rows.length === 0}

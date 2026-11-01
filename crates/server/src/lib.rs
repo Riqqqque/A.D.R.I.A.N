@@ -44,6 +44,7 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>, error::ApiErro
         config,
         db,
         rate_limit: auth::ratelimit::RateLimiter::new().into(),
+        turns: Default::default(),
         http,
         events,
         scheduler: scheduler::SchedulerHandle::detached(),
@@ -67,11 +68,12 @@ pub async fn start_services(state: &Arc<AppState>) -> Result<(), error::ApiError
     state.scheduler.clone().start(state.clone());
     scheduler::replicas::spawn_sync_on_changes(state.clone());
     Arc::new(state.ha.clone()).spawn();
-    // Periodic housekeeping: expired/revoked sessions.
+    // Periodic housekeeping: expired/revoked sessions, old fact history.
     let gc_db = state.db.clone();
     tokio::spawn(async move {
         loop {
             auth::sweep_expired_sessions(&gc_db).await;
+            memory::purge_versions(&gc_db).await;
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });
