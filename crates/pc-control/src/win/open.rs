@@ -24,14 +24,58 @@ pub fn encode(q: &str) -> String {
     out
 }
 
-/// Only plain web pages: no file:, javascript: or app protocols from the model.
+/// Longest address that opens. A long query string is how a page gets handed
+/// what she knows.
+const MAX_URL: usize = 300;
+
+/// Last labels that never reach the public web.
+const PRIVATE_SUFFIXES: [&str; 8] = [
+    "localhost",
+    "local",
+    "lan",
+    "home",
+    "internal",
+    "intranet",
+    "corp",
+    "arpa",
+];
+
+/// A name on the public web, from `host` or `host:port`. Only plain hostname
+/// characters pass, so a user@ part, a backslash, an escape or a look-alike
+/// digit can't make the browser go somewhere other than what this reads.
+fn public_host(authority: &str) -> bool {
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return false,
+        None => authority,
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let plain = host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    let labels: Vec<&str> = host.split('.').collect();
+    let last = labels[labels.len() - 1];
+    // No top-level domain starts with a digit, but 127.0.0.1, 127.1 and 0x7f.0.0.1 do.
+    plain
+        && labels.len() > 1
+        && labels.iter().all(|l| !l.is_empty())
+        && !last.starts_with(|c: char| c.is_ascii_digit())
+        && !PRIVATE_SUFFIXES.contains(&last)
+}
+
+/// Only plain web pages on the public web: no file:, javascript: or app
+/// protocols from the model, and nothing on this PC or the LAN.
 pub fn web_url(u: &str) -> Option<&str> {
     let lower = u.to_ascii_lowercase();
-    let ok = (lower.starts_with("https://") || lower.starts_with("http://"))
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))?;
+    let ok = u.len() <= MAX_URL
         && !u
             .chars()
             .any(|c| c.is_whitespace() || c.is_control() || c == '"');
-    ok.then_some(u)
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    (ok && public_host(authority)).then_some(u)
 }
 
 /// A YouTube video id: 11 of [A-Za-z0-9_-].
@@ -83,7 +127,9 @@ pub fn run(args: &Value) -> Outcome {
     let (target, said) = if !url.is_empty() {
         match web_url(&url) {
             Some(u) => (u.to_string(), "the page".to_string()),
-            None => return Outcome::no("Only http and https web addresses can be opened."),
+            None => {
+                return Outcome::no("Only public http and https web addresses can be opened.");
+            }
         }
     } else if video_id(&video) {
         (
@@ -131,5 +177,83 @@ mod tests {
         assert!(web_url("https://x.com/\" --evil").is_none());
         assert!(video_id("dQw4w9WgXcQ"));
         assert!(!video_id("dQw4w9WgXc&"));
+    }
+
+    #[test]
+    fn opens_public_pages() {
+        for u in [
+            "https://example.com",
+            "http://example.com/a?b=c#d",
+            "HTTPS://Example.COM/Path",
+            "https://www.reddit.com/r/pcgaming",
+            "https://modrinth.com:443/mod/jei",
+            "https://example.com./x",
+            "https://xn--bcher-kva.example/",
+            // Country and brand domains that happen to spell hex.
+            "https://example.de/",
+            "https://example.ca/",
+            "https://example.cc/",
+            "https://example.cafe/",
+        ] {
+            assert_eq!(web_url(u), Some(u), "{u}");
+        }
+    }
+
+    #[test]
+    fn refuses_this_pc_and_the_lan() {
+        for u in [
+            "http://localhost/",
+            "http://localhost:3000/",
+            "http://LOCALHOST/",
+            "http://localhost./",
+            "http://app.localhost/",
+            "http://printer.local/",
+            "http://printer.local./",
+            "http://router.lan/",
+            "http://nas.home/",
+            "http://nas.home.arpa/",
+            "http://db.internal/",
+            "http://intranet/",
+            "http://127.0.0.1/",
+            "http://192.168.1.1/admin",
+            "http://192.168.1.1:8080/",
+            "http://8.8.8.8/",
+            "http://127.1/",
+            "http://2130706433/",
+            "http://0x7f.0.0.1/",
+            "http://0x7f000001/",
+            "http://[::1]/",
+            "http://[fe80::1]:8080/",
+        ] {
+            assert_eq!(web_url(u), None, "{u}");
+        }
+    }
+
+    #[test]
+    fn refuses_addresses_that_hide_their_host() {
+        for u in [
+            "https://steamcommunity.com@evil.example/",
+            "https://user:pw@evil.example/",
+            "https://evil.example\\@good.example/",
+            "https://good.example\\.evil.example/",
+            "https://evil.example%2f@good.example/",
+            "http://127%2e0%2e0%2e1/",
+            "http://a.loc%61l/",
+            "http://１２７.０.０.１/",
+            "https://exa_mple.com:80x/",
+            "https://exa..mple.com/",
+            "https:///example.com",
+            "https://",
+        ] {
+            assert_eq!(web_url(u), None, "{u}");
+        }
+    }
+
+    #[test]
+    fn refuses_long_addresses() {
+        let at_limit = format!("https://example.com/{}", "a".repeat(280));
+        assert_eq!(at_limit.len(), 300);
+        assert!(web_url(&at_limit).is_some());
+        assert!(web_url(&format!("{at_limit}a")).is_none());
     }
 }
