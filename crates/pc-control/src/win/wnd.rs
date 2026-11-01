@@ -169,9 +169,14 @@ pub fn act(index: &Index, action: &str, name: &str) -> Outcome {
         Err(e) => return Outcome::no(e),
     };
     let app = label(&wins[0]);
-    if wins.iter().any(|w| index.is_game(&w.exe)) {
+    if wins.iter().any(|w| index.is_protected(&w.exe)) {
+        let what = if wins.iter().any(|w| index.is_game(&w.exe)) {
+            "is a game"
+        } else {
+            "might be a game: I can't tell which program it is"
+        };
         return Outcome::no(format!(
-            "{app} is a game. I don't touch running games, so anti-cheat never sees me. They can close or switch to it themselves."
+            "{app} {what}. I don't touch running games, so anti-cheat never sees me. They can close or switch to it themselves."
         ));
     }
     unsafe {
