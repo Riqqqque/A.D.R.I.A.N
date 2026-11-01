@@ -34,10 +34,14 @@
     const busy = st.mode === 'speaking' || st.mode === 'thinking';
     $('btnStop').hidden = !busy;
     $('btnTalk').hidden = busy;
+    // Offline there's nobody to talk to; what you meant to type can wait in the box.
+    if (st.connected) note('');
+    else if (talk.classList.contains('down')) hold(false);
+    talk.disabled = !st.connected;
+    talk.title = st.connected ? 'Hold to talk' : 'Not connected';
     renderConnection();
   }
-  listen('frame', (e) => {
-    const f = e.payload;
+  const showFrame = (f) => {
     orb.setMode(f.mode);
     orb.setLevel(f.level);
     $('micMeter').style.width = `${Math.round(Math.min(1, f.mic) * 100)}%`;
@@ -46,7 +50,9 @@
       st.micError = f.mic_error;
       render();
     }
-  });
+  };
+  listen('frame', (e) => showFrame(e.payload));
+  invoke('her_state').then(showFrame);
   // The mic and speakers she's using: Windows' defaults, followed as they change.
   const showDevices = (d) => {
     if (d && (d.mic || d.speakers)) $('devices').textContent = `Using ${d.mic || 'no mic'} and ${d.speakers || 'no speakers'} (the Windows defaults; she follows them when they change).`;
@@ -87,12 +93,32 @@
 
   // --- typing, talking, stopping -------------------------------------------
   const input = $('askText');
-  input.addEventListener('input', () => ($('btnSend').hidden = !input.value.trim()));
-  $('ask').addEventListener('submit', (e) => {
+  input.addEventListener('input', () => {
+    $('btnSend').hidden = !input.value.trim();
+    note('');
+  });
+  // Something that didn't reach her.
+  function note(text) {
+    $('note').textContent = text;
+    $('note').hidden = !text;
+  }
+  listen('not_sent', (e) => note(e.payload));
+  let sending = false;
+  $('ask').addEventListener('submit', async (e) => {
     e.preventDefault();
     const t = input.value.trim();
-    if (!t) return;
-    invoke('send_text', { text: t });
+    if (!t || sending) return;
+    sending = true;
+    try {
+      await invoke('send_text', { text: t });
+    } catch (err) {
+      // Refused, not queued: it stays in the box and can't run later on its own.
+      note(String(err));
+      return;
+    } finally {
+      sending = false;
+    }
+    note('');
     $('you').textContent = t;
     $('you').hidden = false;
     $('her').hidden = true;
@@ -106,6 +132,8 @@
     invoke('push_to_talk', { down: on });
   };
   talk.addEventListener('pointerdown', (e) => {
+    // Chromium can still hand pointer events to a disabled button.
+    if (talk.disabled) return;
     talk.setPointerCapture(e.pointerId);
     hold(true);
   });
@@ -142,6 +170,7 @@
     $('connTitle').textContent = ok ? 'Connected to your home server' : current.paired ? 'Not connected' : 'Not set up yet';
     $('connSub').textContent = ok ? 'Her voice, memory and tools are the same as in Discord.' : st.text;
   }
+  const renderUpdate = () => ($('updateInfo').textContent = $('autoUpdate').checked ? current.update_on : current.update_off);
   async function openSettings(showConnection) {
     current = await invoke('get_settings');
     $('server').value = current.server_url;
@@ -151,12 +180,7 @@
     $('mic').value = Math.round(current.mic_threshold * 600);
     $('micHint').textContent = micLabel($('mic').value);
     $('autoUpdate').checked = current.auto_update;
-    const u = current.update;
-    $('updateInfo').textContent =
-      u.state === 'ready' ? `Version ${u.version}. ${u.latest} is downloaded and installs the next time she's idle in the tray.`
-      : u.state === 'available' ? `Version ${u.version}. ${u.latest} is out: turn on automatic updates, or download it from GitHub.`
-      : u.state === 'error' ? `Version ${u.version}. The last update check failed: ${u.message}`
-      : `Version ${u.version}${u.latest && u.latest === u.version ? ', up to date' : ''}.`;
+    renderUpdate();
     const list = $('toggles');
     list.textContent = '';
     for (const [key, label, sub] of PERMS) {
@@ -177,7 +201,7 @@
       row.append(text, box);
       list.append(row);
     }
-    $('shortcuts').value = (current.pc.shortcuts || []).map((s) => `${s.name} = ${s.target}${s.args ? ` ${s.args}` : ''}`).join('\n');
+    $('shortcuts').value = current.shortcuts;
     $('error').hidden = true;
     renderConnection();
     sheet.hidden = false;
@@ -187,6 +211,7 @@
     sheet.hidden = true;
   }
   $('mic').addEventListener('input', () => ($('micHint').textContent = micLabel($('mic').value)));
+  $('autoUpdate').addEventListener('change', renderUpdate);
   $('btnClose').addEventListener('click', closeSettings);
   $('btnCancel').addEventListener('click', closeSettings);
   document.addEventListener('keydown', (e) => {
@@ -197,20 +222,11 @@
   $('btnSave').addEventListener('click', async () => {
     const pc = { ...current.pc };
     for (const [key] of PERMS) pc[key] = $(`pc_${key}`).checked;
-    pc.shortcuts = $('shortcuts')
-      .value.split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .map((l) => {
-        const at = l.indexOf('=');
-        return at > 0 ? { name: l.slice(0, at).trim(), target: l.slice(at + 1).trim(), args: '' } : null;
-      })
-      .filter((s) => s && s.name && s.target);
     const save = $('btnSave');
     save.disabled = true;
     save.textContent = 'Saving';
     try {
-      await invoke('save_settings', { serverUrl: $('server').value, token: $('token').value || null, micThreshold: Number($('mic').value) / 600, pc, autoUpdate: $('autoUpdate').checked });
+      await invoke('save_settings', { serverUrl: $('server').value, token: $('token').value || null, micThreshold: Number($('mic').value) / 600, pc, shortcuts: $('shortcuts').value, autoUpdate: $('autoUpdate').checked });
       closeSettings();
     } catch (err) {
       $('error').textContent = String(err);

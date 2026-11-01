@@ -79,9 +79,13 @@ pub struct Shared {
     voice: AtomicBool,
     listen_until_ms: AtomicU64,
     has_state: AtomicBool,
+    /// The server has welcomed this PC: there's someone to hear what's typed or said.
+    online: AtomicBool,
     pub mic_level: AtomicU32,
     pub talking: AtomicBool,
     pub ptt: AtomicBool,
+    /// The push-to-talk hotkey is physically down, link or no link.
+    pub held: AtomicBool,
     /// Manual mic threshold (f32 bits); 0 = automatic.
     pub threshold: AtomicU32,
     pub mic_error: Mutex<Option<String>>,
@@ -106,9 +110,11 @@ impl Shared {
             voice: AtomicBool::new(false),
             listen_until_ms: AtomicU64::new(0),
             has_state: AtomicBool::new(false),
+            online: AtomicBool::new(false),
             mic_level: AtomicU32::new(0),
             talking: AtomicBool::new(false),
             ptt: AtomicBool::new(false),
+            held: AtomicBool::new(false),
             threshold: AtomicU32::new(threshold.to_bits()),
             mic_error: Mutex::new(None),
             wake: Mutex::new(None),
@@ -137,6 +143,19 @@ impl Shared {
         self.has_state.store(true, Ordering::Relaxed);
         let until = if ms == 0 { 0 } else { self.now_ms() + ms };
         self.listen_until_ms.store(until, Ordering::Relaxed);
+    }
+
+    pub fn online(&self) -> bool {
+        self.online.load(Ordering::Relaxed)
+    }
+
+    /// The server welcomed this PC, or the link to it is gone. Push-to-talk goes
+    /// with the link: nobody is listening any more. It comes back with the link
+    /// only for a hotkey that's still held down.
+    pub fn set_online(&self, on: bool) {
+        self.online.store(on, Ordering::Relaxed);
+        self.ptt
+            .store(on && self.held.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     /// Lost the server: nothing is said or listened to until it reports again.

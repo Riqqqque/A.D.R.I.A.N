@@ -7,13 +7,12 @@
 //! back, until the new one has been up for a while. Turned off in settings, it
 //! only says that a new version exists.
 
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 const REPO: &str = "Riqqqque/adrian-discord-voice";
@@ -24,8 +23,8 @@ const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// low priority, and the virus scanner goes through a new exe first.
 const SELF_CHECK: Duration = Duration::from_secs(30);
 
-/// What the settings page shows.
-#[derive(Serialize, Clone, Default)]
+/// How updates stand.
+#[derive(Clone, Default)]
 pub struct UpdateView {
     pub version: String,
     /// "", "checking", "ready" (downloaded, installs when idle), "available" (auto-update off), "error"
@@ -34,7 +33,55 @@ pub struct UpdateView {
     pub message: Option<String>,
 }
 
+impl UpdateView {
+    /// The line in settings, for one position of the automatic-updates switch:
+    /// what's true depends on the switch as well as on what happened.
+    pub fn line(&self, auto: bool) -> String {
+        let v = &self.version;
+        let latest = self.latest.as_deref().unwrap_or_default();
+        match self.state.as_str() {
+            "ready" if auto => format!(
+                "Version {v}. {latest} is downloaded and installs the next time she's idle in the tray."
+            ),
+            "ready" => {
+                format!(
+                    "Version {v}. {latest} is downloaded and installs when automatic updates are on."
+                )
+            }
+            "available" if auto => format!("Version {v}. {latest} is out: save to download it."),
+            "available" => format!(
+                "Version {v}. {latest} is out: turn on automatic updates, or download it from GitHub."
+            ),
+            "error" => format!(
+                "Version {v}. The last update check failed: {}",
+                self.message.as_deref().unwrap_or_default()
+            ),
+            _ if latest == v => format!("Version {v}, up to date."),
+            _ => format!("Version {v}."),
+        }
+    }
+}
+
 pub static STATUS: Mutex<Option<UpdateView>> = Mutex::new(None);
+
+/// Set by `check_now`, read by the wait between checks.
+static CHECK_NOW: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+/// Cut the wait for the next check short: automatic updates were just turned on.
+pub fn check_now() {
+    *CHECK_NOW.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    CHECK_NOW.1.notify_all();
+}
+
+/// Wait out `time` between checks, unless `check_now` ends it early.
+fn rest(time: Duration) {
+    let asked = CHECK_NOW.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut asked, _) = CHECK_NOW
+        .1
+        .wait_timeout_while(asked, time, |asked| !*asked)
+        .unwrap_or_else(|e| e.into_inner());
+    *asked = false;
+}
 
 pub fn status() -> UpdateView {
     STATUS
@@ -348,7 +395,7 @@ pub fn run(enabled: impl Fn() -> bool, idle: impl Fn() -> bool, quit: impl Fn())
             },
             Err(e) => set("error", None, Some(e)),
         }
-        std::thread::sleep(EVERY);
+        rest(EVERY);
     }
 }
 
@@ -492,6 +539,60 @@ mod tests {
         assert!(!old.exists());
         assert!(here.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn view(state: &str) -> UpdateView {
+        UpdateView {
+            version: "0.15.2".into(),
+            state: state.into(),
+            latest: Some("0.15.3".into()),
+            message: None,
+        }
+    }
+
+    #[test]
+    fn a_downloaded_update_only_promises_an_install_with_the_switch_on() {
+        let u = view("ready");
+        assert!(u.line(true).contains("next time she's idle"));
+        let off = u.line(false);
+        assert!(!off.contains("next time"), "{off}");
+        assert!(off.contains("when automatic updates are on"), "{off}");
+    }
+
+    #[test]
+    fn with_the_switch_on_it_no_longer_says_to_turn_it_on() {
+        let u = view("available");
+        assert!(u.line(false).contains("turn on automatic updates"));
+        let on = u.line(true);
+        assert!(!on.contains("turn on"), "{on}");
+    }
+
+    #[test]
+    fn the_quiet_lines_ignore_the_switch() {
+        let mut u = view("");
+        u.latest = Some("0.15.2".into());
+        assert_eq!(u.line(true), "Version 0.15.2, up to date.");
+        assert_eq!(u.line(false), "Version 0.15.2, up to date.");
+        assert_eq!(view("checking").line(true), "Version 0.15.2.");
+        let mut failed = view("error");
+        failed.message = Some("no network".into());
+        assert!(failed.line(false).ends_with("failed: no network"));
+    }
+
+    #[test]
+    fn turning_updates_on_ends_the_wait_for_the_next_check() {
+        let start = Instant::now();
+        let asker = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            check_now();
+        });
+        rest(Duration::from_secs(30));
+        asker.join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(10));
+        // Used up: the wait after this one runs its full length.
+        let start = Instant::now();
+        rest(Duration::from_millis(100));
+        assert!(start.elapsed() >= Duration::from_millis(100));
     }
 
     #[test]

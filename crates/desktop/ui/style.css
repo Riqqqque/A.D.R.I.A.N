@@ -56,6 +56,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .her { color: var(--fg); font-size: 15.5px; line-height: 1.5; max-height: 7.5em; overflow-y: auto; }
 .hint { color: var(--faint); font-size: 13px; }
 .hint b { color: var(--muted); font-weight: 500; }
+.note { color: var(--warn); font-size: 13px; }
 kbd { font: 11px var(--mono); border: 1px solid var(--line-strong); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; color: var(--muted); }
 .offline { justify-self: start; border: 1px solid rgba(212, 132, 106, 0.4); background: rgba(212, 132, 106, 0.1); color: var(--warn); border-radius: 14px; height: 28px; padding: 0 12px; font-size: 12.5px; }
 
@@ -68,6 +69,7 @@ kbd { font: 11px var(--mono); border: 1px solid var(--line-strong); border-botto
 .round { width: 36px; height: 36px; flex: none; display: grid; place-items: center; border-radius: 50%; border: 0; background: rgba(255, 255, 255, 0.07); color: var(--fg); transition: background 0.15s, transform 0.1s, box-shadow 0.2s; }
 .round:hover { background: rgba(255, 255, 255, 0.13); }
 .round:active { transform: scale(0.94); }
+.round:disabled { opacity: 0.45; cursor: default; background: rgba(255, 255, 255, 0.07); transform: none; }
 .send { background: var(--accent); color: var(--accent-ink); }
 .send:hover { background: color-mix(in srgb, var(--accent) 85%, white); }
 .mic.down { background: var(--accent); color: var(--accent-ink); box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 22%, transparent); }
@@ -111,8 +113,9 @@ code { font: 11.5px var(--mono); color: var(--fg); }
 .switch input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #c9d0da; transition: transform 0.15s, background 0.15s; }
 .switch input:checked { background: var(--accent); }
 .switch input:checked::after { transform: translateX(16px); background: var(--accent-ink); }
-.error { margin: 0; color: var(--warn); font-size: 13px; padding: 0 4px; }
-.sheet-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--line); background: var(--surface); }
+.error { margin: 0; color: var(--warn); font-size: 13px; padding: 0 4px; overflow-wrap: anywhere; }
+.sheet-foot { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--line); background: var(--surface); }
+.sheet-foot .error { flex: 1 0 100%; }
 .btn { height: 36px; padding: 0 18px; border-radius: 8px; border: 1px solid var(--line-strong); background: transparent; color: var(--fg); font-weight: 500; }
 .btn:hover { background: rgba(255, 255, 255, 0.06); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }

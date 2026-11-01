@@ -26,6 +26,7 @@
       <p class="you" id="you" hidden></p>
       <p class="her" id="her" hidden></p>
       <p class="hint" id="hint">Say <b>“Hey Adrian”</b>, hold <kbd>Ctrl</kbd>&nbsp;<kbd>Alt</kbd>&nbsp;<kbd>Space</kbd>, or type below.</p>
+      <p class="note" id="note" hidden></p>
       <button type="button" class="offline" id="offline" hidden>Not connected. Open settings</button>
     </section>
 
@@ -95,10 +96,10 @@
         <div class="sub">Extra things she can open by name, one per line: <code>studio = C:\path\to\file.lnk</code></div>
         <textarea id="shortcuts" rows="3" spellcheck="false" aria-label="Shortcuts"></textarea>
       </section>
-      <p class="error" id="error" hidden></p>
     </div>
 
     <footer class="sheet-foot">
+      <p class="error" id="error" role="alert" hidden></p>
       <button type="button" id="btnCancel" class="btn">Cancel</button>
       <button type="button" id="btnSave" class="btn primary">Save</button>
     </footer>
