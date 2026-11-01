@@ -545,6 +545,10 @@ fn main() {
                                 text,
                                 owner,
                             } => {
+                                // Only a welcome from the server says connected.
+                                if connected {
+                                    update::welcomed();
+                                }
                                 let v = StatusView {
                                     connected,
                                     text,
