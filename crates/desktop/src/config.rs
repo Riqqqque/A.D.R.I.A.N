@@ -1,7 +1,7 @@
 //! Settings, kept in %APPDATA%\adrian\desktop\config\config.json. The pairing
 //! token is encrypted with Windows DPAPI, so only this Windows user can read it.
 
-use adrian_pc_control::Policy;
+use adrian_pc_control::{Policy, Shortcut};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -43,6 +43,119 @@ pub fn save(s: &Settings) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+}
+
+/// What the settings page sends on Save.
+pub struct Form {
+    pub server_url: String,
+    pub token: Option<String>,
+    pub mic_threshold: f32,
+    pub pc: Policy,
+    /// The shortcuts box, as typed. It replaces whatever shortcuts `pc` holds.
+    pub shortcuts: String,
+    pub auto_update: Option<bool>,
+}
+
+/// What a Save changed that needs acting on.
+pub struct Saved {
+    /// The server address or the token is different now.
+    pub connection: bool,
+    /// Automatic updates were off and are on now.
+    pub updates_on: bool,
+}
+
+impl Saved {
+    /// Whether to connect again. A reconnect drops whatever she's in the middle
+    /// of, so not while she's connected on an unchanged connection. Without a
+    /// connection any Save is worth a try, even with the same token.
+    pub fn reconnect(&self, connected: bool) -> bool {
+        self.connection || !connected
+    }
+}
+
+/// Save `form` over `s`. All or nothing: it's checked and written (by `write`)
+/// on a copy, and `s` only changes once that worked.
+pub fn commit(
+    s: &mut Settings,
+    form: Form,
+    write: impl FnOnce(&Settings) -> Result<(), String>,
+) -> Result<Saved, String> {
+    if normalize_url(&form.server_url).is_none() {
+        return Err("Enter the server address, like homeserver:8791.".into());
+    }
+    let mut next = s.clone();
+    next.server_url = form.server_url.trim().to_string();
+    if let Some(t) = form
+        .token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        if !t.starts_with("sat_") {
+            return Err("That doesn't look like a pairing token (they start with sat_).".into());
+        }
+        next.set_token(&t)?;
+    }
+    next.mic_threshold = form.mic_threshold.clamp(0.0, 0.1);
+    next.pc = Policy {
+        shortcuts: parse_shortcuts(&form.shortcuts)?,
+        ..form.pc
+    };
+    if let Some(on) = form.auto_update {
+        next.updates_off = !on;
+    }
+    write(&next)?;
+    let saved = Saved {
+        connection: (next.url(), next.token()) != (s.url(), s.token()),
+        updates_on: s.updates_off && !next.updates_off,
+    };
+    *s = next;
+    Ok(saved)
+}
+
+/// The shortcuts as lines for the settings box. With arguments the target is
+/// quoted, so `parse_shortcuts` can tell them from spaces in a path.
+pub fn shortcut_lines(list: &[Shortcut]) -> String {
+    let line = |s: &Shortcut| {
+        if s.args.is_empty() {
+            format!("{} = {}", s.name, s.target)
+        } else {
+            format!("{} = \"{}\" {}", s.name, s.target, s.args)
+        }
+    };
+    list.iter().map(line).collect::<Vec<_>>().join("\n")
+}
+
+/// The settings box back into shortcuts: `name = target`, or
+/// `name = "target" args`. A line it can't read is an error that names the
+/// line, never something to drop.
+pub fn parse_shortcuts(text: &str) -> Result<Vec<Shortcut>, String> {
+    let unreadable = |line: &str| {
+        let shown: String = line.chars().take(60).collect();
+        format!("Can't read this shortcut: {shown}. Use name = target.")
+    };
+    let mut list = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // Spaces around the = win, so a name or a URL can hold an = of its own.
+        let (name, rest) = line
+            .split_once(" = ")
+            .or_else(|| line.split_once('='))
+            .ok_or_else(|| unreadable(line))?;
+        let (name, rest) = (name.trim(), rest.trim());
+        let (target, args) = match rest.strip_prefix('"') {
+            Some(quoted) => quoted.split_once('"').ok_or_else(|| unreadable(line))?,
+            None => (rest, ""),
+        };
+        let target = target.trim();
+        if name.is_empty() || target.is_empty() {
+            return Err(unreadable(line));
+        }
+        list.push(Shortcut {
+            name: name.to_string(),
+            target: target.to_string(),
+            args: args.trim().to_string(),
+        });
+    }
+    Ok(list)
 }
 
 impl Settings {
@@ -164,6 +277,143 @@ mod tests {
         );
         assert_eq!(normalize_url("  "), None);
         assert_eq!(normalize_url("bad host"), None);
+    }
+
+    fn on_server_a() -> Settings {
+        Settings {
+            server_url: "a:8791".into(),
+            ..Default::default()
+        }
+    }
+
+    fn form(server_url: &str) -> Form {
+        Form {
+            server_url: server_url.into(),
+            token: None,
+            mic_threshold: 0.0,
+            pc: Policy::default(),
+            shortcuts: String::new(),
+            auto_update: None,
+        }
+    }
+
+    #[test]
+    fn a_refused_token_changes_nothing() {
+        let mut s = on_server_a();
+        let bad = Form {
+            token: Some("not-a-token".into()),
+            mic_threshold: 0.05,
+            ..form("b:8791")
+        };
+        assert!(commit(&mut s, bad, |_| panic!("nothing to write")).is_err());
+        assert_eq!(s.server_url, "a:8791");
+        assert_eq!(s.mic_threshold, 0.0);
+    }
+
+    #[test]
+    fn a_failed_write_changes_nothing() {
+        let mut s = on_server_a();
+        let off = Form {
+            pc: Policy {
+                shutdown: false,
+                ..Policy::default()
+            },
+            auto_update: Some(false),
+            ..form("b:8791")
+        };
+        assert!(commit(&mut s, off, |_| Err("disk full".into())).is_err());
+        assert_eq!(s.server_url, "a:8791");
+        assert!(s.pc.shutdown);
+        assert!(!s.updates_off);
+    }
+
+    #[test]
+    fn a_good_save_changes_everything_and_says_what_moved() {
+        let mut s = on_server_a();
+        s.updates_off = true;
+        let good = Form {
+            mic_threshold: 0.05,
+            auto_update: Some(true),
+            ..form("b:8791")
+        };
+        let saved = commit(&mut s, good, |next| {
+            assert_eq!(next.server_url, "b:8791");
+            Ok(())
+        })
+        .unwrap();
+        assert!(saved.connection && saved.updates_on);
+        assert_eq!(s.server_url, "b:8791");
+        assert_eq!(s.mic_threshold, 0.05);
+        // The same again moves nothing.
+        let saved = commit(&mut s, form("b:8791"), |_| Ok(())).unwrap();
+        assert!(!saved.connection && !saved.updates_on);
+    }
+
+    #[test]
+    fn saving_with_no_connection_tries_again_even_when_nothing_changed() {
+        let saved = Saved {
+            connection: false,
+            updates_on: false,
+        };
+        assert!(saved.reconnect(false));
+        // Connected, it would only drop what she's in the middle of.
+        assert!(!saved.reconnect(true));
+    }
+
+    #[test]
+    fn an_unreadable_shortcut_is_named_and_stops_the_save() {
+        for bad in [
+            "studio C:\\x.lnk",
+            "= C:\\x.lnk",
+            "studio =",
+            "studio = \"C:\\no closing quote.exe --flag",
+            "studio = \"\"",
+        ] {
+            let e = parse_shortcuts(&format!("ok = C:\\ok.lnk\n{bad}\n")).unwrap_err();
+            assert!(e.contains(bad.trim()), "{e}");
+        }
+        let mut s = on_server_a();
+        s.pc.shortcuts = parse_shortcuts("kept = C:\\kept.lnk").unwrap();
+        let bad = Form {
+            shortcuts: "studio C:\\x.lnk".into(),
+            ..form("a:8791")
+        };
+        assert!(commit(&mut s, bad, |_| panic!("nothing to write")).is_err());
+        assert_eq!(s.pc.shortcuts.len(), 1);
+    }
+
+    #[test]
+    fn shortcuts_keep_their_args_through_a_save() {
+        let before = vec![
+            Shortcut {
+                name: "with args".into(),
+                target: "C:\\Program Files\\x.exe".into(),
+                args: "--foo --bar".into(),
+            },
+            Shortcut {
+                name: "spaces".into(),
+                target: "C:\\Program Files\\y.exe".into(),
+                args: String::new(),
+            },
+            Shortcut {
+                name: "site".into(),
+                target: "https://example.com/?a=b".into(),
+                args: String::new(),
+            },
+        ];
+        let after = parse_shortcuts(&shortcut_lines(&before)).unwrap();
+        assert_eq!(after.len(), before.len());
+        for (a, b) in after.iter().zip(&before) {
+            assert_eq!((&a.name, &a.target, &a.args), (&b.name, &b.target, &b.args));
+        }
+    }
+
+    #[test]
+    fn reads_shortcuts_as_typed() {
+        let list = parse_shortcuts("\n a=b \n\nquoted = \"C:\\p q\\x.lnk\"\n").unwrap();
+        assert_eq!((list[0].name.as_str(), list[0].target.as_str()), ("a", "b"));
+        assert_eq!(list[1].target, "C:\\p q\\x.lnk");
+        assert_eq!(list[1].args, "");
     }
 
     #[cfg(windows)]

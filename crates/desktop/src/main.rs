@@ -10,6 +10,7 @@ mod config;
 mod link;
 mod quiet;
 mod single;
+mod tray;
 mod update;
 
 use adrian_pc_control::{Pc, Policy};
@@ -19,7 +20,7 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use link::{Cmd, Event, Link};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
@@ -34,6 +35,8 @@ struct AppState {
     shared: Arc<Shared>,
     pc: Arc<Mutex<Arc<Pc>>>,
     status: Mutex<StatusView>,
+    /// What the tray shows now.
+    tray: Mutex<Option<tray::View>>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -49,9 +52,13 @@ struct SettingsView {
     paired: bool,
     mic_threshold: f32,
     pc: Policy,
+    /// The shortcuts as lines for the settings box.
+    shortcuts: String,
     settings_file: String,
     auto_update: bool,
-    update: update::UpdateView,
+    /// The update line for each position of the switch: it can flip before a Save.
+    update_on: String,
+    update_off: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -65,6 +72,63 @@ struct Frame {
 
 /// How long the window may sit minimized before it's closed to the tray.
 const MINIMIZED_TO_TRAY: Duration = Duration::from_secs(120);
+
+/// Her state right now, as the window shows it.
+fn frame(shared: &Shared) -> Frame {
+    let out = f32::from_bits(shared.out_level.load(Ordering::Relaxed));
+    let mic = f32::from_bits(shared.mic_level.load(Ordering::Relaxed));
+    // Her own music isn't her talking: the orb only speaks with her voice.
+    let (mode, level) = if (shared.playing() || out > 0.03) && shared.her_voice() {
+        ("speaking", out)
+    } else if shared.online()
+        && (shared.ptt.load(Ordering::Relaxed)
+            || (shared.talking.load(Ordering::Relaxed) && shared.listening()))
+    {
+        // Only when she's really listening to you: push-to-talk, or talking
+        // right after her answer. Any loud sound opens the mic gate (music, a
+        // cough); the server ignores those, so the orb shouldn't light up for
+        // them either. And offline nobody is listening at all.
+        ("listening", mic)
+    } else if shared.answering.load(Ordering::Relaxed) {
+        ("thinking", 0.0)
+    } else {
+        ("idle", 0.0)
+    };
+    let mic_error = shared.mic_error.lock().ok().and_then(|e| e.clone());
+    Frame {
+        mode,
+        level,
+        mic,
+        mic_error,
+    }
+}
+
+/// Decides which frames reach the page. With the orb drawing, all of them.
+/// With it paused (say behind a full-screen game) the chip and the Stop button
+/// still have to be right, so on slow ticks it looks, and only sends a change.
+#[derive(Default)]
+struct Pacer {
+    sent: Option<(&'static str, Option<String>)>,
+}
+
+impl Pacer {
+    fn next(&mut self, shared: &Shared, drawing: bool, slow_tick: bool) -> Option<Frame> {
+        if drawing {
+            self.sent = None;
+            return Some(frame(shared));
+        }
+        if !slow_tick {
+            return None;
+        }
+        let f = frame(shared);
+        let state = (f.mode, f.mic_error.clone());
+        if self.sent.as_ref() == Some(&state) {
+            return None;
+        }
+        self.sent = Some(state);
+        Some(f)
+    }
+}
 
 fn device_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into())
@@ -81,16 +145,19 @@ fn link_for(s: &Settings) -> Option<Link> {
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, AppState>) -> SettingsView {
     let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+    let update = update::status();
     SettingsView {
         server_url: s.server_url.clone(),
         paired: s.token().is_some(),
         mic_threshold: s.mic_threshold,
         pc: s.pc.clone(),
+        shortcuts: config::shortcut_lines(&s.pc.shortcuts),
         settings_file: config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
         auto_update: !s.updates_off,
-        update: update::status(),
+        update_on: update.line(true),
+        update_off: update.line(false),
     }
 }
 
@@ -110,63 +177,72 @@ fn save_settings(
     token: Option<String>,
     mic_threshold: f32,
     pc: Policy,
+    shortcuts: String,
     auto_update: Option<bool>,
 ) -> Result<(), String> {
-    if config::normalize_url(&server_url).is_none() {
-        return Err("Enter the server address, like homeserver:8791.".into());
-    }
+    let form = config::Form {
+        server_url,
+        token,
+        mic_threshold,
+        pc,
+        shortcuts,
+        auto_update,
+    };
     let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
-    let before = (s.url(), s.token());
-    s.server_url = server_url.trim().to_string();
-    if let Some(t) = token
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-    {
-        if !t.starts_with("sat_") {
-            return Err("That doesn't look like a pairing token (they start with sat_).".into());
-        }
-        s.set_token(&t)?;
-    }
-    s.mic_threshold = mic_threshold.clamp(0.0, 0.1);
-    s.pc = pc;
-    if let Some(on) = auto_update {
-        s.updates_off = !on;
-    }
-    config::save(&s)?;
+    let saved = config::commit(&mut s, form, config::save)?;
     state
         .shared
         .threshold
         .store(s.mic_threshold.to_bits(), Ordering::Relaxed);
     let new_pc = Arc::new(Pc::new(s.pc.clone()));
     *state.pc.lock().unwrap_or_else(|e| e.into_inner()) = new_pc;
-    // Reconnect only when the connection itself changed: a reconnect drops
-    // whatever she's in the middle of.
-    if (s.url(), s.token()) != before {
+    let connected = state
+        .status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .connected;
+    if saved.reconnect(connected) {
         let _ = state.link.send(link_for(&s));
+    }
+    if saved.updates_on {
+        update::check_now();
     }
     Ok(())
 }
 
 #[tauri::command]
-fn send_text(state: tauri::State<'_, AppState>, text: String) {
+fn send_text(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
     let t = text.trim();
-    if !t.is_empty() {
-        let _ = state.cmds.send(Cmd::Text(t.chars().take(2000).collect()));
+    if t.is_empty() {
+        return Ok(());
+    }
+    let cmd = Cmd::Text(t.chars().take(2000).collect());
+    if link::offer(&state.shared, &state.cmds, cmd) {
+        Ok(())
+    } else {
+        Err(link::NOT_SENT.into())
     }
 }
 
 #[tauri::command]
 fn stop_talking(state: tauri::State<'_, AppState>) {
-    let _ = state.cmds.send(Cmd::Stop);
+    // Offline there's nothing to stop: losing the link already silenced her.
+    link::offer(&state.shared, &state.cmds, Cmd::Stop);
 }
 
 /// The talk button: held down, the mic is open and what's said is for her.
 #[tauri::command]
-fn push_to_talk(state: tauri::State<'_, AppState>, down: bool) {
-    state.shared.ptt.store(down, Ordering::Relaxed);
-    if down {
-        let _ = state.cmds.send(Cmd::Ptt);
+fn push_to_talk(app: AppHandle, state: tauri::State<'_, AppState>, down: bool) {
+    if !link::talk_key(&state.shared, &state.cmds, down) {
+        let _ = app.emit("not_sent", link::NOT_SENT);
     }
+}
+
+/// The page asks once at load, in case frames are paused then; after that it
+/// follows "frame" events.
+#[tauri::command]
+fn her_state(state: tauri::State<'_, AppState>) -> Frame {
+    frame(&state.shared)
 }
 
 #[derive(Serialize, Clone, PartialEq)]
@@ -224,6 +300,24 @@ fn close(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.destroy();
     }
+}
+
+/// Have the main thread bring the tray up to date with the link and the mic.
+fn refresh_tray(app: &AppHandle) {
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let state = h.state::<AppState>();
+        let view = {
+            let status = state.status.lock().unwrap_or_else(|e| e.into_inner());
+            let error = state
+                .shared
+                .mic_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            tray::view(status.connected, &status.text, error.as_deref())
+        };
+        tray::show(&h, view, &state.tray);
+    });
 }
 
 /// A full-screen app (a game, a full-screen video) is in front.
@@ -359,6 +453,7 @@ fn main() {
             shared: shared.clone(),
             pc: pc.clone(),
             status: Mutex::new(StatusView::default()),
+            tray: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -367,6 +462,7 @@ fn main() {
             send_text,
             stop_talking,
             push_to_talk,
+            her_state,
             orb_drawing,
             audio_devices
         ])
@@ -409,16 +505,16 @@ fn main() {
                     if manager.register(key).is_ok() {
                         // Registration lasts as long as the manager: keep it for the app's life.
                         Box::leak(Box::new(manager));
-                        let (shared, cmds) = (shared.clone(), cmd_tx.clone());
+                        let (handle, shared, cmds) =
+                            (handle.clone(), shared.clone(), cmd_tx.clone());
                         std::thread::spawn(move || {
                             while let Ok(ev) = GlobalHotKeyEvent::receiver().recv() {
                                 if ev.id != key.id() {
                                     continue;
                                 }
                                 let down = ev.state == HotKeyState::Pressed;
-                                shared.ptt.store(down, Ordering::Relaxed);
-                                if down {
-                                    let _ = cmds.send(Cmd::Ptt);
+                                if !link::talk_hotkey(&shared, &cmds, down) {
+                                    let _ = handle.emit("not_sent", link::NOT_SENT);
                                 }
                             }
                         });
@@ -438,10 +534,9 @@ fn main() {
                 ev_tx,
             ));
 
-            // Server events → window, and her state ~20 times a second.
-            let thinking = Arc::new(AtomicBool::new(false));
+            // Server events → window and tray, and her state ~20 times a second.
             {
-                let (handle, shared, thinking) = (handle.clone(), shared.clone(), thinking.clone());
+                let (handle, shared) = (handle.clone(), shared.clone());
                 tauri::async_runtime::spawn(async move {
                     while let Some(ev) = ev_rx.recv().await {
                         match ev {
@@ -461,9 +556,9 @@ fn main() {
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner()) = v.clone();
                                 let _ = handle.emit("status", v);
+                                refresh_tray(&handle);
                             }
                             Event::Thinking(on) => {
-                                thinking.store(on, Ordering::Relaxed);
                                 shared.answering.store(on, Ordering::Relaxed);
                             }
                             Event::Transcript { who, text, last } => {
@@ -477,10 +572,12 @@ fn main() {
                 });
             }
             {
-                let (handle, shared, thinking) = (handle.clone(), shared.clone(), thinking.clone());
+                let (handle, shared) = (handle.clone(), shared.clone());
                 std::thread::spawn(move || {
                     let mut drawing = None;
+                    let mut pacer = Pacer::default();
                     let mut shown_devices: Option<Devices> = None;
+                    let mut mic_error: Option<String> = None;
                     let mut quiet = None;
                     let mut minimized_since: Option<std::time::Instant> = None;
                     for tick in 0u64.. {
@@ -498,7 +595,7 @@ fn main() {
                             let busy = window.is_some()
                                 || shared.playing()
                                 || shared.ptt.load(Ordering::Relaxed)
-                                || thinking.load(Ordering::Relaxed);
+                                || shared.answering.load(Ordering::Relaxed);
                             if quiet != Some(!busy) {
                                 quiet = Some(!busy);
                                 quiet::background(!busy);
@@ -530,43 +627,26 @@ fn main() {
                             } else {
                                 shown_devices = None;
                             }
+                            // The mic failed or came back: nothing else tells the tray.
+                            let error = shared.mic_error.lock().ok().and_then(|e| e.clone());
+                            if error != mic_error {
+                                mic_error = error;
+                                refresh_tray(&handle);
+                            }
                             let on = window.is_some() && orb_on_screen(&handle);
                             if drawing != Some(on) {
                                 drawing = Some(on);
                                 let _ = handle.emit("draw", on);
                             }
                         }
-                        if drawing != Some(true) {
+                        if window.is_none() {
+                            pacer = Pacer::default();
                             continue;
                         }
-                        let out = f32::from_bits(shared.out_level.load(Ordering::Relaxed));
-                        let mic = f32::from_bits(shared.mic_level.load(Ordering::Relaxed));
-                        // Her own music isn't her talking: the orb only speaks with her voice.
-                        let (mode, level) = if (shared.playing() || out > 0.03) && shared.her_voice() {
-                            ("speaking", out)
-                        } else if shared.ptt.load(Ordering::Relaxed)
-                            || (shared.talking.load(Ordering::Relaxed) && shared.listening())
-                        {
-                            // Only when she's really listening to you: push-to-talk, or
-                            // talking right after her answer. Any loud sound opens the
-                            // mic gate (music, a cough); the server ignores those, so
-                            // the orb shouldn't light up for them either.
-                            ("listening", mic)
-                        } else if thinking.load(Ordering::Relaxed) {
-                            ("thinking", 0.0)
-                        } else {
-                            ("idle", 0.0)
-                        };
-                        let mic_error = shared.mic_error.lock().ok().and_then(|e| e.clone());
-                        let _ = handle.emit(
-                            "frame",
-                            Frame {
-                                mode,
-                                level,
-                                mic,
-                                mic_error,
-                            },
-                        );
+                        let f = pacer.next(&shared, drawing == Some(true), tick % 10 == 0);
+                        if let Some(f) = f {
+                            let _ = handle.emit("frame", f);
+                        }
                     }
                 });
             }
@@ -581,7 +661,6 @@ fn main() {
                     handle.clone(),
                     shared.clone(),
                 );
-                let thinking = thinking.clone();
                 std::thread::spawn(move || {
                     update::run(
                         move || {
@@ -596,7 +675,7 @@ fn main() {
                                 && !shared.playing()
                                 && !shared.talking.load(Ordering::Relaxed)
                                 && !shared.ptt.load(Ordering::Relaxed)
-                                && !thinking.load(Ordering::Relaxed)
+                                && !shared.answering.load(Ordering::Relaxed)
                         },
                         move || h3.exit(0),
                     )
@@ -626,4 +705,64 @@ fn main() {
                 api.prevent_exit();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_she_never_looks_like_she_is_listening() {
+        let shared = Shared::new(0.0);
+        // Held from before the link fell, or the mic gate open on a loud room.
+        shared.ptt.store(true, Ordering::Relaxed);
+        shared.talking.store(true, Ordering::Relaxed);
+        assert_eq!(frame(&shared).mode, "idle");
+        shared.set_online(true);
+        shared.ptt.store(true, Ordering::Relaxed);
+        assert_eq!(frame(&shared).mode, "listening");
+    }
+
+    #[test]
+    fn a_drawing_orb_gets_every_frame() {
+        let shared = Shared::new(0.0);
+        let mut pacer = Pacer::default();
+        assert!(pacer.next(&shared, true, false).is_some());
+        assert!(pacer.next(&shared, true, false).is_some());
+    }
+
+    #[test]
+    fn a_paused_orb_still_hears_every_change_and_nothing_else() {
+        let shared = Shared::new(0.0);
+        let mut pacer = Pacer::default();
+        // Only slow ticks look at all.
+        assert!(pacer.next(&shared, false, false).is_none());
+        assert!(pacer.next(&shared, false, true).is_some());
+        assert!(pacer.next(&shared, false, true).is_none());
+
+        // She starts answering behind a full-screen app: the Stop button has to show.
+        shared.answering.store(true, Ordering::Relaxed);
+        let f = pacer.next(&shared, false, true).expect("a change");
+        assert_eq!(f.mode, "thinking");
+        assert!(pacer.next(&shared, false, true).is_none());
+
+        // And goes back.
+        shared.answering.store(false, Ordering::Relaxed);
+        assert_eq!(pacer.next(&shared, false, true).unwrap().mode, "idle");
+
+        // A mic failure counts, for the chip.
+        *shared.mic_error.lock().unwrap() = Some("No microphone found.".into());
+        let f = pacer.next(&shared, false, true).expect("a change");
+        assert_eq!(f.mic_error.as_deref(), Some("No microphone found."));
+        assert!(pacer.next(&shared, false, true).is_none());
+    }
+
+    #[test]
+    fn pausing_again_starts_from_a_fresh_frame() {
+        let shared = Shared::new(0.0);
+        let mut pacer = Pacer::default();
+        assert!(pacer.next(&shared, false, true).is_some());
+        assert!(pacer.next(&shared, true, false).is_some());
+        assert!(pacer.next(&shared, false, true).is_some());
+    }
 }
