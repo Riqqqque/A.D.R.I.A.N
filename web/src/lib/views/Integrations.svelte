@@ -103,7 +103,13 @@
     notice = '';
     try {
       const r = await post<{ ok: boolean; detail: string }>('/api/integrations/ha/test', {});
-      notice = r.detail;
+      if (r.ok) {
+        notice = r.detail;
+        // The live connection may be up by now, which unlocks Import.
+        await load();
+      } else {
+        error = r.detail;
+      }
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }

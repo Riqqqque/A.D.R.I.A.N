@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { post } from './api';
   import { session } from './session.svelte';
-  import { audioEndpointStored, enableBrowserAudio } from './audio';
+  import { audioEndpointStored, audioNeedsGesture, enableBrowserAudio } from './audio';
   import Chat from './views/Chat.svelte';
   import Devices from './views/Devices.svelte';
   import Memory from './views/Memory.svelte';
@@ -14,6 +14,7 @@
   type Tab = 'chat' | 'devices' | 'memory' | 'alarms' | 'audio' | 'integrations' | 'system';
   let tab = $state<Tab>('chat');
   let ringing = $state<{ id: string; label: string } | null>(null);
+  let audioBlocked = $state(false);
   let events: EventSource | null = null;
 
   const tabs: { id: Tab; label: string }[] = [
@@ -28,7 +29,10 @@
 
   onMount(() => {
     // Resume browser audio if this tab was previously registered.
-    if (audioEndpointStored()) void enableBrowserAudio('Browser');
+    if (audioEndpointStored()) {
+      void enableBrowserAudio('Browser');
+      audioBlocked = audioNeedsGesture();
+    }
     events = new EventSource('/api/events');
     events.addEventListener('alarm', (e) => {
       try {
@@ -61,6 +65,8 @@
   }
 </script>
 
+<svelte:window onpointerdown={() => (audioBlocked = false)} onkeydown={() => (audioBlocked = false)} />
+
 <header>
   <strong>{session.settings.assistant_name || 'Adrian'}</strong>
   <nav>
@@ -81,6 +87,9 @@
 {/if}
 
 <main>
+  {#if audioBlocked}
+    <div class="banner">This tab is an alarm speaker. Click in it so the browser lets it play sound.</div>
+  {/if}
   {#if tab === 'chat'}<Chat />{/if}
   {#if tab === 'devices'}<Devices />{/if}
   {#if tab === 'memory'}<Memory />{/if}

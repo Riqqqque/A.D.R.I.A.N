@@ -113,6 +113,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             web_dir: dir.path().to_path_buf(),
             tls: None,
+            trusted_proxy: None,
         };
         let state = crate::build_state(config).await.unwrap();
         state

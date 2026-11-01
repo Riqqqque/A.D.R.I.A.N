@@ -159,12 +159,17 @@ simple integrations.
 | `ADRIAN_BIND` | `127.0.0.1:8787` | bind address (`0.0.0.0:8787` for LAN) |
 | `ADRIAN_WEB_DIR` | `web/build` | built frontend location |
 | `ADRIAN_TLS_CERT` / `ADRIAN_TLS_KEY` | unset | PEM certificate chain and private key; when both are set the server speaks HTTPS only |
+| `ADRIAN_TRUSTED_PROXY` | unset | IP address of the TLS reverse proxy in front of the server; only connections from it may set `X-Forwarded-For` and `X-Forwarded-Proto` |
 | `ADRIAN_KEY_FILE` | `<data dir>/secret.key` | key that encrypts stored secrets (DPAPI-wrapped on Windows) |
 | `RUST_LOG` | `info,adrian=debug` | log filter |
 
 TLS is off by default. For LAN use, set `ADRIAN_TLS_CERT`/`ADRIAN_TLS_KEY` or
 put a TLS-terminating reverse proxy in front. With built-in TLS the session
-cookie is marked `Secure` and default media URLs use `https://`. A
+cookie is marked `Secure` and default media URLs use `https://`. Behind a
+proxy, set `ADRIAN_TRUSTED_PROXY` to its address: the cookie is then marked
+`Secure` when the proxy reports `X-Forwarded-Proto: https`, and login limits
+apply per client rather than to the proxy as a whole. The proxy must set
+`X-Forwarded-Proto` itself and append the client to `X-Forwarded-For`. A
 self-signed certificate for testing must be a leaf certificate
 (`basicConstraints=CA:FALSE`), for example:
 
@@ -221,7 +226,8 @@ Design rules enforced by the code:
   `(alarm_id, occurrence)`; a server restart reconciles ambiguous deliveries
   honestly instead of silently refiring.
 - All SQLite access runs on one bounded worker thread; WAL + `synchronous=FULL`.
-- No telemetry. Strict-local mode refuses non-loopback provider endpoints.
+- No telemetry. Strict-local mode refuses non-local (loopback, private or
+  link-local) provider endpoints.
 
 ## Verify
 

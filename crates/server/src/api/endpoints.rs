@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/endpoints/{id}", delete(remove))
         .route("/api/endpoints/{id}/test", post(test))
         .route("/api/audio/register", post(register_browser))
+        .route("/api/audio/unregister", post(unregister_browser))
         .route("/api/audio/channel/{id}", get(audio_channel))
         .route("/api/audio/ack", post(audio_ack))
 }
@@ -34,12 +35,17 @@ async fn list(user: AuthUser, State(s): State<AppState>) -> Result<Json<Value>, 
             "SELECT id,name,kind,config,enabled,created_at FROM endpoints ORDER BY created_at",
             vec![],
             |r| {
+                let mut config =
+                    serde_json::from_str::<Value>(&r.get::<_, String>(3)?).unwrap_or(json!({}));
+                // Whoever holds a browser's channel id can unregister it.
+                if let Some(c) = config.as_object_mut() {
+                    c.remove("channel_id");
+                }
                 Ok(json!({
                     "id": r.get::<_, String>(0)?,
                     "name": r.get::<_, String>(1)?,
                     "kind": r.get::<_, String>(2)?,
-                    "config": serde_json::from_str::<Value>(&r.get::<_, String>(3)?)
-                        .unwrap_or(json!({})),
+                    "config": config,
                     "enabled": r.get::<_, i64>(4)? != 0,
                     "created_at": r.get::<_, i64>(5)?,
                 }))
@@ -121,16 +127,40 @@ async fn create(
     Ok(Json(json!({"ok": true, "id": id})))
 }
 
+/// Remove an endpoint no alarm is waiting on. Finished alarms keep their
+/// history and just lose the speaker; deliveries record the id without a
+/// foreign key, so they keep theirs.
 async fn remove(
     user: AuthUser,
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     user.require_owner()?;
-    s.db.exec(
-        "DELETE FROM endpoints WHERE id = ?1",
-        vec![P::T(id.clone())],
-    )
+    s.db.call({
+        let id = id.clone();
+        move |c| {
+            let tx = c.transaction()?;
+            let pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM alarms
+                 WHERE endpoint_id = ?1 AND status IN ('scheduled','ringing')
+                   AND deleted_at IS NULL",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if pending > 0 {
+                return Err(ApiError::Conflict(format!(
+                    "{pending} pending alarm(s) still use this endpoint; cancel them first"
+                )));
+            }
+            tx.execute(
+                "UPDATE alarms SET endpoint_id = NULL WHERE endpoint_id = ?1",
+                [&id],
+            )?;
+            tx.execute("DELETE FROM endpoints WHERE id = ?1", [&id])?;
+            tx.commit()?;
+            Ok(())
+        }
+    })
     .await?;
     s.emit("endpoint", json!({"event": "removed", "id": id}));
     Ok(Json(json!({"ok": true})))
@@ -162,10 +192,7 @@ async fn test(
     match kind.as_str() {
         "ha_media_player" => {
             let entity = cfg.get("entity_id").and_then(|e| e.as_str()).unwrap_or("");
-            let base = s
-                .get_setting("public_url")
-                .await?
-                .unwrap_or_else(|| s.config.base_url());
+            let base = s.public_base().await?;
             let url = format!("{}/media/{token}", base.trim_end_matches('/'));
             match s.ha.play_media(entity, &url, Some(0.7)).await {
                 Ok(()) => Ok(Json(json!({
@@ -217,9 +244,15 @@ async fn test(
                 volume: 0.7,
                 label: format!("Test — {name}"),
             };
+            // Arm before sending so a fast ack cannot be missed.
+            let ack = s.audio.arm_ack(&delivery);
             s.audio.send_to_channel(channel, &cmd)?;
-            match s.audio.wait_ack(&delivery, Duration::from_secs(20)).await {
-                Ok((_, result)) => Ok(Json(json!({"ok": true, "detail": result}))),
+            match s.audio.await_ack(ack, Duration::from_secs(20)).await {
+                Ok((true, result)) => Ok(Json(json!({"ok": true, "detail": result}))),
+                Ok((false, result)) => Ok(Json(json!({
+                    "ok": false,
+                    "detail": format!("browser reported failure: {result}"),
+                }))),
                 Err(e) => Ok(Json(json!({
                     "ok": false,
                     "detail": format!("no playback ack from the browser: {e}"),
@@ -275,6 +308,39 @@ async fn register_browser(
     ))
 }
 
+#[derive(Deserialize)]
+struct UnregisterBody {
+    endpoint_id: String,
+    channel_id: String,
+}
+
+/// A browser stops being a speaker. Disabled, not deleted: alarms may still
+/// point at it, but it no longer becomes the default target. Any signed-in
+/// browser can register, so unregistering isn't owner-only like `DELETE`;
+/// the channel id, which only the registering browser holds, scopes it.
+async fn unregister_browser(
+    user: AuthUser,
+    State(s): State<AppState>,
+    Json(b): Json<UnregisterBody>,
+) -> Result<Json<Value>, ApiError> {
+    let _ = user;
+    let changed =
+        s.db.exec(
+            "UPDATE endpoints SET enabled = 0
+             WHERE id = ?1 AND kind = 'browser' AND enabled = 1
+               AND json_extract(config, '$.channel_id') = ?2",
+            vec![P::T(b.endpoint_id.clone()), P::T(b.channel_id)],
+        )
+        .await?;
+    if changed > 0 {
+        s.emit(
+            "endpoint",
+            json!({"event": "disabled", "id": b.endpoint_id}),
+        );
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
 /// SSE stream of play/stop commands for one browser channel. Cookie auth
 /// (GET). The channel id from registration reconnects to the same sender.
 async fn audio_channel(
@@ -304,6 +370,10 @@ async fn audio_channel(
 #[derive(Deserialize)]
 struct AckBody {
     delivery_id: String,
+    /// Whether the tab really played it. Missing means a tab still running
+    /// a bundle from before this field, which only acked success.
+    #[serde(default)]
+    ok: Option<bool>,
     result: String,
 }
 
@@ -316,6 +386,7 @@ async fn audio_ack(
     if b.delivery_id.len() > 80 || b.result.len() > 300 {
         return Err(ApiError::BadRequest("ack fields too long".into()));
     }
-    s.audio.resolve_ack(&b.delivery_id, b.result);
+    s.audio
+        .resolve_ack_status(&b.delivery_id, b.ok.unwrap_or(true), b.result);
     Ok(Json(json!({"ok": true})))
 }

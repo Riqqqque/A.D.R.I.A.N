@@ -6,6 +6,7 @@ pub mod password;
 pub mod ratelimit;
 
 use crate::AppState;
+use crate::config::Config;
 use crate::db::P;
 use crate::error::ApiError;
 use crate::util;
@@ -17,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 pub const SESSION_COOKIE: &str = "adrian_session";
@@ -117,6 +118,42 @@ fn session_cookie(value: &str, max_age_secs: i64, secure: bool) -> String {
     format!(
         "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{secure}"
     )
+}
+
+/// Whether this connection comes from the configured reverse proxy. Nobody
+/// else may speak for the client through forwarded headers.
+fn from_trusted_proxy(peer: SocketAddr, config: &Config) -> bool {
+    config.trusted_proxy == Some(peer.ip().to_canonical())
+}
+
+/// Last entry of a forwarded header, the one the proxy nearest us added.
+/// Anything before it arrived from the client and proves nothing.
+fn last_forwarded<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let line = headers.get_all(name).iter().next_back()?.to_str().ok()?;
+    line.rsplit(',').next().map(str::trim)
+}
+
+/// The address to rate-limit a request by: the client as seen by the trusted
+/// proxy, otherwise the peer. An entry that isn't an address falls back to
+/// the proxy's shared bucket, which is the safe side.
+pub fn client_ip(headers: &HeaderMap, peer: SocketAddr, config: &Config) -> IpAddr {
+    let forwarded = if from_trusted_proxy(peer, config) {
+        last_forwarded(headers, "x-forwarded-for").and_then(|v| v.parse::<IpAddr>().ok())
+    } else {
+        None
+    };
+    forwarded.unwrap_or(peer.ip()).to_canonical()
+}
+
+/// Whether the session cookie gets `Secure`: over built-in TLS, or when the
+/// trusted proxy says the browser used HTTPS. Not on every proxied request,
+/// because the browser drops a Secure cookie set over plain HTTP, which would
+/// break login from a LAN address.
+fn cookie_secure(headers: &HeaderMap, peer: SocketAddr, config: &Config) -> bool {
+    config.tls.is_some()
+        || (from_trusted_proxy(peer, config)
+            && last_forwarded(headers, "x-forwarded-proto")
+                .is_some_and(|p| p.eq_ignore_ascii_case("https")))
 }
 
 /// First-boot: mint the one-use setup token if the system is unclaimed.
@@ -222,11 +259,13 @@ struct ClaimBody {
 async fn setup_claim(
     State(s): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(b): Json<ClaimBody>,
 ) -> Result<Response, ApiError> {
+    let ip = client_ip(&headers, addr, &s.config);
     if !s
         .rate_limit
-        .check(&format!("claim:{}", addr.ip()), 8, Duration::from_secs(60))
+        .check(&format!("claim:{ip}"), 8, Duration::from_secs(60))
     {
         return Err(ApiError::RateLimited);
     }
@@ -304,10 +343,11 @@ async fn setup_claim(
         .await;
 
     let uid = created?;
+    let secure = cookie_secure(&headers, addr, &s.config);
     Ok((
         [(
             SET_COOKIE,
-            session_cookie(&session_id, SESSION_TTL_SECS, s.config.tls.is_some()),
+            session_cookie(&session_id, SESSION_TTL_SECS, secure),
         )],
         Json(json!({
             "ok": true,
@@ -333,11 +373,13 @@ struct LoginBody {
 async fn login(
     State(s): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(b): Json<LoginBody>,
 ) -> Result<Response, ApiError> {
+    let ip = client_ip(&headers, addr, &s.config);
     if !s
         .rate_limit
-        .check(&format!("login:{}", addr.ip()), 10, Duration::from_secs(60))
+        .check(&format!("login:{ip}"), 10, Duration::from_secs(60))
     {
         return Err(ApiError::RateLimited);
     }
@@ -376,10 +418,11 @@ async fn login(
         ],
     )
     .await?;
+    let secure = cookie_secure(&headers, addr, &s.config);
     Ok((
         [(
             SET_COOKIE,
-            session_cookie(&session_id, SESSION_TTL_SECS, s.config.tls.is_some()),
+            session_cookie(&session_id, SESSION_TTL_SECS, secure),
         )],
         Json(json!({
             "ok": true,
@@ -390,14 +433,20 @@ async fn login(
         .into_response())
 }
 
-async fn logout(user: AuthUser, State(s): State<AppState>) -> Result<Response, ApiError> {
+async fn logout(
+    user: AuthUser,
+    State(s): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     s.db.exec(
         "UPDATE sessions SET revoked_at = ?1 WHERE id = ?2",
         vec![P::I(util::now_unix()), P::T(user.session_id)],
     )
     .await?;
+    let secure = cookie_secure(&headers, addr, &s.config);
     Ok((
-        [(SET_COOKIE, session_cookie("", 0, s.config.tls.is_some()))],
+        [(SET_COOKIE, session_cookie("", 0, secure))],
         Json(json!({"ok": true})),
     )
         .into_response())
@@ -416,4 +465,93 @@ async fn me(user: AuthUser, State(s): State<AppState>) -> Result<Json<Value>, Ap
         "settings": settings,
         "setup": flags,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn config(trusted_proxy: Option<&str>) -> Config {
+        Config {
+            data_dir: "data".into(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            web_dir: "web".into(),
+            tls: None,
+            trusted_proxy: trusted_proxy.map(|ip| ip.parse().unwrap()),
+        }
+    }
+
+    fn peer(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 40000)
+    }
+
+    fn forwarded(lines: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for line in lines {
+            h.append("x-forwarded-for", HeaderValue::from_str(line).unwrap());
+        }
+        h
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn client_ip_believes_only_the_trusted_proxy_and_only_its_entry() {
+        let cfg = config(Some("10.0.0.1"));
+        let proxy = peer("10.0.0.1");
+
+        // Whatever the client sent comes first; the proxy appends the truth.
+        let h = forwarded(&["203.0.113.9, 192.168.1.20"]);
+        assert_eq!(client_ip(&h, proxy, &cfg), ip("192.168.1.20"));
+        // Some proxies add a line instead of extending the last one.
+        let h = forwarded(&["203.0.113.9", "192.168.1.20"]);
+        assert_eq!(client_ip(&h, proxy, &cfg), ip("192.168.1.20"));
+        // Anyone else's header is ignored.
+        assert_eq!(client_ip(&h, peer("10.0.0.2"), &cfg), ip("10.0.0.2"));
+        assert_eq!(client_ip(&h, proxy, &config(None)), ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_the_proxy_on_a_missing_or_junk_entry() {
+        let cfg = config(Some("10.0.0.1"));
+        let proxy = peer("10.0.0.1");
+        for lines in [&[][..], &["unknown"], &["192.168.1.20:5000"], &["1.2.3.4,"]] {
+            let h = forwarded(lines);
+            assert_eq!(client_ip(&h, proxy, &cfg), ip("10.0.0.1"), "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn mapped_addresses_count_as_their_ipv4_form() {
+        // A dual-stack listener reports IPv4 peers as ::ffff:a.b.c.d.
+        let cfg = config(Some("10.0.0.1"));
+        let h = forwarded(&["::ffff:192.168.1.20"]);
+        assert_eq!(
+            client_ip(&h, peer("::ffff:10.0.0.1"), &cfg),
+            ip("192.168.1.20")
+        );
+        assert_eq!(
+            client_ip(&HeaderMap::new(), peer("::ffff:10.0.0.2"), &cfg),
+            ip("10.0.0.2")
+        );
+    }
+
+    #[test]
+    fn cookie_is_secure_only_for_https_seen_by_the_trusted_proxy() {
+        let cfg = config(Some("10.0.0.1"));
+        let proxy = peer("10.0.0.1");
+        let mut https = HeaderMap::new();
+        https.insert("x-forwarded-proto", HeaderValue::from_static("HTTPS"));
+        let mut http = HeaderMap::new();
+        http.insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
+
+        assert!(cookie_secure(&https, proxy, &cfg));
+        assert!(!cookie_secure(&http, proxy, &cfg));
+        assert!(!cookie_secure(&HeaderMap::new(), proxy, &cfg));
+        assert!(!cookie_secure(&https, peer("10.0.0.2"), &cfg));
+        assert!(!cookie_secure(&https, proxy, &config(None)));
+    }
 }

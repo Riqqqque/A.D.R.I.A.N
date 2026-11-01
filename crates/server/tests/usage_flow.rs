@@ -96,6 +96,7 @@ async fn harness() -> H {
         bind: "127.0.0.1:0".parse().unwrap(),
         web_dir: dir.path().join("web"),
         tls: None,
+        trusted_proxy: None,
     };
     let state = build_state(config).await.unwrap();
     start_services(&state).await.unwrap();

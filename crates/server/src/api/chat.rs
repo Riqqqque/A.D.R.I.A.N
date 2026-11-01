@@ -396,17 +396,7 @@ async fn load_provider_checked(
 ) -> Result<(Arc<dyn providers::ChatProvider>, providers::ProviderRow), ApiError> {
     let (provider, row) =
         providers::load_provider(&state.db, &state.secret_box, state.http.clone(), None).await?;
-    let strict = state.get_setting("privacy_mode").await?.as_deref() == Some("strict_local");
-    if strict && !providers::base_is_local(&row.base_url) {
-        let host = reqwest::Url::parse(&row.base_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
-            .unwrap_or_default();
-        return Err(ApiError::Forbidden(format!(
-            "strict-local mode blocks cloud egress — provider '{}' ({}) is not a local endpoint",
-            row.label, host
-        )));
-    }
+    providers::ensure_egress_allowed(state, &row).await?;
     Ok((provider, row))
 }
 

@@ -63,8 +63,10 @@
   async function toggleBrowser() {
     error = '';
     if (browserOn) {
-      disableBrowserAudio();
+      const told = await disableBrowserAudio();
       browserOn = false;
+      if (!told) error = 'This browser stopped listening, but the server did not hear about it. Remove its endpoint below.';
+      await load();
     } else {
       try {
         await enableBrowserAudio(`Browser — ${navigator.userAgent.includes('Windows') ? 'this PC' : 'this device'}`);
@@ -82,7 +84,8 @@
     error = '';
     try {
       const r = await post<{ ok: boolean; detail: string }>(`/api/endpoints/${e.id}/test`, {});
-      result = r.detail;
+      if (r.ok) result = r.detail;
+      else error = r.detail;
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     } finally {
@@ -94,7 +97,7 @@
     if (!confirm(`Remove endpoint "${e.name}"?`)) return;
     try {
       await del(`/api/endpoints/${e.id}`);
-      if (e.id === audioEndpointId()) disableBrowserAudio();
+      if (e.id === audioEndpointId()) await disableBrowserAudio();
       browserOn = audioEndpointStored();
       await load();
     } catch (err) {

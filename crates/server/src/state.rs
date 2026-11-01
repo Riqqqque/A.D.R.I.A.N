@@ -62,6 +62,16 @@ impl AppState {
             .await
     }
 
+    /// Base URL speakers fetch media from: the `public_url` setting, or this
+    /// server's own address when it is unset or was cleared.
+    pub async fn public_base(&self) -> Result<String, ApiError> {
+        Ok(self
+            .get_setting("public_url")
+            .await?
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| self.config.base_url()))
+    }
+
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), ApiError> {
         self.db
             .exec(
