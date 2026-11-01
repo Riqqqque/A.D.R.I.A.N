@@ -26,6 +26,18 @@ $links = @(
     (Join-Path ([Environment]::GetFolderPath('Startup')) 'A.D.R.I.A.N..lnk')
 )
 
+# Bad input stops here, before a running copy or an earlier install is touched.
+if (-not $Uninstall) {
+    if (-not (Test-Path $App)) { throw "Build the app first (cargo build --release -p adrian-desktop), or pass -App <path to adrian-desktop.exe>." }
+    if ($Server -and $Token) {
+        # It's a GUI app: PowerShell doesn't wait for one or set $LASTEXITCODE.
+        $pairing = Start-Process -FilePath $App -ArgumentList @('--pair', $Server, $Token) -Wait -PassThru
+        if ($pairing.ExitCode -ne 0) { throw 'Pairing failed: check the server address and the sat_ token.' }
+    } elseif ($Server -or $Token) {
+        throw 'Give both -Server and -Token, or neither (then enter them in the app''s settings).'
+    }
+}
+
 # A running copy holds the file open.
 Get-Process ADRIAN -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
 Start-Sleep -Milliseconds 500
@@ -37,16 +49,8 @@ if ($Uninstall) {
     exit 0
 }
 
-if (-not (Test-Path $App)) { throw "Build the app first (cargo build --release -p adrian-desktop), or pass -App <path to adrian-desktop.exe>." }
 New-Item -ItemType Directory -Force $dir | Out-Null
 Copy-Item $App $exe -Force
-
-if ($Server -and $Token) {
-    & $exe --pair $Server $Token
-    if ($LASTEXITCODE -ne 0) { throw 'Pairing failed: check the server address and the sat_ token.' }
-} elseif ($Server -or $Token) {
-    throw 'Give both -Server and -Token, or neither (then enter them in the app''s settings).'
-}
 
 $shell = New-Object -ComObject WScript.Shell
 function Add-Shortcut([string]$path, [string]$arguments) {
