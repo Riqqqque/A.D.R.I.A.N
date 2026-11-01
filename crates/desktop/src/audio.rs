@@ -13,10 +13,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 /// Audio to and from the server: 48 kHz mono.
 pub const RATE: u32 = 48_000;
+/// Most frames waiting for the link (30 s, about 3 MB). Nothing reads them
+/// while the server is down or this PC isn't paired; past this they're dropped.
+pub const UP_QUEUE: usize = 30 * 50;
 /// 20 ms frames.
 const FRAME: usize = 960;
 /// Audio kept from before the gate opens (300 ms), so first syllables aren't lost.
@@ -352,9 +355,30 @@ fn to_bytes(f: &[f32]) -> Vec<u8> {
     b
 }
 
+/// Queue what the gate decided for the link. Never waits: with nothing reading,
+/// the queue fills and the rest is dropped, and the link clears it on connect.
+/// The gate keeps running either way, so its preroll stays current.
+fn forward(up: &Sender<Up>, event: GateEvent) {
+    match event {
+        GateEvent::Open(pre) => {
+            let _ = up.try_send(Up::Start);
+            for p in pre {
+                let _ = up.try_send(Up::Pcm(to_bytes(&p)));
+            }
+        }
+        GateEvent::Frame(f) => {
+            let _ = up.try_send(Up::Pcm(to_bytes(&f)));
+        }
+        GateEvent::Close => {
+            let _ = up.try_send(Up::End);
+        }
+        GateEvent::Nothing => {}
+    }
+}
+
 /// Start the mic and the speakers on their own threads; they rebuild
 /// themselves after a device error (headset unplugged, default changed).
-pub fn start(shared: Arc<Shared>, up: UnboundedSender<Up>) {
+pub fn start(shared: Arc<Shared>, up: Sender<Up>) {
     let (mic_tx, mic_rx) = mpsc::channel::<(u32, Vec<f32>)>();
     // Gate and framing.
     {
@@ -406,21 +430,7 @@ pub fn start(shared: Arc<Shared>, up: UnboundedSender<Up>) {
                             None
                         };
                         let manual = f32::from_bits(shared.threshold.load(Ordering::Relaxed));
-                        match gate.frame(f, manual, force, echo) {
-                            GateEvent::Open(pre) => {
-                                let _ = up.send(Up::Start);
-                                for p in pre {
-                                    let _ = up.send(Up::Pcm(to_bytes(&p)));
-                                }
-                            }
-                            GateEvent::Frame(f) => {
-                                let _ = up.send(Up::Pcm(to_bytes(&f)));
-                            }
-                            GateEvent::Close => {
-                                let _ = up.send(Up::End);
-                            }
-                            GateEvent::Nothing => {}
-                        }
+                        forward(&up, gate.frame(f, manual, force, echo));
                         shared.talking.store(gate.is_open(), Ordering::Relaxed);
                         // Cutting in on her answer: drop her voice now; the server stops
                         // her a moment later. Music alone is never turned down for a
@@ -836,6 +846,49 @@ mod tests {
             );
         }
         assert!(closed);
+    }
+
+    #[test]
+    fn audio_nobody_reads_is_capped_and_preroll_survives_it() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(UP_QUEUE);
+        let mut g = Gate::new();
+        // The server is down, or this PC was never paired: an hour's worth
+        // would be 180,000 frames. It never blocks, and only the queue is kept.
+        for _ in 0..(UP_QUEUE + 500) {
+            forward(&tx, g.frame(vec![0.2; FRAME], 0.0, None, 0.0));
+        }
+        let mut queued = 0;
+        while rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, UP_QUEUE);
+        // The link connected and threw that away, with the gate still open: it
+        // closes as usual, and that reaches the server.
+        assert!(g.is_open());
+        for _ in 0..CLOSE_FRAMES {
+            forward(&tx, g.frame(vec![0.001; FRAME], 0.0, None, 0.0));
+        }
+        assert!(!g.is_open());
+        let mut last = None;
+        while let Ok(u) = rx.try_recv() {
+            last = Some(u);
+        }
+        assert!(matches!(last, Some(Up::End)));
+        // The same gate, overflow behind it: the next words arrive whole.
+        for _ in 0..PREROLL_FRAMES {
+            forward(&tx, g.frame(vec![0.001; FRAME], 0.0, None, 0.0));
+        }
+        assert!(rx.try_recv().is_err());
+        for _ in 0..OPEN_FRAMES {
+            forward(&tx, g.frame(vec![0.2; FRAME], 0.0, None, 0.0));
+        }
+        assert!(matches!(rx.try_recv(), Ok(Up::Start)));
+        let mut frames = 0;
+        while let Ok(Up::Pcm(pcm)) = rx.try_recv() {
+            assert_eq!(pcm.len(), FRAME * 2);
+            frames += 1;
+        }
+        assert_eq!(frames, PREROLL_FRAMES);
     }
 
     #[test]

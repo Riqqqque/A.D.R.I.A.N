@@ -1,20 +1,28 @@
 //! Self-update from the GitHub releases. A few minutes after start and then
 //! every six hours it looks at the newest release; when that's newer than this
-//! build it downloads the app, checks it against the release's `.sha256`, and
-//! waits until she's idle in the tray (no window, not talking, not listening)
-//! to swap the file and start the new copy. Turned off in settings, it only
-//! says that a new version exists.
+//! build it downloads the app, checks it against the release's `.sha256`, runs
+//! it once to prove it starts and is that version, and waits until she's idle
+//! in the tray (no window, not talking, not listening) to swap the file and
+//! start the new copy. The copy it replaced stays as ADRIAN.old.exe, the way
+//! back, until the new one has been up for a while. Turned off in settings, it
+//! only says that a new version exists.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 const REPO: &str = "Riqqqque/adrian-discord-voice";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FIRST_CHECK: Duration = Duration::from_secs(3 * 60);
 const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// How long a download gets to answer `--self-check`: it inherits the tray's
+/// low priority, and the virus scanner goes through a new exe first.
+const SELF_CHECK: Duration = Duration::from_secs(30);
 
 /// What the settings page shows.
 #[derive(Serialize, Clone, Default)]
@@ -132,12 +140,79 @@ fn download(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>, Strin
         .map_err(|e| e.to_string())
 }
 
+/// Whether a `--self-check` run proves a download is the release it's meant to
+/// be. A build that dies at start can't update itself out of that, and one that
+/// reports a lower version than its tag would update again after every restart.
+fn accepted(code: Option<i32>, stdout: &str, tag: &str) -> bool {
+    code == Some(0) && stdout.trim() == tag
+}
+
+/// Run a program for its exit code and output; None if it won't start or
+/// outlasts `limit`.
+fn run_for(cmd: &mut Command, limit: Duration) -> Option<(Option<i32>, String)> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    // On its own thread, so nothing here can wait past the limit.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = out.read_to_string(&mut text);
+        let _ = tx.send(text);
+    });
+    let end = Instant::now() + limit;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    Some((code, rx.recv_timeout(Duration::from_secs(2)).ok()?))
+}
+
+/// Start a download once, before anything is swapped. One that fails is thrown
+/// away and this copy carries on; the next check tries again.
+fn prove(new: &Path, tag: &str) -> Result<(), String> {
+    let seen = run_for(Command::new(new).arg("--self-check"), SELF_CHECK);
+    if seen.is_some_and(|(code, out)| accepted(code, &out, tag)) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(new);
+    Err(format!("the download of {tag} failed its start check"))
+}
+
+/// Put a verified download on disk and prove it. All the way to the disk: a
+/// power cut after the swap mustn't leave an ADRIAN.exe whose bytes were still
+/// in memory.
+fn save(new: &Path, bytes: &[u8], tag: &str) -> Result<(), String> {
+    let written = File::create(new).and_then(|mut f| {
+        f.write_all(bytes)?;
+        f.sync_all()
+    });
+    written.map_err(|e| format!("can't write {}: {e}", new.display()))?;
+    prove(new, tag)
+}
+
 /// Download and verify the new app next to this one; returns its path.
 fn fetch(
     agent: &ureq::Agent,
     exe_url: &str,
     sum_url: &str,
     here: &Path,
+    tag: &str,
 ) -> Result<PathBuf, String> {
     let sum = String::from_utf8(download(agent, sum_url, 4096)?).map_err(|e| e.to_string())?;
     let want = sum
@@ -158,27 +233,44 @@ fn fetch(
     }
     let dir = here.parent().ok_or("no app folder")?;
     let new = dir.join("ADRIAN.new.exe");
-    std::fs::write(&new, &bytes).map_err(|e| format!("can't write to {}: {e}", dir.display()))?;
+    save(&new, &bytes, tag)?;
     Ok(new)
 }
 
-/// Swap the files and start the new copy; the caller exits right after.
-/// A running exe can be renamed on Windows, just not overwritten.
-fn install(new: &Path, here: &Path) -> Result<(), String> {
+/// Put `new` in `here`'s place and keep `here` as ADRIAN.old.exe. A running exe
+/// can't be overwritten, but once it has a second name the first can be taken
+/// over in one step, so there's an app to start at every moment, even if the
+/// power goes mid-update. Without hard links it takes two renames, with nothing
+/// at `here` between them. `step` runs after each change to the folder.
+fn swap(new: &Path, here: &Path, step: impl Fn()) -> Result<(), String> {
     let old = here.with_extension("old.exe");
     let _ = std::fs::remove_file(&old);
+    if std::fs::hard_link(here, &old).is_ok() {
+        step();
+        if std::fs::rename(new, here).is_ok() {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&old);
+    }
     std::fs::rename(here, &old).map_err(|e| e.to_string())?;
+    step();
     if let Err(e) = std::fs::rename(new, here) {
         let _ = std::fs::rename(&old, here);
         return Err(e.to_string());
     }
+    Ok(())
+}
+
+/// Swap the files and start the new copy; the caller exits right after.
+fn install(new: &Path, here: &Path) -> Result<(), String> {
+    swap(new, here, || {})?;
     std::process::Command::new(here)
         .args(["--background", "--after-update"])
         .spawn()
         .map_err(|e| {
             // Couldn't start it: put the old one back.
             let _ = std::fs::rename(here, new);
-            let _ = std::fs::rename(&old, here);
+            let _ = std::fs::rename(here.with_extension("old.exe"), here);
             e.to_string()
         })?;
     Ok(())
@@ -193,21 +285,29 @@ pub fn now() -> Result<String, String> {
     if !newer(&v, VERSION) {
         return Ok(format!("Up to date ({VERSION}; newest release {v})."));
     }
-    let new = fetch(&agent, &exe, &sum, &here)?;
+    let new = fetch(&agent, &exe, &sum, &here, &v)?;
     install(&new, &here)?;
     Ok(format!(
         "Updated {VERSION} -> {v}; the new version is starting."
     ))
 }
 
-/// Leftovers from the last update.
+/// A download an earlier run left behind. Only for the copy that stays running:
+/// that copy may be waiting to install this very file.
 pub fn clean_up() {
     if let Ok(here) = std::env::current_exe() {
-        let _ = std::fs::remove_file(here.with_extension("old.exe"));
-        if let Some(dir) = here.parent() {
-            let _ = std::fs::remove_file(dir.join("ADRIAN.new.exe"));
-        }
+        remove_download(&here);
     }
+}
+
+fn remove_download(here: &Path) {
+    if let Some(dir) = here.parent() {
+        let _ = std::fs::remove_file(dir.join("ADRIAN.new.exe"));
+    }
+}
+
+fn remove_old_copy(here: &Path) {
+    let _ = std::fs::remove_file(here.with_extension("old.exe"));
 }
 
 /// Runs for the life of the app. `enabled` reads the setting; `idle` says
@@ -217,13 +317,15 @@ pub fn run(enabled: impl Fn() -> bool, idle: impl Fn() -> bool, quit: impl Fn())
         return;
     };
     std::thread::sleep(FIRST_CHECK);
+    // Up this long, this version works: the copy it replaced can go.
+    remove_old_copy(&here);
     let agent = agent();
     loop {
         set("checking", None, None);
         match latest(&agent) {
             Ok((v, _, _)) if !newer(&v, VERSION) => set("", Some(&v), None),
             Ok((v, _, _)) if !enabled() => set("available", Some(&v), None),
-            Ok((v, exe, sum)) => match fetch(&agent, &exe, &sum, &here) {
+            Ok((v, exe, sum)) => match fetch(&agent, &exe, &sum, &here, &v) {
                 Ok(new) => {
                     set("ready", Some(&v), None);
                     // Wait for a quiet moment (checked every 30 s), then swap.
@@ -252,7 +354,145 @@ pub fn run(enabled: impl Fn() -> bool, idle: impl Fn() -> bool, quit: impl Fn())
 
 #[cfg(test)]
 mod tests {
-    use super::newer;
+    use super::*;
+
+    /// An empty folder of its own under the system's temp folder.
+    fn temp_folder(what: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("adrian-update-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn only_the_right_version_passes_the_self_check() {
+        assert!(accepted(Some(0), "0.15.3\r\n", "0.15.3"));
+        // an old build under a new tag: installing it would repeat at every restart
+        assert!(!accepted(Some(0), "0.15.2\r\n", "0.15.3"));
+        assert!(!accepted(Some(0), "", "0.15.3"));
+        assert!(!accepted(Some(1), "0.15.3\r\n", "0.15.3"));
+        assert!(!accepted(None, "0.15.3\r\n", "0.15.3"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_what_a_self_check_says() {
+        let echo = |text: &str| {
+            let line = format!("echo {text}");
+            run_for(Command::new("cmd").args(["/c", &line]), SELF_CHECK).unwrap()
+        };
+        let (code, out) = echo("0.15.3");
+        assert!(accepted(code, &out, "0.15.3"));
+        let (code, out) = echo("0.15.2");
+        assert!(!accepted(code, &out, "0.15.3"));
+        let exit = run_for(Command::new("cmd").args(["/c", "exit 1"]), SELF_CHECK);
+        assert_eq!(exit.map(|(code, _)| code), Some(Some(1)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gives_up_on_a_self_check_that_hangs() {
+        let start = Instant::now();
+        let mut hung = Command::new("ping");
+        hung.args(["-n", "30", "127.0.0.1"]);
+        assert!(run_for(&mut hung, Duration::from_millis(300)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_download_that_wont_start_is_thrown_away() {
+        let dir = temp_folder("prove");
+        let new = dir.join("ADRIAN.new.exe");
+        assert!(save(&new, b"not a program", "0.15.3").is_err());
+        assert!(!new.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The app, a download, and where the replaced copy goes, in a temp folder.
+    fn app_folder(what: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let dir = temp_folder(what);
+        let (here, new) = (dir.join("ADRIAN.exe"), dir.join("ADRIAN.new.exe"));
+        std::fs::write(&here, b"this version").unwrap();
+        std::fs::write(&new, b"next version").unwrap();
+        let old = dir.join("ADRIAN.old.exe");
+        (dir, here, new, old)
+    }
+
+    #[test]
+    fn a_power_cut_at_any_step_of_a_swap_leaves_an_app_to_start() {
+        let (dir, here, new, old) = app_folder("swap");
+        swap(&new, &here, || assert!(here.exists())).unwrap();
+        assert_eq!(std::fs::read(&here).unwrap(), b"next version");
+        assert_eq!(std::fs::read(&old).unwrap(), b"this version");
+        assert!(!new.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Swapping out the exe that's running is the whole job, so try it on one.
+    #[cfg(windows)]
+    #[test]
+    fn swaps_out_a_copy_that_is_running() {
+        let (dir, here, new, old) = app_folder("running");
+        let root = std::env::var("SystemRoot").unwrap();
+        std::fs::copy(format!("{root}\\System32\\ping.exe"), &here).unwrap();
+        let mut running = Command::new(&here)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let gap = std::cell::Cell::new(false);
+        let swapped = swap(&new, &here, || gap.set(gap.get() || !here.exists()));
+        let still_up = running.try_wait().unwrap().is_none();
+        let _ = running.kill();
+        let _ = running.wait();
+        swapped.unwrap();
+        assert!(still_up, "it has to be running for this to prove anything");
+        assert!(!gap.get(), "the two renames were needed");
+        assert_eq!(std::fs::read(&here).unwrap(), b"next version");
+        assert!(old.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_swap_with_no_download_leaves_the_app_as_it_was() {
+        let (dir, here, new, old) = app_folder("no-download");
+        std::fs::remove_file(&new).unwrap();
+        assert!(swap(&new, &here, || {}).is_err());
+        assert_eq!(std::fs::read(&here).unwrap(), b"this version");
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_copy_that_wont_start_is_swapped_back() {
+        let (dir, here, new, old) = app_folder("wont-start");
+        // Neither file is a program, so this can't start anything.
+        assert!(install(&new, &here).is_err());
+        assert_eq!(std::fs::read(&here).unwrap(), b"this version");
+        assert_eq!(std::fs::read(&new).unwrap(), b"next version");
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_old_copy_outlasts_the_start_of_the_new_one() {
+        let dir = temp_folder("leftovers");
+        let here = dir.join("ADRIAN.exe");
+        let old = dir.join("ADRIAN.old.exe");
+        let new = dir.join("ADRIAN.new.exe");
+        for f in [&here, &old, &new] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        // At start: only the stale download goes.
+        remove_download(&here);
+        assert!(!new.exists());
+        assert!(old.exists());
+        // Proven by uptime: now the old copy goes too.
+        remove_old_copy(&here);
+        assert!(!old.exists());
+        assert!(here.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn compares_versions() {

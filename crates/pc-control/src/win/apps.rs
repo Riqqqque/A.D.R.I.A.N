@@ -52,8 +52,46 @@ impl Index {
     /// Whether a program lives in a game's install folder.
     pub fn is_game(&self, exe_path: &str) -> bool {
         let p = exe_path.to_lowercase().replace('/', "\\");
-        self.game_roots.iter().any(|r| p.starts_with(r.as_str()))
+        !NOT_GAMES.iter().any(|n| p.contains(n))
+            && self.game_roots.iter().any(|r| p.starts_with(r.as_str()))
     }
+
+    /// Whether a window's program has to be left alone: a game, or a program
+    /// that can't be identified, which might be one.
+    pub fn is_protected(&self, exe_path: &str) -> bool {
+        exe_path.is_empty() || self.is_game(exe_path)
+    }
+}
+
+/// Where launchers with no install list we read put their games, under Program
+/// Files. The launchers themselves stay closable, like the Riot Client.
+const LAUNCHER_FOLDERS: [&str; 5] = [
+    "EA Games",
+    "Ubisoft\\Ubisoft Game Launcher\\games",
+    "Call of Duty",
+    "Overwatch",
+    "Roblox\\Versions",
+];
+
+/// Lowercase ends of paths in a game's folder that aren't games: Roblox keeps
+/// Studio, its editor, right beside the player.
+const NOT_GAMES: [&str; 1] = ["\\robloxstudio"];
+
+/// Game folders found by where they usually are, not from a launcher's list:
+/// the Xbox app's on every fixed drive (`drives` as "C:\\"), and the defaults
+/// of the launchers above. Lowercase, like `Index::game_roots`. These end in a
+/// backslash, so a folder whose name only starts the same way doesn't count.
+fn other_roots(
+    drives: &[String],
+    local_app_data: Option<&str>,
+    program_files: &[String],
+) -> Vec<String> {
+    let mut roots: Vec<String> = drives.iter().map(|d| format!("{d}XboxGames\\")).collect();
+    roots.extend(local_app_data.map(|l| format!("{l}\\Roblox\\Versions\\")));
+    for dir in program_files {
+        roots.extend(LAUNCHER_FOLDERS.iter().map(|f| format!("{dir}\\{f}\\")));
+    }
+    roots.iter().map(|r| r.to_lowercase()).collect()
 }
 
 /// Start menu entries that are never what anyone means.
@@ -116,6 +154,15 @@ pub fn build(policy: &Policy) -> Index {
     riot(&mut apps, &mut game_roots);
     steam(&mut apps, &mut game_roots);
     epic(&mut apps, &mut game_roots);
+    let program_files: Vec<String> = ["ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .collect();
+    game_roots.extend(other_roots(
+        &super::info::fixed_drives(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        &program_files,
+    ));
     start_apps(&mut apps);
     Index {
         apps,
@@ -458,22 +505,65 @@ pub fn list(index: &Index, filter: &str) -> Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{Index, vdf_values};
+    use super::{Index, other_roots, vdf_values};
 
     #[test]
     fn knows_game_folders() {
+        let mut game_roots = vec![
+            "d:\\steamlibrary\\steamapps\\common".to_string(),
+            "c:\\riot games\\valorant".to_string(),
+        ];
+        game_roots.extend(other_roots(
+            &["C:\\".to_string(), "D:\\".to_string()],
+            Some("C:\\Users\\player\\AppData\\Local"),
+            &[
+                "C:\\Program Files".to_string(),
+                "C:\\Program Files (x86)".to_string(),
+            ],
+        ));
         let index = Index {
             apps: Vec::new(),
-            game_roots: vec![
-                "d:\\steamlibrary\\steamapps\\common".into(),
-                "c:\\riot games\\valorant".into(),
-            ],
+            game_roots,
             built: std::time::Instant::now(),
         };
         assert!(index.is_game("D:\\SteamLibrary\\steamapps\\common\\Apex Legends\\r5apex.exe"));
         assert!(index.is_game("C:/Riot Games/VALORANT/live/VALORANT.exe"));
+        assert!(index.is_game("D:\\XboxGames\\Some Game\\Content\\game.exe"));
+        assert!(index.is_game(
+            "C:\\Users\\player\\AppData\\Local\\Roblox\\Versions\\version-abc\\RobloxPlayerBeta.exe"
+        ));
+        assert!(index.is_game("C:\\Program Files (x86)\\Call of Duty\\cod.exe"));
+        assert!(index.is_game("C:\\Program Files\\EA Games\\Some Game\\game.exe"));
+        assert!(index.is_game(
+            "C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\games\\Some Game\\game.exe"
+        ));
         assert!(!index.is_game("C:\\Riot Games\\Riot Client\\RiotClientServices.exe"));
         assert!(!index.is_game("C:\\Program Files\\Spotify\\Spotify.exe"));
+        assert!(!index.is_game("C:\\Program Files (x86)\\Battle.net\\Battle.net.exe"));
+        // Everyday programs, and neighbours of the folders above.
+        assert!(!index.is_game("C:\\Windows\\System32\\notepad.exe"));
+        assert!(!index.is_game(
+            "C:\\Program Files\\WindowsApps\\Microsoft.WindowsNotepad_11.0_x64__8wekyb3d8bbwe\\Notepad\\Notepad.exe"
+        ));
+        assert!(!index.is_game(
+            "C:\\Users\\player\\AppData\\Local\\Roblox\\Versions\\version-abc\\RobloxStudioBeta.exe"
+        ));
+        assert!(!index.is_game("C:\\Program Files\\EA Games Tools\\tool.exe"));
+        assert!(!index.is_game("D:\\XboxGamesBackup\\notes.exe"));
+    }
+
+    #[test]
+    fn leaves_alone_a_program_it_cant_identify() {
+        let index = Index {
+            apps: Vec::new(),
+            game_roots: vec!["c:\\games".into()],
+            built: std::time::Instant::now(),
+        };
+        assert!(index.is_protected(""));
+        assert!(index.is_protected("C:\\Games\\game.exe"));
+        assert!(!index.is_protected("C:\\Program Files\\Spotify\\Spotify.exe"));
+        // Not labelled a game in "what's open", just left alone.
+        assert!(!index.is_game(""));
     }
 
     #[test]

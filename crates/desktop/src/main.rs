@@ -306,21 +306,39 @@ fn main() {
         }
         return;
     }
-    update::clean_up();
+    let context = tauri::generate_context!();
+    // The copy before this one runs this ahead of swapping to it: this build
+    // starts, and here's its version. No claim, window, tray or audio, so it
+    // works next to that copy, and it comes before anything that touches files.
+    if args.get(1).map(String::as_str) == Some("--self-check") {
+        match tauri::Builder::default().build(context) {
+            Ok(_app) => {
+                println!("{}", update::VERSION);
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
     // Already running: bring that window up instead of starting a second copy.
     // Right after an update the old copy is still closing: give it a moment.
     let after_update = args.iter().any(|a| a == "--after-update");
-    let mut show_signal = single::claim();
+    let mut show_signal = single::claim(!after_update);
     for _ in 0..40 {
         if show_signal.is_some() || !after_update {
             break;
         }
         std::thread::sleep(Duration::from_millis(250));
-        show_signal = single::claim();
+        show_signal = single::claim(!after_update);
     }
     let Some(show_signal) = show_signal else {
         return;
     };
+    // Only now: a launch that just raised the window mustn't delete the update
+    // the running copy is waiting to install.
+    update::clean_up();
     // At login it starts in the tray; opened by hand, the window shows.
     let background = args.iter().any(|a| a == "--background");
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -329,7 +347,7 @@ fn main() {
     let pc = Arc::new(Mutex::new(Arc::new(Pc::new(settings.pc.clone()))));
     let (link_tx, link_rx) = watch::channel(link_for(&settings));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (up_tx, up_rx) = mpsc::unbounded_channel();
+    let (up_tx, up_rx) = mpsc::channel(audio::UP_QUEUE);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
     let needs_setup = link_for(&settings).is_none();
 
@@ -596,7 +614,7 @@ fn main() {
             }
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("A.D.R.I.A.N. failed to start")
         .run(|_, e| {
             // Closing the window isn't quitting: she keeps running in the tray.

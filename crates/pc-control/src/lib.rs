@@ -40,6 +40,28 @@ impl Outcome {
     }
 }
 
+/// Whether `policy` allows an action; None for one that doesn't exist.
+fn allowed(p: &Policy, name: &str, action: &str) -> Option<bool> {
+    Some(match name {
+        "pc_apps" => p.apps,
+        "pc_open" => p.open,
+        "pc_media" => p.media,
+        "pc_volume" => p.volume,
+        "pc_info" => p.info,
+        "pc_system" => match action {
+            "lock" => p.lock,
+            "screen_off" => p.screen_off,
+            "sleep" => p.sleep,
+            "restart" => p.restart,
+            "shutdown" => p.shutdown,
+            // Either setting can have started what this stops.
+            "cancel_shutdown" => p.restart || p.shutdown,
+            _ => true,
+        },
+        _ => return None,
+    })
+}
+
 /// The PC: its policy and its index of apps and games.
 pub struct Pc {
     policy: Policy,
@@ -77,24 +99,10 @@ impl Pc {
         };
         let action = s("action");
         let p = &self.policy;
-        let allowed = match name {
-            "pc_apps" => p.apps,
-            "pc_open" => p.open,
-            "pc_media" => p.media,
-            "pc_volume" => p.volume,
-            "pc_info" => p.info,
-            "pc_system" => match action.as_str() {
-                "lock" => p.lock,
-                "screen_off" => p.screen_off,
-                "sleep" => p.sleep,
-                "restart" | "cancel_shutdown" => p.restart || p.shutdown,
-                "shutdown" => p.shutdown,
-                _ => true,
-            },
-            _ => return Outcome::no(format!("Unknown PC action {name}.")),
-        };
-        if !allowed {
-            return Outcome::no("That's turned off in this PC's settings.");
+        match allowed(p, name, &action) {
+            Some(true) => {}
+            Some(false) => return Outcome::no("That's turned off in this PC's settings."),
+            None => return Outcome::no(format!("Unknown PC action {name}.")),
         }
         #[cfg(windows)]
         {
@@ -129,6 +137,33 @@ mod tests {
         );
         assert!(!pc.run("pc_volume", &json!({"action": "get"})).ok);
         assert!(!pc.run("pc_format_disk", &json!({})).ok);
+    }
+
+    // Never with `confirmed: true`: if this ever regressed it would really restart.
+    #[test]
+    fn restart_has_its_own_setting() {
+        let policy = Policy {
+            restart: false,
+            shutdown: true,
+            ..Policy::default()
+        };
+        let o = Pc::new(policy.clone()).run("pc_system", &json!({ "action": "restart" }));
+        assert!(!o.ok);
+        assert!(o.text.contains("turned off"), "{}", o.text);
+        assert_eq!(allowed(&policy, "pc_system", "shutdown"), Some(true));
+    }
+
+    #[test]
+    fn either_power_setting_allows_cancelling() {
+        let set = |restart, shutdown| Policy {
+            restart,
+            shutdown,
+            ..Policy::default()
+        };
+        let can_cancel = |p: Policy| allowed(&p, "pc_system", "cancel_shutdown");
+        assert_eq!(can_cancel(set(true, false)), Some(true));
+        assert_eq!(can_cancel(set(false, true)), Some(true));
+        assert_eq!(can_cancel(set(false, false)), Some(false));
     }
 
     #[cfg(windows)]

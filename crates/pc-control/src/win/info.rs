@@ -14,11 +14,24 @@ use windows::Win32::System::SystemInformation::{
     GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
 use windows::Win32::System::Threading::{
-    GetSystemTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    GetSystemTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::core::HSTRING;
 
 const DRIVE_FIXED: u32 = 3;
+/// All that's asked of a process to read its memory use. Anything more, read
+/// access above all, is what kernel anti-cheat watches for on a game.
+const PROCESS_ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_QUERY_LIMITED_INFORMATION;
+
+/// The roots of the PC's fixed drives: "C:\\", "D:\\".
+pub fn fixed_drives() -> Vec<String> {
+    let drives = unsafe { GetLogicalDrives() };
+    (0..26u32)
+        .filter(|i| drives & (1 << i) != 0)
+        .map(|i| format!("{}:\\", (b'A' + i as u8) as char))
+        .filter(|root| unsafe { GetDriveTypeW(&HSTRING::from(root.as_str())) } == DRIVE_FIXED)
+        .collect()
+}
 
 fn gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
@@ -68,17 +81,9 @@ pub fn summary() -> Outcome {
             m.dwMemoryLoad
         ));
     }
-    let drives = unsafe { GetLogicalDrives() };
     let mut disks = Vec::new();
-    for i in 0..26u32 {
-        if drives & (1 << i) == 0 {
-            continue;
-        }
-        let root = format!("{}:\\", (b'A' + i as u8) as char);
+    for root in fixed_drives() {
         let h = HSTRING::from(root.as_str());
-        if unsafe { GetDriveTypeW(&h) } != DRIVE_FIXED {
-            continue;
-        }
         let (mut free, mut total) = (0u64, 0u64);
         if unsafe { GetDiskFreeSpaceExW(&h, Some(&mut free), Some(&mut total), None) }.is_ok()
             && total > 0
@@ -123,11 +128,7 @@ pub fn processes() -> Outcome {
         let mut more = Process32FirstW(snap, &mut e).is_ok();
         while more {
             let name = exe_stem(&super::from_wide(&e.szExeFile));
-            if let Ok(h) = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-                false,
-                e.th32ProcessID,
-            ) {
+            if let Ok(h) = OpenProcess(PROCESS_ACCESS, false, e.th32ProcessID) {
                 let mut c = PROCESS_MEMORY_COUNTERS {
                     cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
                     ..Default::default()
@@ -164,4 +165,30 @@ pub fn processes() -> Outcome {
         })
         .collect();
     Outcome::ok(format!("Using the most memory: {}.", top.join(", ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Threading::PROCESS_VM_READ;
+
+    #[test]
+    fn asks_for_no_read_access_to_other_programs() {
+        assert_eq!(PROCESS_ACCESS.0 & PROCESS_VM_READ.0, 0);
+    }
+
+    #[test]
+    fn memory_use_works_without_read_access() {
+        let o = processes();
+        assert!(o.ok, "{}", o.text);
+        // Would be empty if the limited access weren't enough for the memory counters.
+        let list = o.text.strip_prefix("Using the most memory: ").unwrap();
+        assert!(list.contains(" GB"), "{}", o.text);
+    }
+
+    #[test]
+    fn finds_a_fixed_drive() {
+        assert!(fixed_drives().iter().all(|d| d.ends_with(":\\")));
+        assert!(!fixed_drives().is_empty());
+    }
 }
