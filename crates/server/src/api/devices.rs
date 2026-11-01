@@ -1,7 +1,7 @@
 //! Device inventory and the allowlisted light control path — the same
 //! policy gate the LLM tool goes through.
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, Cap};
 use crate::db::P;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -19,14 +19,20 @@ pub fn routes() -> Router<AppState> {
         .route("/api/devices/entities/{id}/command", post(command))
 }
 
-async fn list_entities(
-    _user: AuthUser,
-    State(s): State<AppState>,
-) -> Result<Json<Value>, ApiError> {
+/// The owner sees everything imported, to choose what to allow; everyone else
+/// sees what they can use.
+async fn list_entities(user: AuthUser, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let visible = if user.is_owner() {
+        ""
+    } else {
+        "WHERE allowed = 1 AND domain = 'light'"
+    };
     let rows =
         s.db.q(
-            "SELECT entity_id, name, area, domain, state, allowed, updated_at
-             FROM entities ORDER BY domain, area, name",
+            &format!(
+                "SELECT entity_id, name, area, domain, state, allowed, updated_at
+                 FROM entities {visible} ORDER BY domain, area, name"
+            ),
             vec![],
             |r| {
                 Ok(json!({
@@ -98,6 +104,7 @@ pub async fn execute_light(
     action: &str,
     brightness_pct: Option<i64>,
 ) -> Result<Value, ApiError> {
+    user.require(Cap::Lights)?;
     if !matches!(action, "turn_on" | "turn_off" | "toggle") {
         return Err(ApiError::BadRequest(format!(
             "action '{action}' not in the light service allowlist"
@@ -148,7 +155,7 @@ pub async fn execute_light(
     .await;
     s.emit(
         "entity_state",
-        json!({"entity_id": entity_id, "state": result.observed_state}),
+        json!({"entity_id": entity_id, "state": result.observed_state, "allowed": true}),
     );
     Ok(json!({
         "ok": true,

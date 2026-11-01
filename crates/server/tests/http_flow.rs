@@ -1758,3 +1758,295 @@ async fn revoking_a_satellite_retires_its_endpoint() {
     .await;
     assert_eq!(s, StatusCode::PRECONDITION_FAILED, "{res}");
 }
+
+/// A signed-in user of `role`, inserted directly: no route adds users yet.
+async fn session_for(h: &Harness, username: &str, role: &str) -> (String, String) {
+    use adrian_server::db::P;
+    let id = h
+        .state
+        .db
+        .q1(
+            "INSERT INTO users(username, display_name, password_hash, role, created_at)
+             VALUES(?1, ?1, 'x', ?2, 1) RETURNING id",
+            vec![P::T(username.into()), P::T(role.into())],
+            |r| r.get::<_, i64>(0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let (session, csrf) = (format!("{username}-session"), format!("{username}-csrf"));
+    h.state
+        .db
+        .exec(
+            "INSERT INTO sessions(id,user_id,csrf,created_at,expires_at)
+             VALUES(?1,?2,?3,1,4102444800)",
+            vec![P::T(session.clone()), P::I(id), P::T(csrf.clone())],
+        )
+        .await
+        .unwrap();
+    (format!("adrian_session={session}"), csrf)
+}
+
+async fn insert_entity(h: &Harness, id: &str, allowed: i64) {
+    use adrian_server::db::P;
+    let domain = id.split('.').next().unwrap().to_string();
+    h.state
+        .db
+        .exec(
+            "INSERT INTO entities(entity_id,name,domain,state,allowed,updated_at)
+             VALUES(?1,?1,?2,'on',?3,1)",
+            vec![P::T(id.into()), P::T(domain), P::I(allowed)],
+        )
+        .await
+        .unwrap();
+}
+
+async fn listed_entities(h: &Harness, cookie: &str) -> Vec<String> {
+    let (s, _, res) = request(
+        &h.router,
+        "GET",
+        "/api/devices/entities",
+        None,
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    res["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["entity_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn only_the_owner_sees_lights_that_are_not_allowed() {
+    let h = harness().await;
+    let (owner, _) = claim_owner(&h).await;
+    let (guest, _) = session_for(&h, "visitor", "guest").await;
+    let (member, _) = session_for(&h, "family", "member").await;
+    insert_entity(&h, "light.desk", 1).await;
+    insert_entity(&h, "light.closet", 0).await;
+    // A row left by an older build, whatever its flag says.
+    insert_entity(&h, "lock.front_door", 1).await;
+
+    assert_eq!(listed_entities(&h, &guest).await, ["light.desk"]);
+    assert_eq!(listed_entities(&h, &member).await, ["light.desk"]);
+    assert_eq!(listed_entities(&h, &owner).await.len(), 3);
+}
+
+/// Everything `cookie` hears on /api/events until `until` shows up.
+async fn events_until(h: &Harness, cookie: &str, until: &str) -> String {
+    let req = Request::builder()
+        .uri("/api/events")
+        .header(header::COOKIE, cookie)
+        .extension(ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))))
+        .body(Body::empty())
+        .unwrap();
+    let mut body = h.router.clone().oneshot(req).await.unwrap().into_body();
+    h.state.emit(
+        "entity_state",
+        json!({"entity_id": "light.closet", "state": "on", "allowed": false}),
+    );
+    h.state.emit(
+        "entity_state",
+        json!({"entity_id": "light.desk", "state": "on", "allowed": true}),
+    );
+    let mut heard = String::new();
+    while !heard.contains(until) {
+        let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("event stream ended")
+            .unwrap();
+        if let Ok(data) = frame.into_data() {
+            heard.push_str(&String::from_utf8_lossy(&data));
+        }
+    }
+    heard
+}
+
+#[tokio::test]
+async fn entity_events_reach_others_only_for_allowed_lights() {
+    let h = harness().await;
+    let (owner, _) = claim_owner(&h).await;
+    let (guest, _) = session_for(&h, "visitor", "guest").await;
+
+    let heard = events_until(&h, &guest, "light.desk").await;
+    assert!(!heard.contains("light.closet"), "{heard}");
+
+    let heard = events_until(&h, &owner, "light.desk").await;
+    assert!(heard.contains("light.closet"), "{heard}");
+}
+
+async fn ledger_count(h: &Harness, action: &str) -> i64 {
+    count(
+        h,
+        &format!("SELECT COUNT(*) FROM action_ledger WHERE action = '{action}'"),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn fact_changes_reach_the_ledger_and_guests_cannot_make_them() {
+    let h = harness().await;
+    let (owner, owner_csrf) = claim_owner(&h).await;
+    let (guest, guest_csrf) = session_for(&h, "visitor", "guest").await;
+    let (s, _, res) = request(
+        &h.router,
+        "POST",
+        "/api/memory",
+        Some(json!({"text": "the bins go out on monday", "scope": "household"})),
+        Some(&owner),
+        Some(&owner_csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    let path = format!("/api/memory/{}", res["fact"]["id"]);
+
+    let edit = json!({"text": "the bins go out on tuesday"});
+    let (s, _, res) = request(
+        &h.router,
+        "PUT",
+        &path,
+        Some(edit.clone()),
+        Some(&guest),
+        Some(&guest_csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{res}");
+    let (s, _, res) = request(
+        &h.router,
+        "DELETE",
+        &path,
+        None,
+        Some(&guest),
+        Some(&guest_csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{res}");
+    assert_eq!(ledger_count(&h, "memory_update").await, 0);
+    assert_eq!(ledger_count(&h, "memory_delete").await, 0);
+
+    let (s, _, res) = request(
+        &h.router,
+        "PUT",
+        &path,
+        Some(edit),
+        Some(&owner),
+        Some(&owner_csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    assert_eq!(ledger_count(&h, "memory_update").await, 1);
+    let (s, _, res) = request(
+        &h.router,
+        "DELETE",
+        &path,
+        None,
+        Some(&owner),
+        Some(&owner_csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    assert_eq!(ledger_count(&h, "memory_delete").await, 1);
+}
+
+/// POST a chat message; returns the status and the raw event stream.
+async fn chat(h: &Harness, cookie: &str, csrf: &str, message: &str) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/chat")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, cookie)
+        .header("x-adrian-csrf", csrf)
+        .extension(ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))))
+        .body(Body::from(json!({"message": message}).to_string()))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The routes that act on the house, called as `cookie`; returns their statuses.
+async fn try_to_act(h: &Harness, cookie: &str, csrf: &str, endpoint: &str) -> Vec<StatusCode> {
+    let mut out = Vec::new();
+    for (path, body) in [
+        (
+            "/api/devices/entities/light.desk/command".to_string(),
+            json!({"action": "turn_off"}),
+        ),
+        (format!("/api/endpoints/{endpoint}/test"), json!({})),
+        ("/api/alarms".to_string(), json!({"in_minutes": 5})),
+        ("/api/audio/register".to_string(), json!({"name": "tab"})),
+    ] {
+        let (s, _, _) = request(
+            &h.router,
+            "POST",
+            &path,
+            Some(body),
+            Some(cookie),
+            Some(csrf),
+        )
+        .await;
+        out.push(s);
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_guest_can_chat_but_cannot_act_on_the_house() {
+    let h = harness().await;
+    let (owner, owner_csrf) = claim_owner(&h).await;
+    let (guest, guest_csrf) = session_for(&h, "visitor", "guest").await;
+    let (member, member_csrf) = session_for(&h, "family", "member").await;
+    insert_entity(&h, "light.desk", 1).await;
+    let (speaker, _) = browser_endpoint(&h, &owner, &owner_csrf).await;
+
+    let denied = try_to_act(&h, &guest, &guest_csrf, &speaker).await;
+    assert_eq!(denied, [StatusCode::FORBIDDEN; 4]);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM alarms").await, 0);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM endpoints").await, 1);
+
+    let (s, said) = chat(&h, &guest, &guest_csrf, "what time is it").await;
+    assert_eq!(s, StatusCode::OK, "{said}");
+    assert!(said.contains("It's"), "{said}");
+
+    // Past the rights check, a missing speaker and Home Assistant are the
+    // only things in the way. The missing id skips a 20 s playback wait.
+    let allowed = [
+        StatusCode::PRECONDITION_FAILED,
+        StatusCode::NOT_FOUND,
+        StatusCode::OK,
+        StatusCode::OK,
+    ];
+    let got = try_to_act(&h, &owner, &owner_csrf, "missing").await;
+    assert_eq!(got, allowed);
+    let got = try_to_act(&h, &member, &member_csrf, "missing").await;
+    assert_eq!(got, allowed);
+}
+
+#[tokio::test]
+async fn chat_is_rate_limited_per_user() {
+    let h = harness().await;
+    let (owner, csrf) = claim_owner(&h).await;
+    let (guest, guest_csrf) = session_for(&h, "visitor", "guest").await;
+
+    for _ in 0..30 {
+        let (s, said) = chat(&h, &owner, &csrf, "what time is it").await;
+        assert_eq!(s, StatusCode::OK, "{said}");
+    }
+    let (s, said) = chat(&h, &owner, &csrf, "what time is it").await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{said}");
+
+    let (s, said) = chat(&h, &guest, &guest_csrf, "what time is it").await;
+    assert_eq!(s, StatusCode::OK, "another person is not held back: {said}");
+}

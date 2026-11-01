@@ -422,6 +422,75 @@ async fn satellite_revoked_during_stt_gets_no_turn() {
     assert_turn_ack_refused(&recv_env(&mut ws, Duration::from_secs(15)).await);
 }
 
+/// A provider that hears "set a timer", sets it, then fails the next round.
+async fn timer_then_failing_provider() -> SocketAddr {
+    let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route(
+            "/v1/audio/transcriptions",
+            axum::routing::post(|_: axum::body::Bytes| async {
+                axum::Json(json!({"text": "set a timer for ten minutes"}))
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(move |_: axum::body::Bytes| {
+                let rounds = rounds.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    if rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                        return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
+                    }
+                    let args = json!({"in_minutes": 10}).to_string();
+                    let call = json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+                        "index":0,"id":"call_0",
+                        "function":{"name":"set_alarm","arguments":args}}]}}]});
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        format!("data: {call}\n\ndata: [DONE]\n\n"),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
+
+#[tokio::test]
+async fn a_failed_later_round_is_spoken_with_what_was_done() {
+    let h = harness().await;
+    let provider = timer_then_failing_provider().await;
+    let router = build_router(h.state.clone());
+    let (s, _, res) = json_request(
+        &router,
+        "POST",
+        "/api/integrations/providers",
+        Some(json!({"kind": "openai_compatible", "label": "Test",
+                    "base_url": format!("http://{provider}/v1"), "model": "m"})),
+        Some(&h.cookie),
+        Some(&h.csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    satellite_endpoint(&h).await;
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    recv_sync(&mut ws, Duration::from_secs(10)).await;
+
+    send_utterance(&mut ws).await;
+
+    let spoken = loop {
+        let env = recv_env(&mut ws, Duration::from_secs(15)).await;
+        if let Message::Speak { text, .. } = env.message {
+            break text.unwrap_or_default();
+        }
+    };
+    assert!(spoken.contains("Timer set"), "{spoken}");
+    assert!(!spoken.starts_with("error:"), "{spoken}");
+}
+
 #[tokio::test]
 async fn session_protocol_envelopes() {
     let h = harness().await;

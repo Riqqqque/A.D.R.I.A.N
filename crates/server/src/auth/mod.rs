@@ -25,6 +25,29 @@ pub const SESSION_COOKIE: &str = "adrian_session";
 pub const CSRF_HEADER: &str = "x-adrian-csrf";
 pub const SESSION_TTL_SECS: i64 = 7 * 24 * 3600;
 
+/// What an account may do. Every path that acts checks one of these, whether
+/// a person or the model asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cap {
+    Chat,
+    Lights,
+    Alarms,
+    Speakers,
+}
+
+/// What a guest may do. This list is the owner's product decision, not a
+/// technical limit: chat alone is the safe default until they choose more.
+const GUEST_CAPS: &[Cap] = &[Cap::Chat];
+
+/// Default deny: a role not named here holds nothing.
+fn role_holds(role: &str, cap: Cap) -> bool {
+    match role {
+        "owner" | "member" => true,
+        "guest" => GUEST_CAPS.contains(&cap),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub id: i64,
@@ -43,6 +66,15 @@ impl AuthUser {
             Ok(())
         } else {
             Err(ApiError::Forbidden("owner role required".into()))
+        }
+    }
+    pub fn require(&self, cap: Cap) -> Result<(), ApiError> {
+        if role_holds(&self.role, cap) {
+            Ok(())
+        } else {
+            Err(ApiError::Forbidden(format!(
+                "this account has no access to {cap:?}"
+            )))
         }
     }
 }
@@ -496,6 +528,46 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    fn user(role: &str) -> AuthUser {
+        AuthUser {
+            id: 1,
+            username: "someone".into(),
+            role: role.into(),
+            session_id: "s".into(),
+            csrf: String::new(),
+        }
+    }
+
+    const ALL_CAPS: [Cap; 4] = [Cap::Chat, Cap::Lights, Cap::Alarms, Cap::Speakers];
+
+    #[test]
+    fn owners_and_members_hold_every_right() {
+        for role in ["owner", "member"] {
+            for cap in ALL_CAPS {
+                assert!(user(role).require(cap).is_ok(), "{role} {cap:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_guest_may_chat_and_nothing_else() {
+        let guest = user("guest");
+        assert!(guest.require(Cap::Chat).is_ok());
+        for cap in [Cap::Lights, Cap::Alarms, Cap::Speakers] {
+            let denied = guest.require(cap);
+            assert!(matches!(denied, Err(ApiError::Forbidden(_))), "{cap:?}");
+        }
+    }
+
+    #[test]
+    fn a_role_nobody_listed_gets_nothing() {
+        for role in ["butler", "", "Owner", "owner "] {
+            for cap in ALL_CAPS {
+                assert!(user(role).require(cap).is_err(), "{role:?} {cap:?}");
+            }
+        }
     }
 
     #[test]

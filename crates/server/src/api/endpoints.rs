@@ -4,7 +4,7 @@
 //! not a notification toast.
 
 use crate::audio::AudioCommand;
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, Cap};
 use crate::db::P;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -168,10 +168,11 @@ async fn remove(
 
 /// Send the builtin tone to an endpoint and report the outcome honestly.
 async fn test(
-    _user: AuthUser,
+    user: AuthUser,
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    user.require(Cap::Speakers)?;
     let row =
         s.db.q1(
             "SELECT name, kind, config FROM endpoints WHERE id = ?1 AND enabled = 1",
@@ -281,6 +282,7 @@ async fn register_browser(
     State(s): State<AppState>,
     Json(b): Json<RegisterBody>,
 ) -> Result<Json<Value>, ApiError> {
+    user.require(Cap::Speakers)?;
     let name = if b.name.trim().is_empty() {
         format!("Browser audio ({})", user.username)
     } else {

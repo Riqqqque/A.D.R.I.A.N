@@ -1,7 +1,7 @@
 //! Alarm CRUD + control. Creation persists before responding; control
 //! commands (snooze/stop/cancel) are durable and reconcile deliveries.
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, Cap};
 use crate::error::ApiError;
 use crate::scheduler::{self, AlarmSpec};
 use crate::state::AppState;
@@ -40,6 +40,7 @@ async fn create(
     State(s): State<AppState>,
     Json(b): Json<CreateBody>,
 ) -> Result<Json<Value>, ApiError> {
+    user.require(Cap::Alarms)?;
     let spec = AlarmSpec {
         label: b.label.as_deref().unwrap_or(""),
         kind: if b.in_minutes.is_some() && b.at_local.is_none() {
