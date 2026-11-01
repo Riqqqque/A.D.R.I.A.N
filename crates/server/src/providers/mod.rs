@@ -10,6 +10,7 @@ use crate::error::ApiError;
 use crate::secrets::SecretBox;
 use futures_util::Stream;
 use serde_json::Value;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,27 +167,56 @@ pub async fn load_provider_rows(db: &Db) -> Result<Vec<ProviderRow>, ApiError> {
 }
 
 /// True when a base URL points at a loopback/private/link-local host.
-/// Used by strict-local privacy mode to decide whether egress is allowed.
+/// Used by strict-local privacy mode to decide whether egress is allowed,
+/// and by metering, which treats local endpoints as free and unlimited.
 pub fn base_is_local(base_url: &str) -> bool {
-    let host = reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_string()))
-        .unwrap_or_default();
-    host == "localhost"
-        || host == "::1"
-        || host.starts_with("127.")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("169.254.")
-        || host.starts_with("172.16.")
-        || host.starts_with("172.17.")
-        || host.starts_with("172.18.")
-        || host.starts_with("172.19.")
-        || host.starts_with("172.2")
-        || host.starts_with("172.30.")
-        || host.starts_with("172.31.")
-        || host.ends_with(".local")
-        || !host.contains('.')
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    // IPv6 hosts keep their brackets in the URL.
+    match host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(ip) => ip_is_local(ip),
+        // A name can't be judged without resolving it, so only the kinds
+        // that never leave the LAN pass.
+        Err(_) => host == "localhost" || host.ends_with(".local") || !host.contains('.'),
+    }
+}
+
+fn ip_is_local(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        // 0.0.0.0 and :: can only reach this machine.
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+        }
+    }
+}
+
+/// Strict-local mode refuses any call to a provider that isn't local.
+pub async fn ensure_egress_allowed(
+    state: &crate::state::AppState,
+    row: &ProviderRow,
+) -> Result<(), ApiError> {
+    let strict = state.get_setting("privacy_mode").await?.as_deref() == Some("strict_local");
+    if strict && !base_is_local(&row.base_url) {
+        let host = reqwest::Url::parse(&row.base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+        return Err(ApiError::Forbidden(format!(
+            "strict-local mode blocks cloud egress — provider '{}' ({}) is not a local endpoint",
+            row.label, host
+        )));
+    }
+    Ok(())
 }
 
 /// Speech-to-text against an OpenAI-compatible `/audio/transcriptions`
@@ -404,4 +434,58 @@ pub async fn upstream_error(resp: reqwest::Response) -> String {
     let body = resp.text().await.unwrap_or_default();
     let snippet: String = body.chars().take(300).collect();
     format!("HTTP {status}: {snippet}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_is_local_only_for_loopback_private_and_link_local_hosts() {
+        for url in [
+            "http://localhost:8080/v1",
+            "http://LOCALHOST:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://127.1.2.3/v1",
+            "http://10.0.0.5/v1",
+            "http://172.16.0.1/v1",
+            "http://172.20.0.5/v1",
+            "http://172.31.0.1/v1",
+            "http://192.168.1.2/v1",
+            "http://169.254.1.1/v1",
+            "http://[::1]:8000/v1",
+            "http://[fd00::1]/v1",
+            "http://[fe80::1]/v1",
+            "http://[::ffff:192.168.1.2]/v1",
+            "http://nas.local:8000/v1",
+            "http://ollama:11434/v1",
+            // Written oddly, but still this machine.
+            "http://0x7f.1/v1",
+            "http://0.0.0.0:11434/v1",
+            "http://[::]:11434/v1",
+        ] {
+            assert!(base_is_local(url), "{url} should be local");
+        }
+        for url in [
+            "https://[2606:4700:4700::1111]/v1",
+            "http://[2a01:4f8::1]:8000/v1",
+            "http://[::ffff:8.8.8.8]/v1",
+            "https://172.217.1.1/v1",
+            "http://172.2.0.1/v1",
+            "http://172.32.0.1/v1",
+            "http://172.232.5.9:8000/v1",
+            "http://10.0.0.5.sslip.io/v1",
+            "http://127.0.0.1.nip.io/v1",
+            "http://localhost.example.com/v1",
+            "http://nas.local.example.com/v1",
+            "http://127.0.0.1@example.com/v1",
+            // 8.8.8.8 as a single number.
+            "http://134744072/v1",
+            "https://api.openai.com/v1",
+            "not a url",
+            "",
+        ] {
+            assert!(!base_is_local(url), "{url} should not be local");
+        }
+    }
 }

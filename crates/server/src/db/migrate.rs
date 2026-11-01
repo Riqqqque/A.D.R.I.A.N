@@ -268,6 +268,21 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         [],
         |r| r.get(0),
     )?;
+    if applied >= MIGRATIONS.len() as i64 {
+        return Ok(());
+    }
+    // Rebuilding a table that others reference (v6) fails under enforcement:
+    // DROP TABLE runs an implicit DELETE. The pragma is ignored inside a
+    // transaction, so it brackets the whole run and each commit checks the
+    // references itself. `reopen_or_die` keeps this connection even when a
+    // migration fails, so enforcement comes back on every path.
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let applied_all = apply_pending(conn, applied);
+    let restored = conn.pragma_update(None, "foreign_keys", "ON");
+    applied_all.and(restored)
+}
+
+fn apply_pending(conn: &Connection, applied: i64) -> rusqlite::Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let v = (i + 1) as i64;
         if v > applied {
@@ -277,9 +292,132 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(?1,?2)",
                 rusqlite::params![v, crate::util::now_unix()],
             )?;
+            check_foreign_keys(&tx)?;
             tx.commit()?;
             tracing::info!(version = v, "applied db migration");
         }
     }
     Ok(())
+}
+
+/// Fail if any row points at a parent that does not exist. With enforcement
+/// off this is all that stops a migration from committing a broken reference.
+fn check_foreign_keys(conn: &Connection) -> rusqlite::Result<()> {
+    let mut st = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = st.query([])?;
+    if let Some(r) = rows.next()? {
+        let table: String = r.get(0)?;
+        let parent: String = r.get(2)?;
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            Some(format!(
+                "migration left a dangling reference: {table} -> {parent}"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A database as v5 left it, enforcing foreign keys like `configure`.
+    fn at_v5() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for (i, sql) in MIGRATIONS[..5].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(?1, 1)",
+                [i as i64 + 1],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO users(id,username,display_name,password_hash,role,created_at)
+             VALUES(1,'o','o','x','owner',1)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_alarm(conn: &Connection, endpoint_id: &str) {
+        conn.execute(
+            "INSERT INTO alarms(id,owner_id,timezone,endpoint_id,created_at,updated_at)
+             VALUES('a',1,'UTC',?1,1,1)",
+            [endpoint_id],
+        )
+        .unwrap();
+    }
+
+    fn version(conn: &Connection) -> i64 {
+        conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    fn enforcing_foreign_keys(conn: &Connection) -> bool {
+        conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 1
+    }
+
+    #[test]
+    fn rebuilding_endpoints_keeps_the_alarms_that_use_them() {
+        let conn = at_v5();
+        conn.execute(
+            "INSERT INTO endpoints(id,name,kind,created_at) VALUES('e','Kitchen','browser',1)",
+            [],
+        )
+        .unwrap();
+        insert_alarm(&conn, "e");
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+        let endpoint: String = conn
+            .query_row("SELECT endpoint_id FROM alarms WHERE id='a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(endpoint, "e");
+        let dangling: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dangling, 0);
+        assert!(enforcing_foreign_keys(&conn));
+        // The rebuilt table is still the alarm's parent.
+        let err = conn
+            .execute("DELETE FROM endpoints WHERE id='e'", [])
+            .unwrap_err();
+        assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
+    }
+
+    /// With enforcement off during a migration, the check before commit is
+    /// all that stops a broken reference, and a failed migration must not
+    /// leave the connection unenforced (`reopen_or_die` keeps it).
+    #[test]
+    fn dangling_reference_aborts_the_migration_with_enforcement_back_on() {
+        let conn = at_v5();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        insert_alarm(&conn, "gone");
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let err = migrate(&conn).unwrap_err();
+
+        assert!(err.to_string().contains("alarms"), "{err}");
+        assert_eq!(version(&conn), 5);
+        assert!(enforcing_foreign_keys(&conn));
+    }
 }

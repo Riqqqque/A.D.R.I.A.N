@@ -86,8 +86,9 @@ impl AudioRegistry {
         Ok(())
     }
 
-    /// Stop playback on every connected browser channel for a delivery.
-    pub fn broadcast_stop(&self, alarm_id: &str) {
+    /// Stop a delivery's playback. Goes to every connected browser channel;
+    /// a tab acts on it only if it is playing that delivery.
+    pub fn broadcast_stop(&self, delivery_id: &str) {
         let txs: Vec<broadcast::Sender<AudioCommand>> = self
             .channels
             .lock()
@@ -97,7 +98,7 @@ impl AudioRegistry {
             .collect();
         for tx in txs {
             let _ = tx.send(AudioCommand::Stop {
-                delivery_id: alarm_id.to_string(),
+                delivery_id: delivery_id.to_string(),
             });
         }
     }
@@ -151,22 +152,6 @@ impl AudioRegistry {
             Ok(Err(_)) => Err(ApiError::internal_msg("ack channel dropped")),
             Err(_) => Err(ApiError::Timeout("playback ack".into())),
         }
-    }
-
-    /// Arm + await in one call (for callers that cannot pre-arm).
-    pub async fn wait_ack(
-        &self,
-        delivery_id: &str,
-        timeout: Duration,
-    ) -> Result<(bool, String), ApiError> {
-        let rx = self.arm_ack(delivery_id);
-        self.await_ack(rx, timeout).await
-    }
-
-    /// Resolve an armed waiter from the browser HTTP ack endpoint (the
-    /// browser reports a result string; treat it as success).
-    pub fn resolve_ack(&self, delivery_id: &str, result: String) {
-        self.resolve_ack_status(delivery_id, true, result);
     }
 
     /// Resolve an armed waiter with an explicit success/failure flag.
@@ -237,4 +222,18 @@ fn generate_tone_wav() -> Vec<u8> {
         out.extend_from_slice(&s.to_le_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_ack_reaches_the_waiter_as_failed() {
+        let audio = AudioRegistry::new();
+        let ack = audio.arm_ack("d1");
+        audio.resolve_ack_status("d1", false, "playback blocked".into());
+        let got = audio.await_ack(ack, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(got, (false, "playback blocked".to_string()));
+    }
 }

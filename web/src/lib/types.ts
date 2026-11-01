@@ -84,6 +84,7 @@ export interface HaStatus {
   configured: boolean;
   enabled?: boolean;
   url?: string;
+  has_token?: boolean;
   connected?: boolean;
   last_ok_at?: number | null;
   last_error?: string | null;

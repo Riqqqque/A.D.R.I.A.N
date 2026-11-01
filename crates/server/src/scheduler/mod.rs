@@ -382,7 +382,7 @@ pub async fn list_for(db: &Db, requester_id: i64, is_owner: bool) -> Result<Vec<
                       WHERE d.alarm_id = a.id ORDER BY started_at DESC LIMIT 1),
                     (SELECT detail FROM alarm_deliveries d
                       WHERE d.alarm_id = a.id ORDER BY started_at DESC LIMIT 1),
-                    u.username
+                    u.username, a.snooze_minutes
              FROM alarms a
              LEFT JOIN endpoints e ON e.id = a.endpoint_id
              JOIN users u ON u.id = a.owner_id
@@ -405,6 +405,7 @@ pub async fn list_for(db: &Db, requester_id: i64, is_owner: bool) -> Result<Vec<
                 "last_delivery_status": r.get::<_, Option<String>>(10)?,
                 "last_delivery_detail": r.get::<_, Option<String>>(11)?,
                 "owner": r.get::<_, String>(12)?,
+                "snooze_minutes": r.get::<_, i64>(13)?,
             }))
         },
     )
@@ -444,12 +445,13 @@ pub async fn snooze(
         )));
     }
     let new_due = util::now_unix() + alarm.snooze_minutes * 60;
-    state
+    let delivering = state
         .db
         .call({
             let id = id.to_string();
             move |c| {
                 let tx = c.transaction()?;
+                let delivering = delivering_ids(&tx, &id)?;
                 tx.execute(
                     "UPDATE alarm_deliveries SET status = 'canceled',
                         detail = detail || ' (snoozed)', finished_at = ?1
@@ -463,15 +465,19 @@ pub async fn snooze(
                     rusqlite::params![new_due, util::now_unix(), id],
                 )?;
                 tx.commit()?;
-                Ok(())
+                Ok(delivering)
             }
         })
         .await?;
+    release_deliveries(state, &delivering);
     state.scheduler.wake();
     state.emit("alarm", json!({"event": "snoozed", "alarm_id": id}));
     Ok(json!({"id": id, "status": "scheduled", "next_due_utc": new_due}))
 }
 
+/// Stop ('done') ends this ringing: a recurring alarm goes on to its next
+/// occurrence, and a Stop that arrives after the ringing ended changes
+/// nothing. Cancel ('canceled') is terminal.
 pub async fn stop_or_cancel(
     state: &AppState,
     id: &str,
@@ -482,32 +488,77 @@ pub async fn stop_or_cancel(
     let alarm = load_alarm(&state.db, id).await?;
     check_ownership(&alarm, requester_id, is_owner)?;
     let now = util::now_unix();
+    let stopping = final_status == "done";
+    let next = if stopping {
+        next_occurrence_after(&alarm, now.max(alarm.next_due_utc.unwrap_or(now)))
+    } else {
+        None
+    };
+    let new_status = if next.is_some() {
+        "scheduled".to_string()
+    } else {
+        final_status.to_string()
+    };
     let id2 = id.to_string();
-    let fs = final_status.to_string();
-    state
+    let (delivering, changed) = state
         .db
         .call(move |c| {
             let tx = c.transaction()?;
+            let delivering = delivering_ids(&tx, &id2)?;
             tx.execute(
                 "UPDATE alarm_deliveries SET status='canceled',
                     detail = detail || ' (stopped by user)', finished_at=?1
                  WHERE alarm_id=?2 AND status='delivering'",
                 rusqlite::params![now, id2],
             )?;
-            tx.execute(
-                "UPDATE alarms SET status=?1, next_due_utc=NULL, updated_at=?2,
-                    schedule_version=schedule_version+1
-                 WHERE id=?3",
-                rusqlite::params![fs, now, id2],
+            let only_if_ringing = if stopping {
+                " AND status='ringing'"
+            } else {
+                ""
+            };
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE alarms SET status=?1, next_due_utc=?2, updated_at=?3,
+                        schedule_version=schedule_version+1
+                     WHERE id=?4{only_if_ringing}"
+                ),
+                rusqlite::params![new_status, next, now, id2],
             )?;
             tx.commit()?;
-            Ok(())
+            Ok((delivering, changed))
         })
         .await?;
-    // Tell any browser endpoint to silence an in-progress playback.
-    state.audio.broadcast_stop(id);
-    state.emit("alarm", json!({"event": final_status, "alarm_id": id}));
+    release_deliveries(state, &delivering);
+    if changed > 0 {
+        if next.is_some() {
+            state.scheduler.wake();
+        }
+        state.emit("alarm", json!({"event": final_status, "alarm_id": id}));
+    }
     Ok(())
+}
+
+/// Deliveries still in flight for an alarm. Read in the transaction that
+/// ends them, so `release_deliveries` names exactly those.
+fn delivering_ids(c: &rusqlite::Connection, alarm_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut st =
+        c.prepare("SELECT id FROM alarm_deliveries WHERE alarm_id=?1 AND status='delivering'")?;
+    let ids = st
+        .query_map([alarm_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(ids)
+}
+
+/// Silence deliveries the user just ended and release the executor, which
+/// would otherwise hold every other alarm until the ack timeout. `finish`
+/// then finds them settled and leaves the user's outcome in place.
+fn release_deliveries(state: &AppState, delivery_ids: &[String]) {
+    for id in delivery_ids {
+        state.audio.broadcast_stop(id);
+        state
+            .audio
+            .resolve_ack_status(id, true, "stopped by user".into());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +572,7 @@ pub fn spawn(state: Arc<AppState>) -> SchedulerHandle {
 }
 
 async fn executor(state: Arc<AppState>, notify: Arc<Notify>) {
-    reconcile_after_boot(state.as_ref()).await;
+    reconcile_interrupted(state.as_ref(), "server restart").await;
     loop {
         let next = next_due(&state.db).await;
         match next {
@@ -532,7 +583,7 @@ async fn executor(state: Arc<AppState>, notify: Arc<Notify>) {
                 }
             }
             Some(t) => {
-                let wait = Duration::from_secs((t - util::now_unix()).max(0) as u64);
+                let wait = wait_for(t, util::now_unix());
                 tokio::select! {
                     _ = notify.notified() => {}
                     _ = tokio::time::sleep(wait) => {}
@@ -541,11 +592,20 @@ async fn executor(state: Arc<AppState>, notify: Arc<Notify>) {
             None => {
                 tokio::select! {
                     _ = notify.notified() => {}
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    _ = tokio::time::sleep(MAX_SLEEP) => {}
                 }
             }
         }
     }
+}
+
+/// Longest the executor sleeps before looking at the clock again. A timer
+/// does not count time the host was suspended and does not follow clock
+/// steps, so an alarm can only be as late as this after either.
+const MAX_SLEEP: Duration = Duration::from_secs(60);
+
+fn wait_for(due: i64, now: i64) -> Duration {
+    Duration::from_secs((due - now).max(0) as u64).min(MAX_SLEEP)
 }
 
 async fn next_due(db: &Db) -> Option<i64> {
@@ -565,15 +625,15 @@ async fn next_due(db: &Db) -> Option<i64> {
 /// delivery outcome is unknown — the delivery record exists, so do NOT
 /// redeliver; record the ambiguous outcome honestly. Recurring alarms are
 /// rescheduled to their next occurrence rather than left dead.
-async fn reconcile_after_boot(state: &AppState) {
+async fn reconcile_interrupted(state: &AppState, cause: &str) {
     let now = util::now_unix();
     let _ = state
         .db
         .exec(
             "UPDATE alarm_deliveries SET status='failed',
-                detail = detail || ' (interrupted by server restart)', finished_at=?1
+                detail = detail || ' (interrupted by ' || ?2 || ')', finished_at=?1
              WHERE status='delivering'",
-            vec![P::I(now)],
+            vec![P::I(now), P::T(cause.to_string())],
         )
         .await;
     let ringing = state
@@ -588,21 +648,7 @@ async fn reconcile_after_boot(state: &AppState) {
         .await
         .unwrap_or_default();
     for alarm in ringing {
-        let next = if alarm.recurrence != "none" {
-            match (alarm.local_time.clone(), TimeZone::get(&alarm.timezone)) {
-                (Some(hhmm), Ok(tz)) => next_clock_time(
-                    &tz,
-                    &hhmm,
-                    &alarm.recurrence,
-                    jiff::Timestamp::from_second(now).unwrap_or_else(|_| jiff::Timestamp::now()),
-                )
-                .ok()
-                .map(|z| z.timestamp().as_second()),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let next = next_occurrence_after(&alarm, now.max(alarm.next_due_utc.unwrap_or(now)));
         let status = if next.is_some() { "scheduled" } else { "done" };
         let _ = state
             .db
@@ -617,6 +663,27 @@ async fn reconcile_after_boot(state: &AppState) {
             )
             .await;
     }
+}
+
+/// A restore rewinds the alarms to when the backup was taken. A ring caught
+/// in that backup has no delivery running now, the executor is asleep on the
+/// old schedule, and satellites hold replicas of it.
+pub async fn after_restore(state: &AppState) {
+    reconcile_interrupted(state, "database restore").await;
+    state.scheduler.wake();
+    state.emit("alarm", json!({"event": "restored"}));
+}
+
+/// What became of a due alarm when the executor reached it.
+enum Claim {
+    /// It is ringing, under this delivery id.
+    Ringing(String),
+    /// That occurrence already has a delivery, so the alarm moved past it.
+    Skipped,
+    /// It is no longer due: each alarm ahead of it in the batch can hold the
+    /// executor for the whole ack timeout, and someone snoozed or canceled it
+    /// meanwhile.
+    Changed,
 }
 
 /// Atomically claim due alarms (delivery row + status change in one
@@ -637,12 +704,21 @@ async fn claim_and_deliver(state: &AppState) -> Result<(), ApiError> {
         .await?;
     for alarm in due {
         let occurrence = alarm.next_due_utc.unwrap_or(now);
+        let next = next_occurrence_after(&alarm, now.max(occurrence));
         let claimed = state
             .db
             .call({
                 let alarm = alarm.clone();
                 move |c| {
                     let tx = c.transaction()?;
+                    let rung = tx.execute(
+                        "UPDATE alarms SET status='ringing', updated_at=?1
+                         WHERE id=?2 AND status='scheduled' AND next_due_utc=?3",
+                        rusqlite::params![now, alarm.id, occurrence],
+                    )?;
+                    if rung == 0 {
+                        return Ok(Claim::Changed);
+                    }
                     let exec_id = util::new_id();
                     let delivery_id = util::new_id();
                     let inserted = tx.execute(
@@ -660,37 +736,47 @@ async fn claim_and_deliver(state: &AppState) -> Result<(), ApiError> {
                         ],
                     )?;
                     if inserted == 0 {
+                        // Already delivered for this occurrence (a satellite
+                        // ahead of this clock rang it). Move past it, or the
+                        // executor would keep finding it due.
+                        let status = if next.is_some() { "scheduled" } else { "done" };
+                        tx.execute(
+                            "UPDATE alarms SET status=?1, next_due_utc=?2, updated_at=?3,
+                                schedule_version=schedule_version+1
+                             WHERE id=?4",
+                            rusqlite::params![status, next, now, alarm.id],
+                        )?;
                         tx.commit()?;
-                        return Ok(None); // already delivered for this occurrence
+                        return Ok(Claim::Skipped);
                     }
-                    let updated = tx.execute(
-                        "UPDATE alarms SET status='ringing', updated_at=?1
-                         WHERE id=?2 AND status='scheduled'",
-                        rusqlite::params![now, alarm.id],
-                    )?;
                     tx.commit()?;
-                    Ok(if updated == 1 {
-                        Some((delivery_id, exec_id))
-                    } else {
-                        None
-                    })
+                    Ok(Claim::Ringing(delivery_id))
                 }
             })
             .await?;
-        let Some((delivery_id, _exec)) = claimed else {
-            continue;
-        };
-        state.emit(
-            "alarm",
-            json!({"event": "ringing", "alarm_id": alarm.id, "label": alarm.label}),
-        );
-        deliver(state, alarm, delivery_id, occurrence).await;
+        match claimed {
+            Claim::Ringing(delivery_id) => {
+                state.emit(
+                    "alarm",
+                    json!({"event": "ringing", "alarm_id": alarm.id, "label": alarm.label}),
+                );
+                deliver(state, alarm, delivery_id, occurrence).await;
+            }
+            // Satellites holding this occurrence need the new schedule.
+            Claim::Skipped => state.emit(
+                "alarm",
+                json!({"event": "skipped", "alarm_id": alarm.id, "occurrence_utc": occurrence}),
+            ),
+            Claim::Changed => {}
+        }
     }
     Ok(())
 }
 
 /// Next occurrence of a recurring alarm strictly after `now`; `None` for
-/// one-shot alarms (which are then done).
+/// one-shot alarms (which are then done). To move past an occurrence, pass
+/// `now.max(occurrence)`: a clock still behind it would land back on it, and
+/// its delivery row would then block the alarm for good.
 fn next_occurrence_after(alarm: &AlarmRow, now: i64) -> Option<i64> {
     if alarm.recurrence == "none" {
         return None;
@@ -717,39 +803,55 @@ async fn finish(
     detail: &str,
 ) {
     let now = util::now_unix();
-    let next = next_occurrence_after(alarm, now);
+    let next = next_occurrence_after(alarm, now.max(occurrence));
     let new_status = if next.is_some() { "scheduled" } else { "done" };
     let aid = alarm.id.clone();
     let did = delivery_id.to_string();
     let st = status.to_string();
     let det = detail.to_string();
-    let _ = state
+    // The two guards are independent. A snooze, stop or cancel ends both the
+    // delivery and the ringing, and those outcomes stand. A satellite's
+    // local report settles only the delivery, and the alarm must still move
+    // on from 'ringing'.
+    let settled = state
         .db
         .call(move |c| {
             let tx = c.transaction()?;
-            tx.execute(
-                "UPDATE alarm_deliveries SET status=?1, detail=?2, finished_at=?3 WHERE id=?4",
+            let delivery = tx.execute(
+                "UPDATE alarm_deliveries SET status=?1, detail=?2, finished_at=?3
+                 WHERE id=?4 AND status='delivering'",
                 rusqlite::params![st, det, now, did],
             )?;
-            tx.execute(
+            let alarm = tx.execute(
                 "UPDATE alarms SET status=?1, next_due_utc=?2, updated_at=?3,
-                    schedule_version=schedule_version+1 WHERE id=?4",
+                    schedule_version=schedule_version+1
+                 WHERE id=?4 AND status='ringing'",
                 rusqlite::params![new_status, next, now, aid],
             )?;
             tx.commit()?;
-            Ok(())
+            Ok((delivery > 0, alarm > 0))
         })
         .await;
-    state.emit(
-        "alarm",
-        json!({
-            "event": "delivered",
-            "alarm_id": alarm.id,
-            "status": status,
-            "detail": detail,
-            "occurrence_utc": occurrence,
-        }),
-    );
+    match settled {
+        Ok((true, _)) => state.emit(
+            "alarm",
+            json!({
+                "event": "delivered",
+                "alarm_id": alarm.id,
+                "status": status,
+                "detail": detail,
+                "occurrence_utc": occurrence,
+            }),
+        ),
+        // The delivery was settled and reported elsewhere; only the schedule
+        // moved, and this outcome was never stored.
+        Ok((false, true)) => state.emit(
+            "alarm",
+            json!({"event": "rescheduled", "alarm_id": alarm.id}),
+        ),
+        Ok((false, false)) => {}
+        Err(e) => tracing::error!(alarm = %alarm.id, error = %e, "recording alarm outcome failed"),
+    }
 }
 
 async fn deliver(state: &AppState, alarm: AlarmRow, delivery_id: String, occurrence: i64) {
@@ -801,11 +903,9 @@ async fn deliver(state: &AppState, alarm: AlarmRow, delivery_id: String, occurre
                 )
             } else {
                 let base = state
-                    .get_setting("public_url")
+                    .public_base()
                     .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| state.config.base_url());
+                    .unwrap_or_else(|_| state.config.base_url());
                 let url = format!("{}/media/{token}", base.trim_end_matches('/'));
                 match state.ha.play_media(&entity, &url, Some(alarm.volume)).await {
                     Ok(()) => (
@@ -842,9 +942,13 @@ async fn deliver(state: &AppState, alarm: AlarmRow, delivery_id: String, occurre
             let ack = state.audio.arm_ack(&delivery_id);
             match state.audio.send_to_channel(&channel, &cmd) {
                 Ok(()) => match state.audio.await_ack(ack, Duration::from_secs(20)).await {
-                    Ok((_, result)) => (
+                    Ok((true, result)) => (
                         "played".into(),
                         format!("played on browser endpoint '{ep_name}' ({result}){late_note}"),
+                    ),
+                    Ok((false, result)) => (
+                        "failed".into(),
+                        format!("browser playback failed: {result}"),
                     ),
                     Err(e) => (
                         "failed".into(),
@@ -1016,6 +1120,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             web_dir: dir.path().to_path_buf(),
             tls: None,
+            trusted_proxy: None,
         };
         let state = crate::build_state(config).await.unwrap();
         let now = util::now_unix();
@@ -1061,7 +1166,7 @@ mod tests {
             .await
             .unwrap();
 
-        reconcile_after_boot(state.as_ref()).await;
+        reconcile_interrupted(state.as_ref(), "server restart").await;
 
         let one = state
             .db
@@ -1110,5 +1215,458 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(deliveries, 0); // no new delivery row created by reconciliation
+    }
+
+    /// State with no executor running, so a test sets the order of events
+    /// itself, plus an owner to hang alarms on.
+    async fn test_state() -> (tempfile::TempDir, Arc<AppState>, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::Config {
+            data_dir: dir.path().to_path_buf(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            web_dir: dir.path().to_path_buf(),
+            tls: None,
+            trusted_proxy: None,
+        };
+        let state = crate::build_state(config).await.unwrap();
+        let uid = state
+            .db
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO users(username,display_name,password_hash,role,created_at)
+                     VALUES('o','o','x','owner',1)",
+                    [],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+        (dir, state, uid)
+    }
+
+    async fn seed_alarm(
+        state: &AppState,
+        uid: i64,
+        id: &str,
+        recurrence: &str,
+        due: i64,
+        status: &str,
+    ) -> AlarmRow {
+        let local_time = if recurrence == "none" {
+            P::Null
+        } else {
+            P::T("07:00".into())
+        };
+        state
+            .db
+            .exec(
+                "INSERT INTO alarms(id,owner_id,label,kind,timezone,local_time,recurrence,next_due_utc,status,created_at,updated_at)
+                 VALUES(?1,?2,'t','alarm','UTC',?3,?4,?5,?6,1,1)",
+                vec![
+                    P::T(id.into()),
+                    P::I(uid),
+                    local_time,
+                    P::T(recurrence.into()),
+                    P::I(due),
+                    P::T(status.into()),
+                ],
+            )
+            .await
+            .unwrap();
+        load_alarm(&state.db, id).await.unwrap()
+    }
+
+    /// Delivery row for `alarm_id`, with the id `d-<alarm_id>`.
+    async fn seed_delivery(state: &AppState, alarm_id: &str, occurrence: i64, status: &str) {
+        state
+            .db
+            .exec(
+                "INSERT INTO alarm_deliveries(id,alarm_id,occurrence_utc,execution_id,status,started_at)
+                 VALUES('d-' || ?1,?1,?2,'e',?3,?2)",
+                vec![
+                    P::T(alarm_id.into()),
+                    P::I(occurrence),
+                    P::T(status.into()),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// An alarm mid-ring, as `claim_and_deliver` leaves it for `finish`.
+    async fn seed_ringing(
+        state: &AppState,
+        uid: i64,
+        id: &str,
+        recurrence: &str,
+        occurrence: i64,
+    ) -> AlarmRow {
+        let alarm = seed_alarm(state, uid, id, recurrence, occurrence, "ringing").await;
+        seed_delivery(state, id, occurrence, "delivering").await;
+        alarm
+    }
+
+    async fn alarm_state(state: &AppState, id: &str) -> (String, Option<i64>) {
+        state
+            .db
+            .q1(
+                "SELECT status, next_due_utc FROM alarms WHERE id = ?1",
+                vec![P::T(id.into())],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn delivery_state(state: &AppState, id: &str) -> (String, String) {
+        state
+            .db
+            .q1(
+                "SELECT status, detail FROM alarm_deliveries WHERE id = ?1",
+                vec![P::T(id.into())],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Whether `due` is the first 07:00 after `now`, on the schedule the
+    /// seeded alarms use.
+    fn is_next_seven_oclock(due: i64, now: i64) -> bool {
+        due > now && due <= now + 86_400 && due % 86_400 == 7 * 3600
+    }
+
+    /// The next 07:00 after now, on the schedule the seeded alarms use.
+    fn next_seven_oclock() -> i64 {
+        let now = jiff::Timestamp::from_second(util::now_unix()).unwrap();
+        next_clock_time(&tz("UTC"), "07:00", "daily", now)
+            .unwrap()
+            .timestamp()
+            .as_second()
+    }
+
+    #[tokio::test]
+    async fn snooze_while_ringing_survives_finish() {
+        let (_dir, state, uid) = test_state().await;
+        let occurrence = util::now_unix() - 1;
+        let alarm = seed_ringing(&state, uid, "a", "none", occurrence).await;
+
+        let snoozed = snooze(&state, "a", uid, true).await.unwrap();
+        finish(&state, &alarm, "d-a", occurrence, "played", "played").await;
+
+        assert_eq!(
+            alarm_state(&state, "a").await,
+            ("scheduled".to_string(), snoozed["next_due_utc"].as_i64())
+        );
+        assert_eq!(delivery_state(&state, "d-a").await.0, "canceled");
+    }
+
+    #[tokio::test]
+    async fn cancel_while_ringing_survives_finish() {
+        let (_dir, state, uid) = test_state().await;
+        let occurrence = util::now_unix() - 1;
+        let alarm = seed_ringing(&state, uid, "a", "daily", occurrence).await;
+
+        stop_or_cancel(&state, "a", uid, true, "canceled")
+            .await
+            .unwrap();
+        finish(&state, &alarm, "d-a", occurrence, "played", "played").await;
+
+        assert_eq!(
+            alarm_state(&state, "a").await,
+            ("canceled".to_string(), None)
+        );
+        assert_eq!(delivery_state(&state, "d-a").await.0, "canceled");
+    }
+
+    /// Stop ends this ringing, not the schedule. `finish` no longer re-arms
+    /// a stopped alarm, so Stop has to do that itself.
+    #[tokio::test]
+    async fn stop_keeps_a_recurring_schedule_and_ends_a_one_shot() {
+        let (_dir, state, uid) = test_state().await;
+        let now = util::now_unix();
+        let daily = seed_ringing(&state, uid, "daily", "daily", now - 1).await;
+        let once = seed_ringing(&state, uid, "once", "none", now - 1).await;
+
+        stop_or_cancel(&state, "daily", uid, true, "done")
+            .await
+            .unwrap();
+        stop_or_cancel(&state, "once", uid, true, "done")
+            .await
+            .unwrap();
+        finish(&state, &daily, "d-daily", now - 1, "played", "played").await;
+        finish(&state, &once, "d-once", now - 1, "played", "played").await;
+
+        let (status, due) = alarm_state(&state, "daily").await;
+        assert_eq!(status, "scheduled");
+        assert!(is_next_seven_oclock(due.unwrap(), now));
+        assert_eq!(delivery_state(&state, "d-daily").await.0, "canceled");
+        assert_eq!(
+            alarm_state(&state, "once").await,
+            ("done".to_string(), None)
+        );
+    }
+
+    /// A Stop that lands just after `finish` has nothing left to stop. It
+    /// must not end tomorrow's alarm.
+    #[tokio::test]
+    async fn stop_after_the_ringing_ended_changes_nothing() {
+        let (_dir, state, uid) = test_state().await;
+        let due = next_seven_oclock();
+        seed_alarm(&state, uid, "daily", "daily", due, "scheduled").await;
+
+        stop_or_cancel(&state, "daily", uid, true, "done")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alarm_state(&state, "daily").await,
+            ("scheduled".to_string(), Some(due))
+        );
+    }
+
+    /// `record_local_firings` can settle the delivery while the executor
+    /// still waits on the ack. The record stands, and the alarm must still
+    /// leave 'ringing'.
+    #[tokio::test]
+    async fn finish_keeps_a_delivery_already_settled_and_still_advances_the_alarm() {
+        let (_dir, state, uid) = test_state().await;
+        let now = util::now_unix();
+        let alarm = seed_ringing(&state, uid, "a", "daily", now - 1).await;
+        state
+            .db
+            .exec(
+                "UPDATE alarm_deliveries SET status='played', detail='rang locally' WHERE id='d-a'",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        finish(&state, &alarm, "d-a", now - 1, "failed", "did not ack").await;
+
+        assert_eq!(
+            delivery_state(&state, "d-a").await,
+            ("played".to_string(), "rang locally".to_string())
+        );
+        let (status, due) = alarm_state(&state, "a").await;
+        assert_eq!(status, "scheduled");
+        assert!(is_next_seven_oclock(due.unwrap(), now));
+    }
+
+    /// Stop, snooze and cancel end the delivery they name at once, so the
+    /// executor is not held for the ack timeout, and leave every other
+    /// browser alone.
+    #[tokio::test]
+    async fn ending_a_ringing_alarm_releases_its_delivery_and_no_other() {
+        let (_dir, state, uid) = test_state().await;
+        let now = util::now_unix();
+        let mut rx = state.audio.attach_channel("c");
+        for (id, end) in [
+            ("stopped", "done"),
+            ("canceled", "canceled"),
+            ("snoozed", ""),
+        ] {
+            seed_ringing(&state, uid, id, "none", now - 1).await;
+            let delivery = format!("d-{id}");
+            let ack = state.audio.arm_ack(&delivery);
+
+            if end.is_empty() {
+                snooze(&state, id, uid, true).await.unwrap();
+            } else {
+                stop_or_cancel(&state, id, uid, true, end).await.unwrap();
+            }
+
+            let (ok, detail) = state
+                .audio
+                .await_ack(ack, Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(ok, "{detail}");
+            assert_eq!(detail, "stopped by user");
+            match rx.try_recv() {
+                Ok(AudioCommand::Stop { delivery_id }) => assert_eq!(delivery_id, delivery),
+                other => panic!("expected stop for {delivery}, got {other:?}"),
+            }
+        }
+
+        // Nothing was ringing here, so nothing is sent.
+        seed_alarm(&state, uid, "idle", "none", now + 3600, "scheduled").await;
+        stop_or_cancel(&state, "idle", uid, true, "canceled")
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A satellite running ahead of the server can report an occurrence the
+    /// server has not reached: the delivery row exists while the alarm still
+    /// points at it. Left there, the executor would spin on it forever.
+    #[tokio::test]
+    async fn delivery_conflict_moves_the_alarm_past_that_occurrence() {
+        let (_dir, state, uid) = test_state().await;
+        let now = util::now_unix();
+        seed_alarm(&state, uid, "daily", "daily", now - 60, "scheduled").await;
+        seed_delivery(&state, "daily", now - 60, "played").await;
+        seed_alarm(&state, uid, "once", "none", now - 60, "scheduled").await;
+        seed_delivery(&state, "once", now - 60, "played").await;
+
+        claim_and_deliver(&state).await.unwrap();
+
+        let (status, due) = alarm_state(&state, "daily").await;
+        assert_eq!(status, "scheduled");
+        assert!(due.unwrap() > now);
+        assert_eq!(
+            alarm_state(&state, "once").await,
+            ("done".to_string(), None)
+        );
+        let deliveries = state
+            .db
+            .q1("SELECT COUNT(*) FROM alarm_deliveries", vec![], |r| {
+                r.get::<_, i64>(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(deliveries, Some(2));
+    }
+
+    #[tokio::test]
+    async fn local_firing_ahead_of_the_server_clock_moves_past_that_occurrence() {
+        let (_dir, state, uid) = test_state().await;
+        let due = next_seven_oclock();
+        state
+            .db
+            .exec(
+                r#"INSERT INTO endpoints(id,name,kind,config,created_at)
+                   VALUES('ep','Sat','satellite','{"satellite_id":"s1"}',1)"#,
+                vec![],
+            )
+            .await
+            .unwrap();
+        seed_alarm(&state, uid, "daily", "daily", due, "scheduled").await;
+        state
+            .db
+            .exec("UPDATE alarms SET endpoint_id='ep'", vec![])
+            .await
+            .unwrap();
+
+        let fired = [adrian_protocol::LocalAlarmFiring {
+            alarm_id: "daily".into(),
+            occurrence_unix: due,
+            fired_at_unix: due,
+        }];
+        let recorded = replicas::record_local_firings(&state, "s1", "Sat", &fired)
+            .await
+            .unwrap();
+
+        assert_eq!(recorded, 1);
+        let (status, next) = alarm_state(&state, "daily").await;
+        assert_eq!(status, "scheduled");
+        assert!(next.unwrap() > due);
+    }
+
+    /// Same trap on boot: an interrupted occurrence still ahead of the clock
+    /// must not be rescheduled onto itself.
+    #[tokio::test]
+    async fn reconcile_moves_past_an_occurrence_still_ahead_of_the_clock() {
+        let (_dir, state, uid) = test_state().await;
+        let due = next_seven_oclock();
+        seed_ringing(&state, uid, "daily", "daily", due).await;
+
+        reconcile_interrupted(&state, "server restart").await;
+
+        let (status, next) = alarm_state(&state, "daily").await;
+        assert_eq!(status, "scheduled");
+        assert!(next.unwrap() > due);
+    }
+
+    /// A clock stepped back mid-ring: the occurrence is ahead of it again,
+    /// and landing back on that occurrence would hit its own delivery row.
+    #[tokio::test]
+    async fn ending_a_ring_moves_past_an_occurrence_ahead_of_the_clock() {
+        let (_dir, state, uid) = test_state().await;
+        let due = next_seven_oclock();
+        let finished = seed_ringing(&state, uid, "finished", "daily", due).await;
+        seed_ringing(&state, uid, "stopped", "daily", due).await;
+
+        finish(&state, &finished, "d-finished", due, "played", "played").await;
+        stop_or_cancel(&state, "stopped", uid, true, "done")
+            .await
+            .unwrap();
+
+        for id in ["finished", "stopped"] {
+            let (status, next) = alarm_state(&state, id).await;
+            assert_eq!(status, "scheduled", "{id}");
+            assert!(next.unwrap() > due, "{id}");
+        }
+    }
+
+    /// One delivery can hold the executor for the whole ack timeout, so the
+    /// rest of its batch can change before their turn comes.
+    #[tokio::test]
+    async fn alarms_changed_while_their_batch_waits_are_not_rung() {
+        let (_dir, state, uid) = test_state().await;
+        let now = util::now_unix();
+        state
+            .db
+            .exec(
+                r#"INSERT INTO endpoints(id,name,kind,config,created_at)
+                   VALUES('ep','Tab','browser','{"channel_id":"c"}',1)"#,
+                vec![],
+            )
+            .await
+            .unwrap();
+        seed_alarm(&state, uid, "first", "none", now - 3, "scheduled").await;
+        seed_alarm(&state, uid, "snoozed", "none", now - 2, "scheduled").await;
+        seed_alarm(&state, uid, "canceled", "none", now - 1, "scheduled").await;
+        state
+            .db
+            .exec("UPDATE alarms SET endpoint_id='ep'", vec![])
+            .await
+            .unwrap();
+        let mut rx = state.audio.attach_channel("c");
+
+        let batch = tokio::spawn({
+            let state = state.clone();
+            async move { claim_and_deliver(&state).await }
+        });
+        let delivery_id = match rx.recv().await {
+            Ok(AudioCommand::Play { delivery_id, .. }) => delivery_id,
+            other => panic!("expected play, got {other:?}"),
+        };
+
+        let snoozed = snooze(&state, "snoozed", uid, true).await.unwrap();
+        stop_or_cancel(&state, "canceled", uid, true, "canceled")
+            .await
+            .unwrap();
+        state
+            .audio
+            .resolve_ack_status(&delivery_id, true, "played".into());
+        batch.await.unwrap().unwrap();
+
+        assert_eq!(
+            alarm_state(&state, "snoozed").await,
+            ("scheduled".to_string(), snoozed["next_due_utc"].as_i64())
+        );
+        assert_eq!(
+            alarm_state(&state, "canceled").await,
+            ("canceled".to_string(), None)
+        );
+        let deliveries = state
+            .db
+            .q1("SELECT COUNT(*) FROM alarm_deliveries", vec![], |r| {
+                r.get::<_, i64>(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(deliveries, Some(1), "only 'first' was rung");
+    }
+
+    #[test]
+    fn executor_sleep_is_capped_so_it_keeps_checking_the_clock() {
+        let now = 1_800_000_000;
+        assert_eq!(wait_for(now + 8 * 3600, now), Duration::from_secs(60));
+        assert_eq!(wait_for(now + 5, now), Duration::from_secs(5));
+        assert_eq!(wait_for(now - 5, now), Duration::ZERO);
     }
 }

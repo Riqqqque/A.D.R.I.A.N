@@ -51,7 +51,12 @@
   Home Assistant token. Nothing else is affected.
 - TLS is off by default and bind is loopback. For LAN access set
   `ADRIAN_BIND=0.0.0.0:8787` and either enable built-in TLS or put a
-  TLS-terminating reverse proxy in front.
+  TLS-terminating reverse proxy in front. Behind a proxy, set
+  `ADRIAN_TRUSTED_PROXY` to its address; without it the session cookie is
+  not marked `Secure` and all clients share one login rate limit. Forwarded
+  headers are ignored from every other address, and the proxy must set
+  `X-Forwarded-Proto` itself and append the client to `X-Forwarded-For`, or
+  a client could forge them.
 - Home Assistant playback "success" means the service call was accepted;
   audibility is not confirmed by this build.
 - Browser audio endpoints require the tab to stay open and logged in.

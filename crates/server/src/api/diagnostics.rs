@@ -148,6 +148,7 @@ async fn restore(
         return Err(ApiError::NotFound(format!("backup '{name}'")));
     }
     s.db.restore_from(&path).await?;
+    crate::scheduler::after_restore(&s).await;
     s.audit(
         Some(user.id),
         "user",

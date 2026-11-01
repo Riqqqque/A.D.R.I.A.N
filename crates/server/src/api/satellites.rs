@@ -7,16 +7,16 @@
 //! endpoint, runs the normal assistant turn, and returns the reply text.
 
 use crate::api::chat;
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, client_ip};
 use crate::db::P;
 use crate::error::ApiError;
 use crate::providers;
 use crate::state::AppState;
 use crate::util;
 use adrian_protocol as proto;
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -30,16 +30,12 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const PAIRING_TTL_SECS: i64 = 300; // 5 minutes
 const MAX_WAV_BYTES: usize = 25 * 1024 * 1024;
 
 pub fn routes() -> Router<AppState> {
-    // The utterance route carries WAV bodies up to MAX_WAV_BYTES; the rest
-    // stay under axum's default 2MB request-body limit.
-    let voice = Router::new()
-        .route("/api/satellite/utterance", post(utterance))
-        .layer(DefaultBodyLimit::max(MAX_WAV_BYTES));
     Router::new()
         .route("/api/satellites", get(list_satellites))
         .route("/api/satellites/pairing-code", post(mint_code))
@@ -47,7 +43,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/satellite/pair", post(pair))
         .route("/api/satellite/status", get(status))
         .route("/api/satellite/session", get(session))
-        .merge(voice)
+        .route("/api/satellite/utterance", post(utterance))
 }
 
 // ---------- session-authed (web UI) ----------
@@ -148,6 +144,19 @@ async fn revoke_satellite(
     if n == 0 {
         return Err(ApiError::NotFound("satellite".into()));
     }
+    s.satellites.disconnect(&id);
+    // Left enabled, it would stay a default alarm target nothing can answer.
+    let retired =
+        s.db.exec(
+            "UPDATE endpoints SET enabled = 0
+             WHERE kind = 'satellite' AND enabled = 1
+               AND json_extract(config, '$.satellite_id') = ?1",
+            vec![P::T(id.clone())],
+        )
+        .await?;
+    if retired > 0 {
+        s.emit("endpoint", json!({"event": "disabled", "satellite_id": id}));
+    }
     s.audit(
         Some(user.id),
         "user",
@@ -221,13 +230,15 @@ struct PairBody {
 async fn pair(
     State(s): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(b): Json<PairBody>,
 ) -> Result<Json<Value>, ApiError> {
     // Brute-force guard: 6-digit codes are guessable — throttle attempts
     // per source IP like login and setup claim.
+    let ip = client_ip(&headers, addr, &s.config);
     if !s
         .rate_limit
-        .check(&format!("pair:{}", addr.ip()), 10, Duration::from_secs(60))
+        .check(&format!("pair:{ip}"), 10, Duration::from_secs(60))
     {
         return Err(ApiError::RateLimited);
     }
@@ -302,17 +313,27 @@ async fn utterance(
     State(s): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<UtteranceQuery>,
-    body: Bytes,
+    body: Body,
 ) -> Result<impl IntoResponse, ApiError> {
+    // The token comes before the body: only a paired device gets to make the
+    // server buffer MAX_WAV_BYTES.
     let sat = satellite_from_headers(&s, &headers).await?;
-    if body.len() < 100 || body.len() > MAX_WAV_BYTES {
-        return Err(ApiError::BadRequest(format!(
+    let bad_size = || {
+        ApiError::BadRequest(format!(
             "wav body must be 100B-{}MB",
             MAX_WAV_BYTES / 1024 / 1024
-        )));
+        ))
+    };
+    let body = axum::body::to_bytes(body, MAX_WAV_BYTES)
+        .await
+        .map_err(|_| bad_size())?;
+    if body.len() < 100 {
+        return Err(bad_size());
     }
     let state = Arc::new(s);
 
+    // Uploads and STT both take time; the device may be revoked meanwhile.
+    sat_auth_user(&state, &sat).await?;
     ensure_stt_allowed(&state).await?;
     let transcript =
         providers::transcribe_wav(&state, Some(sat.user_id), "satellite", body.to_vec()).await?;
@@ -380,13 +401,15 @@ async fn ensure_stt_allowed(state: &AppState) -> Result<(), ApiError> {
         return Ok(());
     }
     let rows = providers::load_provider_rows(&state.db).await?;
-    let base = rows
+    let row = rows
         .iter()
         .find(|r| r.enabled && r.is_default)
-        .or_else(|| rows.iter().find(|r| r.enabled))
-        .map(|r| r.base_url.clone())
-        .unwrap_or_default();
-    if !providers::base_is_local(&base) {
+        .or_else(|| rows.iter().find(|r| r.enabled));
+    // No provider means no egress; transcribe_wav reports what is missing.
+    let Some(row) = row else {
+        return Ok(());
+    };
+    if !providers::base_is_local(&row.base_url) {
         return Err(ApiError::Forbidden(
             "strict-local mode blocks cloud egress — voice transcription needs a local STT endpoint"
                 .into(),
@@ -396,16 +419,20 @@ async fn ensure_stt_allowed(state: &AppState) -> Result<(), ApiError> {
 }
 
 /// The satellite's owner as an `AuthUser` for the assistant pipeline.
+/// Unauthorized once the satellite is revoked or its owner disabled, so a
+/// `Satellite` authenticated earlier cannot keep acting.
 async fn sat_auth_user(state: &AppState, sat: &Satellite) -> Result<AuthUser, ApiError> {
     let (username, role) = state
         .db
         .q1(
-            "SELECT username, role FROM users WHERE id = ?1",
-            vec![P::I(sat.user_id)],
+            "SELECT u.username, u.role FROM satellites s
+             JOIN users u ON u.id = s.user_id
+             WHERE s.id = ?1 AND s.revoked = 0 AND u.disabled_at IS NULL",
+            vec![P::T(sat.id.clone())],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
         .await?
-        .ok_or_else(|| ApiError::internal_msg("satellite owner missing"))?;
+        .ok_or(ApiError::Unauthorized)?;
     Ok(AuthUser {
         id: sat.user_id,
         username,
@@ -422,12 +449,12 @@ type SatTx = tokio::sync::mpsc::UnboundedSender<WsMessage>;
 
 /// Connected satellites, keyed by satellite id — lets the scheduler and
 /// other services push (alarm playback, future notify/wake) to a live
-/// device. A second connection for the same satellite replaces the first;
-/// each registration carries a conn id so a dying session cannot
-/// unregister a newer one.
+/// device. A second connection for the same satellite replaces the first,
+/// which is told to end; each registration carries a conn id so a dying
+/// session cannot unregister a newer one.
 #[derive(Default)]
 pub struct SatelliteHub {
-    sessions: Mutex<HashMap<String, (u64, SatTx)>>,
+    sessions: Mutex<HashMap<String, (u64, SatTx, CancellationToken)>>,
     next_conn: AtomicU64,
 }
 
@@ -436,19 +463,40 @@ impl SatelliteHub {
         Self::default()
     }
 
-    fn register(&self, satellite_id: &str, tx: SatTx) -> u64 {
+    fn register(&self, satellite_id: &str, tx: SatTx) -> (u64, CancellationToken) {
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed) + 1;
-        self.sessions
+        let end = CancellationToken::new();
+        let replaced = self
+            .sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(satellite_id.to_string(), (conn, tx));
-        conn
+            .insert(satellite_id.to_string(), (conn, tx, end.clone()));
+        // Only the newest socket is tracked, so a later revoke could not
+        // reach this one.
+        if let Some((_, _, old)) = replaced {
+            old.cancel();
+        }
+        (conn, end)
     }
 
     fn unregister(&self, satellite_id: &str, conn: u64) {
         let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if map.get(satellite_id).is_some_and(|(c, _)| *c == conn) {
+        if map.get(satellite_id).is_some_and(|(c, _, _)| *c == conn) {
             map.remove(satellite_id);
+        }
+    }
+
+    /// End a satellite's live session. Its read loop stops at once, so
+    /// nothing the device still sends is handled, whether or not it would
+    /// have honored a Close frame.
+    pub fn disconnect(&self, satellite_id: &str) {
+        let session = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(satellite_id);
+        if let Some((_, _, end)) = session {
+            end.cancel();
         }
     }
 
@@ -477,7 +525,7 @@ impl SatelliteHub {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(satellite_id)
-            .map(|(_, tx)| tx.clone());
+            .map(|(_, tx, _)| tx.clone());
         let Some(tx) = tx else {
             return Err(ApiError::NotConfigured(format!(
                 "satellite '{satellite_id}' is not connected"
@@ -543,10 +591,24 @@ async fn session(
         .on_upgrade(move |sock| session_loop(s, sat, sock)))
 }
 
+/// Register a session, unless the satellite lost its rights after the
+/// upgrade request was checked: a revoke in that gap found nothing to
+/// disconnect. One that lands after this check finds the registration.
+async fn admit(s: &AppState, sat: &Satellite, tx: SatTx) -> Option<(u64, CancellationToken)> {
+    let (conn, end) = s.satellites.register(&sat.id, tx);
+    if sat_auth_user(s, sat).await.is_err() {
+        s.satellites.unregister(&sat.id, conn);
+        return None;
+    }
+    Some((conn, end))
+}
+
 async fn session_loop(s: AppState, sat: Satellite, sock: WebSocket) {
     let (mut sink, mut stream) = sock.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
-    let conn = s.satellites.register(&sat.id, tx.clone());
+    let Some((conn, end)) = admit(&s, &sat, tx.clone()).await else {
+        return;
+    };
     let _ =
         s.db.exec(
             "UPDATE satellites SET last_seen = ?1 WHERE id = ?2",
@@ -567,8 +629,13 @@ async fn session_loop(s: AppState, sat: Satellite, sock: WebSocket) {
     let mut capture: Option<Capture> = None;
     let mut seen_keys: HashSet<String> = HashSet::new();
 
-    while let Some(msg) = stream.next().await {
-        let Ok(msg) = msg else { break };
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = end.cancelled() => break,
+            msg = stream.next() => msg,
+        };
+        let Some(Ok(msg)) = msg else { break };
         match msg {
             WsMessage::Binary(b) => {
                 if let Some(c) = &mut capture {
@@ -692,6 +759,12 @@ async fn finish_utterance(
     conv: Arc<Mutex<Option<String>>>,
     tx: &SatTx,
 ) {
+    // Checked here and again after STT: a revoked device spends nothing, and
+    // one revoked while STT runs gets no turn.
+    if let Err(e) = sat_auth_user(state, sat).await {
+        send_ack(tx, "turn", false, e.to_string());
+        return;
+    }
     if let Err(e) = ensure_stt_allowed(state).await {
         send_ack(tx, "stt", false, e.to_string());
         return;
@@ -776,4 +849,64 @@ async fn finish_utterance(
             &error,
         )
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn state_with_satellite(revoked: i64) -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::Config {
+            data_dir: dir.path().to_path_buf(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            web_dir: dir.path().to_path_buf(),
+            tls: None,
+            trusted_proxy: None,
+        };
+        let state = crate::build_state(config).await.unwrap();
+        state
+            .db
+            .exec(
+                "INSERT INTO users(id,username,display_name,password_hash,role,created_at)
+                 VALUES(1,'owner','Owner','x','owner',1)",
+                vec![],
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .exec(
+                "INSERT INTO satellites(id,user_id,name,token_hash,paired_at,revoked)
+                 VALUES('sat1',1,'PC','hash',1,?1)",
+                vec![P::I(revoked)],
+            )
+            .await
+            .unwrap();
+        (state, dir)
+    }
+
+    fn sat() -> Satellite {
+        Satellite {
+            id: "sat1".into(),
+            name: "PC".into(),
+            user_id: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_revoked_during_its_upgrade_is_not_admitted() {
+        let (state, _dir) = state_with_satellite(1).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(admit(&state, &sat(), tx).await.is_none());
+        assert!(!state.satellites.connected("sat1"));
+    }
+
+    #[tokio::test]
+    async fn a_live_satellite_is_admitted() {
+        let (state, _dir) = state_with_satellite(0).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(admit(&state, &sat(), tx).await.is_some());
+        assert!(state.satellites.connected("sat1"));
+    }
 }

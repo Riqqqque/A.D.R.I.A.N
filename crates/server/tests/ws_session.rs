@@ -72,6 +72,7 @@ async fn harness() -> Harness {
         bind: "127.0.0.1:0".parse().unwrap(),
         web_dir: dir.path().join("web"),
         tls: None,
+        trusted_proxy: None,
     };
     let state = build_state(config).await.unwrap();
     start_services(&state).await.unwrap();
@@ -235,6 +236,190 @@ async fn session_requires_device_token() {
     );
     // Valid token upgrades.
     let _ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+}
+
+async fn revoke(h: &Harness) {
+    let router = build_router(h.state.clone());
+    let (s, _, res) = json_request(
+        &router,
+        "DELETE",
+        &format!("/api/satellites/{}", h.satellite_id),
+        None,
+        Some(&h.cookie),
+        Some(&h.csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+}
+
+/// The server dropped this socket, and acked nothing on the way out.
+async fn assert_session_ended(
+    ws: &mut (impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(left, ws.next()).await {
+            Err(_) => panic!("session still open 5 s after the revoke"),
+            Ok(None | Some(Err(_)) | Some(Ok(WsMsg::Close(_)))) => return,
+            Ok(Some(Ok(WsMsg::Text(t)))) => {
+                let env: Envelope = serde_json::from_str(&t).expect("envelope json");
+                assert!(
+                    !matches!(env.message, Message::Ack { .. }),
+                    "acked after the revoke: {:?}",
+                    env.message
+                );
+            }
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn revoking_a_satellite_ends_its_live_session() {
+    let h = harness().await;
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    recv_sync(&mut ws, Duration::from_secs(10)).await;
+
+    revoke(&h).await;
+
+    // A device that carries on as if nothing happened gets nowhere.
+    let status = Envelope::new(Message::Status {
+        state: adrian_protocol::SatelliteState::Idle,
+        detail: None,
+    });
+    let _ = send_env(&mut ws, status).await;
+    assert_session_ended(&mut ws).await;
+    assert!(!h.state.satellites.connected(&h.satellite_id));
+
+    let err = ws_connect(h.addr, Some(&h.device_token)).await.unwrap_err();
+    assert!(
+        matches!(err, tokio_tungstenite::tungstenite::Error::Http(_)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn revoking_reaches_every_socket_on_the_token() {
+    let h = harness().await;
+    let mut first = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    recv_sync(&mut first, Duration::from_secs(10)).await;
+    let mut second = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    recv_sync(&mut second, Duration::from_secs(10)).await;
+
+    revoke(&h).await;
+
+    assert_session_ended(&mut first).await;
+    assert_session_ended(&mut second).await;
+}
+
+/// Send one short utterance and wait for the server to take it.
+async fn send_utterance<S>(ws: &mut S)
+where
+    S: futures_util::Sink<WsMsg, Error = tokio_tungstenite::tungstenite::Error>
+        + StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let start = Envelope::new(Message::AudioSessionStart {
+        room: None,
+        sample_rate: 16000,
+    });
+    send_env(ws, start).await.unwrap();
+    let ack = recv_env(ws, Duration::from_secs(5)).await;
+    assert!(matches!(ack.message, Message::Ack { ok: true, .. }));
+    ws.send(WsMsg::Binary(vec![0u8; 3200].into()))
+        .await
+        .unwrap();
+    let end = Envelope::new(Message::AudioSessionEnd {
+        reason: SessionEndReason::Endpointed,
+    });
+    send_env(ws, end).await.unwrap();
+    let ack = recv_env(ws, Duration::from_secs(5)).await;
+    assert!(matches!(ack.message, Message::Ack { ok: true, .. }));
+}
+
+fn assert_turn_ack_refused(env: &Envelope) {
+    assert_eq!(env.request_id, "turn", "{:?}", env.message);
+    assert!(
+        matches!(env.message, Message::Ack { ok: false, .. }),
+        "{:?}",
+        env.message
+    );
+}
+
+/// Run an audio session on an open socket after `sql` takes the satellite's
+/// rights away behind the hub's back, and expect no STT and no turn.
+async fn assert_turn_refused(h: &Harness, sql: &str) {
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    recv_sync(&mut ws, Duration::from_secs(10)).await;
+    h.state.db.exec(sql, vec![]).await.unwrap();
+
+    send_utterance(&mut ws).await;
+    assert_turn_ack_refused(&recv_env(&mut ws, Duration::from_secs(15)).await);
+}
+
+#[tokio::test]
+async fn revoked_satellite_cannot_run_a_turn_on_an_open_socket() {
+    let h = harness().await;
+    assert_turn_refused(&h, "UPDATE satellites SET revoked = 1").await;
+}
+
+#[tokio::test]
+async fn disabled_owner_cannot_run_a_turn_on_an_open_socket() {
+    let h = harness().await;
+    assert_turn_refused(&h, "UPDATE users SET disabled_at = 1").await;
+}
+
+/// Start an STT that revokes the device while it runs; returns its address.
+async fn revoking_stt(state: Arc<adrian_server::AppState>) -> SocketAddr {
+    let stt = axum::Router::new().route(
+        "/v1/audio/transcriptions",
+        axum::routing::post(move |_: axum::body::Bytes| {
+            let state = state.clone();
+            async move {
+                state
+                    .db
+                    .exec("UPDATE satellites SET revoked = 1", vec![])
+                    .await
+                    .unwrap();
+                axum::Json(json!({"text": "turn off the lights"}))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, stt).await.unwrap() });
+    addr
+}
+
+#[tokio::test]
+async fn satellite_revoked_during_stt_gets_no_turn() {
+    let h = harness().await;
+    let stt = revoking_stt(h.state.clone()).await;
+    let router = build_router(h.state.clone());
+    let (s, _, res) = json_request(
+        &router,
+        "POST",
+        "/api/integrations/providers",
+        Some(json!({"kind": "openai_compatible", "label": "Test",
+                    "base_url": format!("http://{stt}/v1"), "model": "m"})),
+        Some(&h.cookie),
+        Some(&h.csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    recv_sync(&mut ws, Duration::from_secs(10)).await;
+
+    send_utterance(&mut ws).await;
+
+    let heard = recv_env(&mut ws, Duration::from_secs(15)).await;
+    assert!(
+        matches!(heard.message, Message::Transcript { .. }),
+        "{:?}",
+        heard.message
+    );
+    assert_turn_ack_refused(&recv_env(&mut ws, Duration::from_secs(15)).await);
 }
 
 #[tokio::test]
@@ -661,4 +846,157 @@ async fn local_firing_before_server_delivery_advances_the_alarm() {
         .unwrap();
     assert_eq!(alarm_status, "done");
     assert!(delivery(&h, "other1").await.is_none());
+}
+
+/// Ring an alarm on the connected satellite and leave its ack outstanding:
+/// the window in which someone can snooze, stop or cancel it.
+async fn ring(
+    h: &Harness,
+    ws: &mut (impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin),
+    id: &str,
+    recurrence: &str,
+    endpoint_id: &str,
+) -> Envelope {
+    h.state
+        .db
+        .exec(
+            "INSERT INTO alarms(id,owner_id,label,kind,timezone,local_time,recurrence,next_due_utc,endpoint_id,status,created_at,updated_at)
+             VALUES(?1,1,'wake up','alarm','UTC','07:00',?2,?3,?4,'scheduled',1,1)",
+            vec![
+                adrian_server::db::P::T(id.into()),
+                adrian_server::db::P::T(recurrence.into()),
+                adrian_server::db::P::I(adrian_server::util::now_unix() - 1),
+                adrian_server::db::P::T(endpoint_id.into()),
+            ],
+        )
+        .await
+        .unwrap();
+    h.state.scheduler.wake();
+    let speak = recv_env(ws, Duration::from_secs(15)).await;
+    assert!(
+        matches!(speak.message, Message::Speak { .. }),
+        "expected speak, got {:?}",
+        speak.message
+    );
+    speak
+}
+
+/// The satellite finishes playing after the user already acted.
+async fn late_ack<S>(ws: &mut S, speak: &Envelope)
+where
+    S: futures_util::Sink<WsMsg, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let mut ack = Envelope::new(Message::Ack {
+        ok: true,
+        detail: Some("played".into()),
+    });
+    ack.request_id = speak.request_id.clone();
+    send_env(ws, ack).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+async fn alarm_row(h: &Harness, id: &str) -> (String, Option<i64>) {
+    h.state
+        .db
+        .q1(
+            "SELECT status, next_due_utc FROM alarms WHERE id = ?1",
+            vec![adrian_server::db::P::T(id.into())],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn snooze_while_ringing_survives_the_late_ack() {
+    let h = harness().await;
+    let ep = satellite_endpoint(&h).await;
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    let speak = ring(&h, &mut ws, "snz", "none", &ep).await;
+
+    let router = build_router(h.state.clone());
+    let (s, _, res) = json_request(
+        &router,
+        "POST",
+        "/api/alarms/snz/snooze",
+        Some(json!({})),
+        Some(&h.cookie),
+        Some(&h.csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    late_ack(&mut ws, &speak).await;
+
+    let snoozed_to = res["alarm"]["next_due_utc"].as_i64();
+    assert!(snoozed_to.is_some(), "{res}");
+    assert_eq!(
+        alarm_row(&h, "snz").await,
+        ("scheduled".to_string(), snoozed_to)
+    );
+    assert_eq!(delivery(&h, "snz").await.unwrap().0, "canceled");
+}
+
+#[tokio::test]
+async fn cancel_while_ringing_survives_the_late_ack() {
+    let h = harness().await;
+    let ep = satellite_endpoint(&h).await;
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    let speak = ring(&h, &mut ws, "cnl", "daily", &ep).await;
+
+    let router = build_router(h.state.clone());
+    let (s, _, res) = json_request(
+        &router,
+        "DELETE",
+        "/api/alarms/cnl",
+        None,
+        Some(&h.cookie),
+        Some(&h.csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    late_ack(&mut ws, &speak).await;
+
+    assert_eq!(alarm_row(&h, "cnl").await, ("canceled".to_string(), None));
+    assert_eq!(delivery(&h, "cnl").await.unwrap().0, "canceled");
+}
+
+#[tokio::test]
+async fn stop_ends_the_ringing_but_keeps_a_daily_schedule() {
+    let h = harness().await;
+    let ep = satellite_endpoint(&h).await;
+    let mut ws = ws_connect(h.addr, Some(&h.device_token)).await.unwrap();
+    let router = build_router(h.state.clone());
+    let now = adrian_server::util::now_unix();
+
+    let speak = ring(&h, &mut ws, "daily", "daily", &ep).await;
+    let (s, _, res) = json_request(
+        &router,
+        "POST",
+        "/api/alarms/daily/stop",
+        Some(json!({})),
+        Some(&h.cookie),
+        Some(&h.csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    late_ack(&mut ws, &speak).await;
+    let (status, due) = alarm_row(&h, "daily").await;
+    assert_eq!(status, "scheduled");
+    assert!(due.unwrap() > now);
+
+    // A one-shot has nothing left to come back to.
+    let speak = ring(&h, &mut ws, "once", "none", &ep).await;
+    let (s, _, res) = json_request(
+        &router,
+        "POST",
+        "/api/alarms/once/stop",
+        Some(json!({})),
+        Some(&h.cookie),
+        Some(&h.csrf),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{res}");
+    late_ack(&mut ws, &speak).await;
+    assert_eq!(alarm_row(&h, "once").await, ("done".to_string(), None));
 }

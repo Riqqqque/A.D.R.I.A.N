@@ -152,7 +152,7 @@ pub async fn record_local_firings(
             "rang locally on satellite '{satellite_name}' at {fired_local} from its alarm replica (server delivery unavailable; audibility not confirmed)"
         );
         let now = util::now_unix();
-        let next = next_occurrence_after(&alarm, now);
+        let next = next_occurrence_after(&alarm, now.max(f.occurrence_unix));
         let alarm_c = alarm.clone();
         let occurrence = f.occurrence_unix;
         let applied = state

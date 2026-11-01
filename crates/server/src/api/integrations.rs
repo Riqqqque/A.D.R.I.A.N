@@ -216,6 +216,8 @@ async fn test_provider(
     user.require_owner()?;
     let (provider, row) =
         providers::load_provider(&s.db, &s.secret_box, s.http.clone(), Some(&id)).await?;
+    // A test sends the key out like any other call.
+    providers::ensure_egress_allowed(&s, &row).await?;
     match provider.test().await {
         Ok(msg) => Ok(Json(json!({
             "ok": true, "detail": msg, "kind": row.kind, "model": row.model,
@@ -245,19 +247,23 @@ async fn get_ha(_user: AuthUser, State(s): State<AppState>) -> Result<Json<Value
             },
         )
         .await?;
-    let status = s.ha.status_json_now();
-    let configured = match &row {
-        Some((url, secret, enabled, last_ok, last_err)) => json!({
-            "configured": true,
-            "url": url,
-            "has_token": s.has_secret(secret).await?,
-            "enabled": *enabled != 0,
-            "last_ok_at": last_ok,
-            "last_error": last_err,
-        }),
-        None => json!({"configured": false}),
+    let Some((url, secret, enabled, last_ok, last_err)) = row else {
+        return Ok(Json(json!({"configured": false, "connected": false})));
     };
-    Ok(Json(json!({"connection": configured, "live": status})))
+    // `configured` comes from the row: the supervisor's status only catches
+    // up after it reloads.
+    let live = s.ha.status_json_now();
+    let last_ok_at = live["last_ok_at"].as_i64().or(last_ok);
+    let last_error = live["last_error"].as_str().map(str::to_string).or(last_err);
+    Ok(Json(json!({
+        "configured": true,
+        "url": url,
+        "has_token": s.has_secret(&secret).await?,
+        "enabled": enabled != 0,
+        "connected": live["connected"].as_bool().unwrap_or(false),
+        "last_ok_at": last_ok_at,
+        "last_error": last_error,
+    })))
 }
 
 #[derive(Deserialize)]

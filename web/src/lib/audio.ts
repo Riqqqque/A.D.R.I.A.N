@@ -5,6 +5,7 @@ import { post } from './api';
 
 let source: EventSource | null = null;
 let current: HTMLAudioElement | null = null;
+let currentId = '';
 let channelId = '';
 let endpointId = '';
 
@@ -45,14 +46,32 @@ export async function enableBrowserAudio(name: string): Promise<{ endpoint_id: s
   return res;
 }
 
-export function disableBrowserAudio() {
+/** True while this tab has had no click or key press, as after the browser
+ * restores it: autoplay may block its alarms until then. */
+export function audioNeedsGesture(): boolean {
+  return navigator.userActivation?.hasBeenActive === false;
+}
+
+/** Stop being a speaker. Resolves false when the server could not be told,
+ * which leaves its endpoint enabled and a possible default alarm target. */
+export async function disableBrowserAudio(): Promise<boolean> {
+  const closing = { endpoint_id: endpointId, channel_id: channelId };
   localStorage.removeItem(LS_KEY);
   source?.close();
   source = null;
   current?.pause();
   current = null;
+  currentId = '';
   endpointId = '';
   channelId = '';
+  if (!closing.endpoint_id) return true;
+  try {
+    // A no-op once the endpoint has been removed.
+    await post('/api/audio/unregister', closing);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function openChannel() {
@@ -85,20 +104,23 @@ async function handle(cmd: Cmd) {
     audio.volume = Math.min(1, Math.max(0, cmd.volume ?? 0.7));
     current = audio;
     const id = cmd.delivery_id ?? '';
-    audio.onended = () => void ack(id, 'played');
-    audio.onerror = () => void ack(id, 'playback error');
-    audio.play().catch((e) => void ack(id, `playback blocked: ${e}`));
-  } else if (cmd.event === 'stop') {
+    currentId = id;
+    audio.onended = () => void ack(id, true, 'played');
+    audio.onerror = () => void ack(id, false, 'playback error');
+    audio.play().catch((e) => void ack(id, false, `playback blocked: ${e}`));
+  } else if (cmd.event === 'stop' && cmd.delivery_id === currentId) {
+    // Stops reach every browser; only the one playing this delivery acts.
     current?.pause();
     current = null;
-    if (cmd.delivery_id) void ack(cmd.delivery_id, 'stopped by user');
+    currentId = '';
+    void ack(cmd.delivery_id, true, 'stopped by user');
   }
 }
 
-async function ack(deliveryId: string, result: string) {
+async function ack(deliveryId: string, ok: boolean, result: string) {
   if (!deliveryId) return;
   try {
-    await post('/api/audio/ack', { delivery_id: deliveryId, result });
+    await post('/api/audio/ack', { delivery_id: deliveryId, ok, result });
   } catch {
     /* best-effort */
   }

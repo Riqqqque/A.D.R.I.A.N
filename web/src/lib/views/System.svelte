@@ -42,7 +42,7 @@
         timezone,
         assistant_name: assistantName,
         privacy_mode: privacy,
-        public_url: publicUrl || null
+        public_url: publicUrl.trim()
       });
       notice = 'Settings saved.';
       await session.refreshFlags();
