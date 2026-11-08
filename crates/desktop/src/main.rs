@@ -59,6 +59,7 @@ struct SettingsView {
     /// The update line for each position of the switch: it can flip before a Save.
     update_on: String,
     update_off: String,
+    quiet_while_playing: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -72,6 +73,8 @@ struct Frame {
 
 /// How long the window may sit minimized before it's closed to the tray.
 const MINIMIZED_TO_TRAY: Duration = Duration::from_secs(120);
+/// How often to look at what's in front, for "playing a game now".
+const GAME_CHECK: Duration = Duration::from_secs(2);
 
 /// Her state right now, as the window shows it.
 fn frame(shared: &Shared) -> Frame {
@@ -158,6 +161,7 @@ fn get_settings(state: tauri::State<'_, AppState>) -> SettingsView {
         auto_update: !s.updates_off,
         update_on: update.line(true),
         update_off: update.line(false),
+        quiet_while_playing: !s.quiet_off,
     }
 }
 
@@ -179,6 +183,7 @@ fn save_settings(
     pc: Policy,
     shortcuts: String,
     auto_update: Option<bool>,
+    quiet_while_playing: Option<bool>,
 ) -> Result<(), String> {
     let form = config::Form {
         server_url,
@@ -187,6 +192,7 @@ fn save_settings(
         pc,
         shortcuts,
         auto_update,
+        quiet_while_playing,
     };
     let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
     let saved = config::commit(&mut s, form, config::save)?;
@@ -584,6 +590,9 @@ fn main() {
                     let mut mic_error: Option<String> = None;
                     let mut quiet = None;
                     let mut minimized_since: Option<std::time::Instant> = None;
+                    let started = std::time::Instant::now();
+                    let mut game_checked: Option<std::time::Instant> = None;
+                    let mut playing = adrian_pc_control::activity::Debounce::default();
                     for tick in 0u64.. {
                         // No window to draw for: check twice a second and nothing else.
                         let window = handle.get_webview_window("main");
@@ -641,6 +650,29 @@ fn main() {
                             if drawing != Some(on) {
                                 drawing = Some(on);
                                 let _ = handle.emit("draw", on);
+                            }
+                            // Playing a game now: the server keeps her quiet unless named.
+                            if game_checked.is_none_or(|t| t.elapsed() >= GAME_CHECK) {
+                                game_checked = Some(std::time::Instant::now());
+                                let state = handle.state::<AppState>();
+                                let wanted = !state
+                                    .settings
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .quiet_off;
+                                let change = if wanted {
+                                    let pc =
+                                        state.pc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                    let seen = pc.game_in_front(fullscreen_app_in_front());
+                                    playing.observe(started.elapsed().as_millis() as u64, seen.as_ref())
+                                } else {
+                                    playing.reset()
+                                };
+                                if let Some(a) = change {
+                                    *shared.activity.lock().unwrap_or_else(|e| e.into_inner()) = a;
+                                    // Offline it waits for the next welcome, which sends it.
+                                    link::offer(&shared, &state.cmds, Cmd::Activity);
+                                }
                             }
                         }
                         if window.is_none() {
