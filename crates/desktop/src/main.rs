@@ -664,7 +664,10 @@ fn main() {
                                     let pc =
                                         state.pc.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                     let seen = pc.game_in_front(fullscreen_app_in_front());
-                                    playing.observe(started.elapsed().as_millis() as u64, seen.as_ref())
+                                    playing.observe(
+                                        started.elapsed().as_millis() as u64,
+                                        seen.as_ref(),
+                                    )
                                 } else {
                                     playing.reset()
                                 };
