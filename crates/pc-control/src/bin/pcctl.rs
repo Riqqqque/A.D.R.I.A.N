@@ -23,7 +23,7 @@ fn main() {
         args.get(1).map(String::as_str).unwrap_or("{}"),
     ) else {
         fail(
-            "usage: pcctl [--policy FILE] [--out FILE] <pc_apps|pc_open|pc_media|pc_volume|pc_system|pc_info|pc_clipboard|pc_screen> '<json args>'",
+            "usage: pcctl [--policy FILE] [--out FILE] <pc_apps|pc_windows|pc_open|pc_media|pc_volume|pc_system|pc_info|pc_clipboard|pc_screen> '<json args>'",
         );
     };
     let value: serde_json::Value =

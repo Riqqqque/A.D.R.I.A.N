@@ -150,6 +150,7 @@
   // --- settings ---------------------------------------------------------------
   const PERMS = [
     ['apps', 'Apps and games', 'Open, close and switch between them'],
+    ['windows', 'Window layout', 'Snap, maximize and move windows between monitors'],
     ['open', 'Web and folders', 'Websites, YouTube, Downloads and so on'],
     ['media', 'Media', 'Play, pause and skip what is playing'],
     ['volume', 'Volume', 'Overall and per app'],

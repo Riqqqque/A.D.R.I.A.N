@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct Policy {
     /// Open, close, focus and minimize apps and games.
     pub apps: bool,
+    /// Snap, maximize, center and move app windows between monitors.
+    pub windows: bool,
     /// Open web pages, YouTube and known folders.
     pub open: bool,
     /// Play/pause/skip whatever is playing.
@@ -33,6 +35,7 @@ impl Default for Policy {
     fn default() -> Self {
         Policy {
             apps: true,
+            windows: true,
             open: true,
             media: true,
             volume: true,
