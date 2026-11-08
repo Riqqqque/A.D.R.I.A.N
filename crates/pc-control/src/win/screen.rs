@@ -13,7 +13,7 @@
 //! full-screen app is in front, and this app's own window.
 
 use super::apps::Index;
-use super::{Com, exe_stem, wnd};
+use super::{Com, exe_stem, from_wide, wnd};
 use crate::{Image, Outcome};
 use std::ffi::c_void;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
@@ -42,9 +42,10 @@ use windows::Win32::UI::Shell::{
     QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, PW_RENDERFULLCONTENT,
-    SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WINDOW_DISPLAY_AFFINITY,
+    EnumWindows, GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
+    GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, IsZoomed, PW_RENDERFULLCONTENT, SetWindowDisplayAffinity,
+    WDA_EXCLUDEFROMCAPTURE, WINDOW_DISPLAY_AFFINITY,
 };
 use windows::core::{PWSTR, VARIANT, w};
 
@@ -398,10 +399,52 @@ fn pick(name: &str) -> Result<wnd::Win, String> {
     if let Some(w) = wins.iter().find(|w| w.hwnd == fg) {
         return Ok(w.clone());
     }
+    // Something else in front that isn't ours or the desktop: an error box
+    // (an owned window), a Store app. That's the one they mean.
+    if let Some(w) = front_window(fg) {
+        return Ok(w);
+    }
+    // Nothing, the desktop, or our own window in front: the next one down.
     wins.into_iter()
         .find(|w| unsafe { IsWindowVisible(w.hwnd).as_bool() && !IsIconic(w.hwnd).as_bool() })
         .ok_or_else(|| "No window is open to look at.".to_string())
 }
+
+/// The window in front as a `Win`, unless it's nothing, the desktop or
+/// taskbar, hidden, or this app's own.
+fn front_window(fg: HWND) -> Option<wnd::Win> {
+    if fg.is_invalid() {
+        return None;
+    }
+    let mut class = [0u16; 64];
+    // SAFETY: plain window queries with sized buffers.
+    unsafe {
+        if fg == GetShellWindow() || fg == GetDesktopWindow() || !IsWindowVisible(fg).as_bool() {
+            return None;
+        }
+        let n = GetClassNameW(fg, &mut class) as usize;
+        let class = from_wide(&class[..n.min(class.len())]);
+        if DESKTOP_CLASSES.contains(&class.as_str()) {
+            return None;
+        }
+        let mut title = [0u16; 512];
+        let n = GetWindowTextW(fg, &mut title) as usize;
+        let w = wnd::Win {
+            hwnd: fg,
+            title: from_wide(&title[..n.min(title.len())]),
+            exe: wnd::exe_path(pid_of(fg)).unwrap_or_default(),
+        };
+        (!is_ours(&w)).then_some(w)
+    }
+}
+
+/// The desktop and the taskbars.
+const DESKTOP_CLASSES: [&str; 4] = [
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+];
 
 fn refuse_protected(index: &Index, w: &wnd::Win) -> Result<(), String> {
     if index.is_game(&w.exe) {

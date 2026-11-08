@@ -386,12 +386,26 @@ mod tests {
 
     #[test]
     fn a_picture_rides_along_with_its_answer() {
-        let plain: Value = serde_json::from_str(&action_result("7", &Outcome::ok("Done."))).unwrap();
-        assert_eq!(plain, json!({ "type": "action_result", "id": "7", "ok": true, "result": "Done." }));
-        let img = adrian_pc_control::Image { mime: "image/jpeg", bytes: vec![0xFF, 0xD8, 0xFF, 0xD9], width: 2, height: 1 };
-        let with: Value = serde_json::from_str(&action_result("8", &Outcome::ok("Here.").with_image(img))).unwrap();
+        let plain: Value =
+            serde_json::from_str(&action_result("7", &Outcome::ok("Done."))).unwrap();
+        assert_eq!(
+            plain,
+            json!({ "type": "action_result", "id": "7", "ok": true, "result": "Done." })
+        );
+        let img = adrian_pc_control::Image {
+            mime: "image/jpeg",
+            bytes: vec![0xFF, 0xD8, 0xFF, 0xD9],
+            width: 2,
+            height: 1,
+        };
+        let with: Value =
+            serde_json::from_str(&action_result("8", &Outcome::ok("Here.").with_image(img)))
+                .unwrap();
         assert_eq!(with["result"], "Here.");
-        assert_eq!(with["image"], json!({ "mime": "image/jpeg", "data": "/9j/2Q==" }));
+        assert_eq!(
+            with["image"],
+            json!({ "mime": "image/jpeg", "data": "/9j/2Q==" })
+        );
     }
 
     #[test]
