@@ -2,9 +2,13 @@
 
 mod apps;
 mod audio;
+mod clipboard;
+mod health;
 mod info;
 mod media;
+mod nvml;
 mod open;
+mod screen;
 mod system;
 mod wnd;
 
@@ -123,8 +127,11 @@ pub fn run(inner: &Inner, policy: &Policy, name: &str, action: &str, args: &Valu
         ),
         "pc_info" => match action {
             "processes" => info::processes(),
+            "health" => health::run(),
             _ => info::summary(),
         },
+        "pc_clipboard" => clipboard::read(),
+        "pc_screen" => screen::run(&inner.index(policy), action, &s("name")),
         _ => Outcome::no(format!("Unknown PC action {name}.")),
     }
 }

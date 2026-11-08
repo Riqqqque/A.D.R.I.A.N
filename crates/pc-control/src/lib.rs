@@ -23,6 +23,18 @@ use serde_json::Value;
 pub struct Outcome {
     pub ok: bool,
     pub text: String,
+    /// A picture for the model (pc_screen), sent beside `text`.
+    pub image: Option<Image>,
+}
+
+/// An encoded picture: JPEG or PNG bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Image {
+    /// "image/jpeg" or "image/png".
+    pub mime: &'static str,
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Outcome {
@@ -30,13 +42,19 @@ impl Outcome {
         Outcome {
             ok: true,
             text: text.into(),
+            image: None,
         }
     }
     pub fn no(text: impl Into<String>) -> Self {
         Outcome {
             ok: false,
             text: text.into(),
+            image: None,
         }
+    }
+    pub fn with_image(mut self, image: Image) -> Self {
+        self.image = Some(image);
+        self
     }
 }
 
@@ -48,6 +66,8 @@ fn allowed(p: &Policy, name: &str, action: &str) -> Option<bool> {
         "pc_media" => p.media,
         "pc_volume" => p.volume,
         "pc_info" => p.info,
+        "pc_clipboard" => p.clipboard,
+        "pc_screen" => p.screen,
         "pc_system" => match action {
             "lock" => p.lock,
             "screen_off" => p.screen_off,

@@ -5,7 +5,7 @@
 //! pressed offline waits for the link to come back.
 
 use crate::audio::{Shared, Up};
-use adrian_pc_control::Pc;
+use adrian_pc_control::{Outcome, Pc};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::fmt::Display;
@@ -312,7 +312,7 @@ async fn session(
                                 let done = done_tx.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let o = pc.run(&name, &args);
-                                    let _ = done.send(json!({ "type": "action_result", "id": id, "ok": o.ok, "result": o.text }).to_string());
+                                    let _ = done.send(action_result(&id, &o));
                                 });
                             }
                             _ => {}
@@ -360,6 +360,20 @@ async fn session(
     }
 }
 
+/// The answer to an `action`. A picture (pc_screen) goes along as
+/// `image: { mime, data }` in base64; servers that don't know it ignore it.
+fn action_result(id: &str, o: &Outcome) -> String {
+    use base64::Engine;
+    let mut m = json!({ "type": "action_result", "id": id, "ok": o.ok, "result": o.text });
+    if let Some(img) = &o.image {
+        m["image"] = json!({
+            "mime": img.mime,
+            "data": base64::engine::general_purpose::STANDARD.encode(&img.bytes),
+        });
+    }
+    m.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +383,30 @@ mod tests {
     use tokio_tungstenite::WebSocketStream;
 
     const WELCOME: &str = r#"{"type":"welcome","name":"test"}"#;
+
+    #[test]
+    fn a_picture_rides_along_with_its_answer() {
+        let plain: Value =
+            serde_json::from_str(&action_result("7", &Outcome::ok("Done."))).unwrap();
+        assert_eq!(
+            plain,
+            json!({ "type": "action_result", "id": "7", "ok": true, "result": "Done." })
+        );
+        let img = adrian_pc_control::Image {
+            mime: "image/jpeg",
+            bytes: vec![0xFF, 0xD8, 0xFF, 0xD9],
+            width: 2,
+            height: 1,
+        };
+        let with: Value =
+            serde_json::from_str(&action_result("8", &Outcome::ok("Here.").with_image(img)))
+                .unwrap();
+        assert_eq!(with["result"], "Here.");
+        assert_eq!(
+            with["image"],
+            json!({ "mime": "image/jpeg", "data": "/9j/2Q==" })
+        );
+    }
 
     #[test]
     fn waits_1_2_5_then_10_and_starts_over_after_a_reset() {
