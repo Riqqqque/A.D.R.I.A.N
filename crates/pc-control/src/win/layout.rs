@@ -2037,13 +2037,13 @@ mod tests {
                 win(
                     2,
                     "#general | Friends - Discord",
-                    r"C:\Users\Alex\AppData\Local\Discord\app-1.0\Discord.exe",
+                    r"C:\Users\you\AppData\Local\Discord\app-1.0\Discord.exe",
                 ),
                 win(3, "Inbox - Google Chrome", chrome),
                 win(
                     4,
                     "Spotify Premium",
-                    r"C:\Users\Alex\AppData\Roaming\Spotify\Spotify.exe",
+                    r"C:\Users\you\AppData\Roaming\Spotify\Spotify.exe",
                 ),
                 win(5, "Calculator", ""),
             ]
