@@ -361,14 +361,14 @@ mod tests {
             built: std::time::Instant::now(),
         };
         for path in [
-            r"C:\Users\Alex\AppData\Local\Flashback.Desktop\current\Flashback.exe",
-            r"C:\Users\Alex\AppData\Local\Discord\app-1.0\Discord.exe",
+            r"C:\Users\you\AppData\Local\Flashback.Desktop\current\Flashback.exe",
+            r"C:\Users\you\AppData\Local\Discord\app-1.0\Discord.exe",
             r"C:\Games\shooter.exe",
         ] {
             assert!(!could_be_music(&index, &app(path)), "{path}");
         }
         for path in [
-            r"C:\Users\Alex\AppData\Roaming\Spotify\Spotify.exe",
+            r"C:\Users\you\AppData\Roaming\Spotify\Spotify.exe",
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             // Only the recorder itself, not anything with a similar name.
             r"C:\Program Files\Flashbacks Radio\flashbacks.exe",
