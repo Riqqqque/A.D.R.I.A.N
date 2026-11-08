@@ -1,10 +1,12 @@
 //! Reading what's in front for [`crate::activity`]: the foreground window's
-//! program and title, and Steam's running game. Only reads; never touches
-//! the window or its program.
+//! program (for a Store app, the one inside its frame) and title, whether it
+//! fills its screen, and Steam's running game. Only reads; never touches the
+//! window or its program.
 
 use super::Inner;
 use super::from_wide;
-use super::wnd::exe_path;
+use super::screen::borderless_in_front;
+use super::wnd::{exe_path, store_app};
 use crate::activity::{Front, Playing, folder_name, playing};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -43,10 +45,19 @@ pub fn game_in_front(inner: &Inner, fullscreen: bool) -> Option<Playing> {
     if pid == 0 || pid == std::process::id() {
         return None;
     }
-    let exe = exe_path(pid).unwrap_or_default();
+    let mut exe = exe_path(pid).unwrap_or_default();
     let mut buf = [0u16; 256];
     let n = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
     let title = from_wide(&buf[..n.min(buf.len())]);
+    // A Store app shows itself through ApplicationFrameHost: judge the app
+    // inside. Left as the frame (never a game) when it can't be found.
+    if crate::activity::exe_stem(&exe) == "applicationframehost"
+        && let Some(inner) = store_app(hwnd, pid, &title, &[])
+    {
+        exe = inner;
+    }
+    // Borderless full screen, which the shell doesn't always report.
+    let fullscreen = fullscreen || borderless_in_front(hwnd);
     let game_folder = if exe.is_empty() {
         None
     } else {

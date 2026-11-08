@@ -174,6 +174,8 @@ fn get_status(state: tauri::State<'_, AppState>) -> StatusView {
         .clone()
 }
 
+// Tauri commands take the form's fields as flat arguments.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn save_settings(
     state: tauri::State<'_, AppState>,
