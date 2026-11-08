@@ -592,6 +592,39 @@ fn open_streams(
     Ok((in_stream, out_stream))
 }
 
+/// Marks the calling audio thread, once, for Windows' multimedia scheduler and
+/// out of the power throttling quiet mode puts on the process. cpal 0.16 means to
+/// raise its stream threads' priority but passes a thread id where a handle
+/// belongs, so that never happened, and in quiet mode the mic and speakers then
+/// ranked below a game's threads.
+fn audio_thread() {
+    thread_local!(static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    if DONE.with(|d| d.replace(true)) {
+        return;
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadInformation,
+            THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            THREAD_POWER_THROTTLING_STATE, ThreadPowerThrottling,
+        };
+        let mut task = 0u32;
+        let _ = AvSetMmThreadCharacteristicsW(windows::core::w!("Audio"), &mut task);
+        let state = THREAD_POWER_THROTTLING_STATE {
+            Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: 0, // never throttled
+        };
+        let _ = SetThreadInformation(
+            GetCurrentThread(),
+            ThreadPowerThrottling,
+            &state as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
 fn build_input<T>(
     dev: &cpal::Device,
     cfg: &cpal::StreamConfig,
@@ -607,6 +640,7 @@ where
     dev.build_input_stream(
         cfg,
         move |data: &[T], _| {
+            audio_thread();
             let mono: Vec<f32> = data
                 .chunks(channels.max(1))
                 .map(|c| c.iter().map(|s| f32::from_sample(*s)).sum::<f32>() / c.len() as f32)
@@ -632,6 +666,7 @@ where
     dev.build_output_stream(
         cfg,
         move |data: &mut [T], _| {
+            audio_thread();
             let frames = data.len() / channels.max(1);
             let mut played = Vec::with_capacity(frames);
             if let Ok(mut q) = shared.out.try_lock() {

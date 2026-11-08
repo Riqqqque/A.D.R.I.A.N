@@ -680,6 +680,8 @@ fn main() {
                                 && !shared.talking.load(Ordering::Relaxed)
                                 && !shared.ptt.load(Ordering::Relaxed)
                                 && !shared.answering.load(Ordering::Relaxed)
+                                // A restart mid-match would take the window focus.
+                                && !fullscreen_app_in_front()
                         },
                         move || h3.exit(0),
                     )
