@@ -300,6 +300,11 @@ async fn session(
                                 let _ = events.send(Event::Transcript { who: s("who"), text: s("text"), last });
                             }
                             "audio_stop" => shared.stop_reply(),
+                            // Nothing runs for a server that hasn't accepted this PC's token yet:
+                            // whatever answers at the address could send it.
+                            "action" if !*welcomed => {
+                                let _ = done_tx.send(json!({ "type": "action_result", "id": s("id"), "ok": false, "result": "Not connected yet." }).to_string());
+                            }
                             "action" => {
                                 let (id, name, args) = (s("id"), s("name"), m.get("args").cloned().unwrap_or(json!({})));
                                 // The settings may have changed what's allowed: use the current policy.

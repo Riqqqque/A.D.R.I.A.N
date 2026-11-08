@@ -268,7 +268,7 @@ fn fetch(
     sum_url: &str,
     here: &Path,
     tag: &str,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, String), String> {
     let sum = String::from_utf8(download(agent, sum_url, 4096)?).map_err(|e| e.to_string())?;
     let want = sum
         .split_whitespace()
@@ -279,17 +279,31 @@ fn fetch(
         return Err("bad checksum file".into());
     }
     let bytes = download(agent, exe_url, 200 * 1024 * 1024)?;
-    let got: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    if got != want {
+    if hex_sha256(&bytes) != want {
         return Err("the download didn't match its checksum".into());
     }
     let dir = here.parent().ok_or("no app folder")?;
     let new = dir.join("ADRIAN.new.exe");
     save(&new, &bytes, tag)?;
-    Ok(new)
+    Ok((new, want))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `install`, once the file on disk is still the one that was checked: it may
+/// wait hours for a quiet moment, and the swap is the point of no return.
+fn install_checked(new: &Path, here: &Path, want: &str) -> Result<(), String> {
+    let bytes = std::fs::read(new).map_err(|e| e.to_string())?;
+    if hex_sha256(&bytes) != want {
+        let _ = std::fs::remove_file(new);
+        return Err("the downloaded update changed on disk; it was removed".into());
+    }
+    install(new, here)
 }
 
 /// Put `new` in `here`'s place and keep `here` as ADRIAN.old.exe. A running exe
@@ -343,8 +357,8 @@ pub fn now() -> Result<String, String> {
     if !newer(&v, VERSION) {
         return Ok(format!("Up to date ({VERSION}; newest release {v})."));
     }
-    let new = fetch(&agent, &exe, &sum, &here, &v)?;
-    install(&new, &here)?;
+    let (new, want) = fetch(&agent, &exe, &sum, &here, &v)?;
+    install_checked(&new, &here, &want)?;
     Ok(format!(
         "Updated {VERSION} -> {v}; the new version is starting."
     ))
@@ -409,13 +423,13 @@ pub fn run(enabled: impl Fn() -> bool, idle: impl Fn() -> bool, quit: impl Fn())
             Ok((v, _, _)) if !newer(&v, VERSION) => set("", Some(&v), None),
             Ok((v, _, _)) if !enabled() => set("available", Some(&v), None),
             Ok((v, exe, sum)) => match fetch(&agent, &exe, &sum, &here, &v) {
-                Ok(new) => {
+                Ok((new, want)) => {
                     set("ready", Some(&v), None);
                     // Wait for a quiet moment (checked every 30 s), then swap.
                     while !idle() || !enabled() {
                         std::thread::sleep(Duration::from_secs(30));
                     }
-                    match install(&new, &here) {
+                    match install_checked(&new, &here, &want) {
                         Ok(()) => {
                             quit();
                             return;
