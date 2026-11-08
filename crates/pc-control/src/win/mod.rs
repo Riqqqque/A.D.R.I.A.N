@@ -116,7 +116,7 @@ pub fn run(inner: &Inner, policy: &Policy, name: &str, action: &str, args: &Valu
         }
         "pc_open" => open::run(args),
         "pc_media" => media::run(action, &s("app")),
-        "pc_volume" => audio::run(action, args),
+        "pc_volume" => audio::run(action, args, || inner.index(policy)),
         "pc_system" => system::run(
             action,
             args.get("confirmed").and_then(Value::as_bool) == Some(true),

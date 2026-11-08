@@ -1,14 +1,15 @@
-//! Volume: the master level of the default speakers, or one app's own level
-//! in the Windows volume mixer ("turn Spotify down", "mute Discord").
+//! Volume: the master level of the default speakers, one app's own level in
+//! the Windows volume mixer ("turn Spotify down", "mute Discord"), or the level
+//! of whatever is making sound right now ("turn my music down").
 
-use super::{Com, exe_stem};
+use super::{Com, Index, exe_stem};
 use crate::Outcome;
 use crate::matching::{normalize, score};
 use serde_json::Value;
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioMeterInformation};
 use windows::Win32::Media::Audio::{
-    IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, ISimpleAudioVolume,
-    MMDeviceEnumerator, eConsole, eRender,
+    AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
+    ISimpleAudioVolume, MMDeviceEnumerator, eConsole, eRender,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
 use windows::core::Interface;
@@ -23,10 +24,38 @@ fn endpoint() -> windows::core::Result<windows::Win32::Media::Audio::IMMDevice> 
     }
 }
 
+/// Programs whose sound is never "the music": voice chat, the assistant
+/// itself, and the parts of Windows and launchers that make sound.
+const NOT_MUSIC: [&str; 16] = [
+    "discord",
+    "discordptb",
+    "discordcanary",
+    "vesktop",
+    "teamspeak",
+    "ts3client_win64",
+    "mumble",
+    "zoom",
+    "ms-teams",
+    "teams",
+    "slack",
+    "steam",
+    "adrian",
+    "adrian-desktop",
+    "audiodg",
+    "explorer",
+];
+
+/// How long to listen for sound before deciding what's playing: a quiet
+/// moment in a song shouldn't hide it.
+const LISTEN: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// One app's audio sessions (an app can have several).
 struct AppVolume {
     name: String,
+    path: String,
     controls: Vec<ISimpleAudioVolume>,
+    /// The level meters of its sessions with a stream open now.
+    meters: Vec<IAudioMeterInformation>,
 }
 
 fn app_sessions() -> windows::core::Result<Vec<AppVolume>> {
@@ -50,13 +79,23 @@ fn app_sessions() -> windows::core::Result<Vec<AppVolume>> {
             let Ok(vol) = ctl.cast::<ISimpleAudioVolume>() else {
                 continue;
             };
-            match out.iter_mut().find(|a| a.name == name) {
-                Some(a) => a.controls.push(vol),
-                None => out.push(AppVolume {
-                    name,
-                    controls: vec![vol],
-                }),
-            }
+            let meter = (ctl.GetState().ok() == Some(AudioSessionStateActive))
+                .then(|| ctl.cast::<IAudioMeterInformation>().ok())
+                .flatten();
+            let i = match out.iter().position(|a| a.name == name) {
+                Some(i) => i,
+                None => {
+                    out.push(AppVolume {
+                        name,
+                        path,
+                        controls: Vec::new(),
+                        meters: Vec::new(),
+                    });
+                    out.len() - 1
+                }
+            };
+            out[i].controls.push(vol);
+            out[i].meters.extend(meter);
         }
     }
     Ok(out)
@@ -85,10 +124,51 @@ fn pretty(stem: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn run(action: &str, args: &Value) -> Outcome {
+/// Whether an app's sound can be what they mean by "my music": not a game, not
+/// voice chat, not her.
+fn could_be_music(index: &Index, a: &AppVolume) -> bool {
+    !NOT_MUSIC.contains(&a.name.as_str()) && !index.is_protected(&a.path)
+}
+
+/// Of the apps that could be music, the ones making sound, and the names of
+/// the rest. Meters are read a few times over `LISTEN`, so a pause between
+/// songs isn't taken for silence.
+fn playing(index: &Index, apps: Vec<AppVolume>) -> (Vec<AppVolume>, Vec<String>) {
+    let (candidates, others): (Vec<_>, Vec<_>) =
+        apps.into_iter().partition(|a| could_be_music(index, a));
+    let mut heard = vec![false; candidates.len()];
+    let start = std::time::Instant::now();
+    loop {
+        for (h, a) in heard.iter_mut().zip(&candidates) {
+            *h |= a
+                .meters
+                .iter()
+                .any(|m| unsafe { m.GetPeakValue() }.unwrap_or(0.0) > 0.001);
+        }
+        if heard.iter().all(|h| *h) || start.elapsed() >= LISTEN {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut rest: Vec<String> = others.iter().map(|a| pretty(&a.name)).collect();
+    let mut found = Vec::new();
+    for (a, h) in candidates.into_iter().zip(heard) {
+        if h {
+            found.push(a);
+        } else {
+            rest.push(pretty(&a.name));
+        }
+    }
+    (found, rest)
+}
+
+/// `index` is only built for `playing`, which needs to know where games live.
+pub fn run(action: &str, args: &Value, index: impl FnOnce() -> Index) -> Outcome {
     let _com = Com::init();
     let app = args.get("app").and_then(Value::as_str).unwrap_or("").trim();
-    let result = if app.is_empty() {
+    let result = if args.get("playing").and_then(Value::as_bool) == Some(true) {
+        what_plays(action, args, &index())
+    } else if app.is_empty() {
         master(action, args)
     } else {
         one_app(action, app, args)
@@ -196,4 +276,64 @@ fn one_app(action: &str, app: &str, args: &Value) -> windows::core::Result<Outco
             },
         }
     }
+}
+
+/// "Turn my music down": every app making sound that could be music, each from
+/// its own level. The master volume, games and voice chat stay where they are.
+fn what_plays(action: &str, args: &Value, index: &Index) -> windows::core::Result<Outcome> {
+    let (found, rest) = playing(index, app_sessions()?);
+    if found.is_empty() {
+        return Ok(Outcome::no(if rest.is_empty() {
+            "Nothing is playing sound right now.".to_string()
+        } else {
+            format!(
+                "No music or video is playing. Making sound, but left alone: {}.",
+                rest.join(", ")
+            )
+        }));
+    }
+    let mut said = Vec::new();
+    for a in &found {
+        let name = pretty(&a.name);
+        unsafe {
+            let now = a.controls[0].GetMasterVolume()?;
+            let muted = a.controls[0].GetMute()?.as_bool();
+            match action {
+                "get" => said.push(format!(
+                    "{name} is at {}%{}",
+                    pct(now),
+                    if muted { ", muted" } else { "" }
+                )),
+                "mute" | "unmute" => {
+                    for c in &a.controls {
+                        c.SetMute(action == "mute", std::ptr::null())?;
+                    }
+                    said.push(format!(
+                        "{name} {}",
+                        if action == "mute" { "muted" } else { "unmuted" }
+                    ));
+                }
+                _ => {
+                    let Some(x) = new_level(action, now, args) else {
+                        return Ok(Outcome::no(
+                            "Volume action must be get, set (with level 0-100), up, down, mute or unmute.",
+                        ));
+                    };
+                    for c in &a.controls {
+                        c.SetMasterVolume(x, std::ptr::null())?;
+                        if muted && x > 0.0 {
+                            c.SetMute(false, std::ptr::null())?;
+                        }
+                    }
+                    let how = match action {
+                        "down" => "down to",
+                        "up" => "up to",
+                        _ => "at",
+                    };
+                    said.push(format!("{name} {how} {}%", pct(x)));
+                }
+            }
+        }
+    }
+    Ok(Outcome::ok(format!("{}.", said.join(", "))))
 }
