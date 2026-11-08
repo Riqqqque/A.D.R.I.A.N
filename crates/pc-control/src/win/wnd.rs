@@ -110,7 +110,7 @@ fn label(w: &Win) -> String {
 }
 
 /// The windows a spoken name means: every window of the best-matching program.
-fn find(query: &str) -> Result<Vec<Win>, String> {
+pub(super) fn find(query: &str) -> Result<Vec<Win>, String> {
     let wins = list();
     let q = normalize(alias(query).unwrap_or(query));
     let q2 = normalize(query);

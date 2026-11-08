@@ -15,6 +15,10 @@ pub struct Policy {
     pub volume: bool,
     /// CPU, memory, disk, battery and the busiest programs.
     pub info: bool,
+    /// Read the text on the clipboard when asked (never anything marked secret).
+    pub clipboard: bool,
+    /// Take a screenshot of a window or screen when asked (never of games or full-screen apps).
+    pub screen: bool,
     pub lock: bool,
     pub screen_off: bool,
     /// These three also need the person's spoken yes (`confirmed`).
@@ -33,6 +37,8 @@ impl Default for Policy {
             media: true,
             volume: true,
             info: true,
+            clipboard: true,
+            screen: true,
             lock: true,
             screen_off: true,
             sleep: true,
