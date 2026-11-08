@@ -13,6 +13,7 @@ name = "adrian-desktop"
 version = "0.15.5"
 dependencies = [
  "adrian-pc-control",
+ "base64 0.22.1",
  "cpal 0.16.0",
  "directories",
  "futures-util",
