@@ -71,6 +71,8 @@ pub enum Cmd {
     Text(String),
     Stop,
     Ptt,
+    /// Playing started or stopped: send `Shared::activity` as it is now.
+    Activity,
 }
 
 pub struct Link {
@@ -288,6 +290,11 @@ async fn session(
                                 if shared.ptt.load(Ordering::Relaxed) {
                                     put(&mut tx, Message::Text(json!({ "type": "ptt", "down": true }).to_string().into())).await?;
                                 }
+                                // In a game all along: the server starts every connection as not playing.
+                                let playing = shared.activity.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                if playing.gaming {
+                                    put(&mut tx, Message::Text(playing.message().to_string().into())).await?;
+                                }
                             }
                             "denied" => return Err(refused(s("reason"))),
                             "mode" => { let _ = events.send(Event::Thinking(s("mode") == "thinking")); }
@@ -341,6 +348,7 @@ async fn session(
                     Cmd::Text(t) => json!({ "type": "text", "text": t }),
                     Cmd::Stop => { shared.stop_reply(); json!({ "type": "stop" }) }
                     Cmd::Ptt => json!({ "type": "ptt", "down": true }),
+                    Cmd::Activity => shared.activity.lock().unwrap_or_else(|e| e.into_inner()).message(),
                 };
                 put(&mut tx, Message::Text(m.to_string().into())).await?;
             }
@@ -744,6 +752,59 @@ mod tests {
         assert_eq!(heard.len(), 1, "{heard:?}");
         assert!(heard[0].contains("\"ptt\""));
         assert!(shared.ptt.load(Ordering::Relaxed), "the mic has to follow");
+    }
+
+    #[tokio::test]
+    async fn a_game_already_going_when_she_comes_back_is_said_after_the_welcome() {
+        let (_up_tx, mut up) = mpsc::channel(4);
+        let (_cmds_tx, mut cmds) = mpsc::unbounded_channel();
+        let (events, _seen) = mpsc::unbounded_channel();
+        let shared = Shared::new(0.0);
+        *shared.activity.lock().unwrap() = adrian_pc_control::activity::Activity {
+            gaming: true,
+            game: Some("VALORANT".into()),
+        };
+        let (listener, url) = listen().await;
+        let (heard, _) = tokio::join!(
+            orders(&listener, || {}, &[WELCOME], "\"activity\""),
+            attempt_on(&shared, &url, &mut up, &mut cmds, &events)
+        );
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        let m: Value = serde_json::from_str(&heard[0]).unwrap();
+        assert_eq!(m, json!({ "type": "activity", "gaming": true, "game": "VALORANT" }));
+    }
+
+    #[tokio::test]
+    async fn a_game_starting_or_ending_is_said_once_connected() {
+        let (_up_tx, mut up) = mpsc::channel(4);
+        let (cmds_tx, mut cmds) = mpsc::unbounded_channel();
+        let (events, mut seen) = mpsc::unbounded_channel();
+        let shared = Shared::new(0.0);
+        let (listener, url) = listen().await;
+        let change = async {
+            until_status(&mut seen, true).await;
+            *shared.activity.lock().unwrap() = adrian_pc_control::activity::Activity {
+                gaming: true,
+                game: None,
+            };
+            assert!(offer(&shared, &cmds_tx, Cmd::Activity));
+            *shared.activity.lock().unwrap() = Default::default();
+            // Both readings go: whatever the first one sent, the last one is the state.
+            assert!(offer(&shared, &cmds_tx, Cmd::Activity));
+            std::future::pending::<()>().await
+        };
+        let client = async {
+            tokio::select! {
+                _ = attempt_on(&shared, &url, &mut up, &mut cmds, &events) => {}
+                _ = change => {}
+            }
+        };
+        let (heard, _) = tokio::join!(
+            orders(&listener, || {}, &[WELCOME], "\"gaming\":false"),
+            client
+        );
+        assert!(!heard.is_empty(), "{heard:?}");
+        assert!(heard.last().unwrap().contains("\"gaming\":false"));
     }
 
     #[tokio::test]

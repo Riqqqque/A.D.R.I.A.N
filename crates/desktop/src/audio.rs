@@ -93,6 +93,9 @@ pub struct Shared {
     wake: Mutex<Option<mpsc::Sender<Ctl>>>,
     /// The mic and speakers in use (names), for the settings page.
     pub devices: Mutex<(String, String)>,
+    /// Playing a game now (debounced), for the server's quiet mode. Sent after
+    /// every welcome while it's on, and whenever it changes.
+    pub activity: Mutex<adrian_pc_control::activity::Activity>,
 }
 
 impl Shared {
@@ -119,6 +122,7 @@ impl Shared {
             mic_error: Mutex::new(None),
             wake: Mutex::new(None),
             devices: Mutex::new((String::new(), String::new())),
+            activity: Mutex::new(Default::default()),
         })
     }
 
