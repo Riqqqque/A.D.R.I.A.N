@@ -771,7 +771,10 @@ mod tests {
         );
         assert_eq!(heard.len(), 1, "{heard:?}");
         let m: Value = serde_json::from_str(&heard[0]).unwrap();
-        assert_eq!(m, json!({ "type": "activity", "gaming": true, "game": "VALORANT" }));
+        assert_eq!(
+            m,
+            json!({ "type": "activity", "gaming": true, "game": "VALORANT" })
+        );
     }
 
     #[tokio::test]

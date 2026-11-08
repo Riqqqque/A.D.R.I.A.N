@@ -142,7 +142,10 @@ pub fn folder_name(root: &str, path: &str) -> Option<String> {
     };
     let library = ["common", "xboxgames", "games", "ea games"].contains(&last);
     let name = if library {
-        rest.trim_start_matches('\\').split('\\').next().unwrap_or("")
+        rest.trim_start_matches('\\')
+            .split('\\')
+            .next()
+            .unwrap_or("")
     } else {
         head.rsplit('\\').next().unwrap_or("")
     };
@@ -251,7 +254,9 @@ mod tests {
     fn a_known_game_gets_its_real_name_wherever_it_is() {
         let f = Front {
             game_folder: Some("live".into()),
-            ..front("C:\\Riot Games\\VALORANT\\live\\ShooterGame\\Binaries\\Win64\\VALORANT-Win64-Shipping.exe")
+            ..front(
+                "C:\\Riot Games\\VALORANT\\live\\ShooterGame\\Binaries\\Win64\\VALORANT-Win64-Shipping.exe",
+            )
         };
         assert_eq!(playing(&f).unwrap().name.as_deref(), Some("VALORANT"));
         let gta = front("E:\\Rockstar\\GTA5.exe");
@@ -311,8 +316,11 @@ mod tests {
             Some("Counter-Strike Global Offensive")
         );
         assert_eq!(
-            folder_name("c:\\riot games\\valorant", "C:\\Riot Games\\VALORANT\\live\\VALORANT.exe")
-                .as_deref(),
+            folder_name(
+                "c:\\riot games\\valorant",
+                "C:\\Riot Games\\VALORANT\\live\\VALORANT.exe"
+            )
+            .as_deref(),
             Some("VALORANT")
         );
         assert_eq!(
@@ -324,8 +332,11 @@ mod tests {
             Some("Call of Duty")
         );
         assert_eq!(
-            folder_name("d:\\xboxgames\\", "D:\\XboxGames\\Starfield\\Content\\Starfield.exe")
-                .as_deref(),
+            folder_name(
+                "d:\\xboxgames\\",
+                "D:\\XboxGames\\Starfield\\Content\\Starfield.exe"
+            )
+            .as_deref(),
             Some("Starfield")
         );
         assert_eq!(
@@ -338,7 +349,10 @@ mod tests {
         );
         // Not under that root, or a program loose in the library folder.
         assert_eq!(folder_name(steam, "C:\\Windows\\notepad.exe"), None);
-        assert_eq!(folder_name(steam, "D:\\SteamLibrary\\steamapps\\common\\x.exe"), None);
+        assert_eq!(
+            folder_name(steam, "D:\\SteamLibrary\\steamapps\\common\\x.exe"),
+            None
+        );
     }
 
     #[test]
@@ -363,7 +377,10 @@ mod tests {
             gaming: false,
             game: Some("VALORANT".into()),
         };
-        assert_eq!(off.message(), json!({ "type": "activity", "gaming": false }));
+        assert_eq!(
+            off.message(),
+            json!({ "type": "activity", "gaming": false })
+        );
         let long = Activity {
             gaming: true,
             game: Some("x".repeat(500)),
