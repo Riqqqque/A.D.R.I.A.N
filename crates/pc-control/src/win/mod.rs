@@ -1,5 +1,6 @@
 //! The Windows implementation of each action.
 
+pub(crate) mod activity;
 mod apps;
 mod audio;
 mod info;
