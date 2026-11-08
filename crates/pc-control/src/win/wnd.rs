@@ -11,10 +11,10 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow,
-    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, PostMessageW, SW_MINIMIZE, SW_RESTORE, SetForegroundWindow, ShowWindow,
-    WM_CLOSE, WS_EX_TOOLWINDOW,
+    EnumChildWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetDesktopWindow,
+    GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SW_MINIMIZE, SW_RESTORE,
+    SetForegroundWindow, ShowWindow, WM_CLOSE, WS_EX_TOOLWINDOW,
 };
 use windows::core::PWSTR;
 
@@ -135,10 +135,26 @@ fn class_of(hwnd: HWND) -> String {
     from_wide(&buf[..n.min(buf.len())])
 }
 
+/// The desktop and the taskbars.
+const DESKTOP_CLASSES: [&str; 4] = [
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+];
+
+/// The desktop or a taskbar: what's "in front" when no app is.
+pub(super) fn is_desktop(hwnd: HWND) -> bool {
+    // SAFETY: plain window queries.
+    let shell = unsafe { hwnd == GetShellWindow() || hwnd == GetDesktopWindow() };
+    shell || DESKTOP_CLASSES.contains(&class_of(hwnd).as_str())
+}
+
 /// The program of the Store app inside an ApplicationFrameHost frame: its
 /// CoreWindow is a child of the frame, or, while the app is suspended or
-/// minimized, a top-level window of its own with the same title.
-fn store_app(frame: HWND, frame_pid: u32, title: &str, top: &[HWND]) -> Option<String> {
+/// minimized, a top-level window of its own with the same title (looked for
+/// among `top`).
+pub(super) fn store_app(frame: HWND, frame_pid: u32, title: &str, top: &[HWND]) -> Option<String> {
     let mut kids: Vec<HWND> = Vec::new();
     unsafe {
         let _ = EnumChildWindows(
@@ -200,6 +216,21 @@ pub(super) fn find(query: &str) -> Result<Vec<Win>, String> {
         Found::None => Err(format!("Nothing called \"{query}\" is open.")),
         Found::Many(ask) => Err(ask),
     }
+}
+
+/// Like [`find`], among windows on screen including Store apps' frames.
+pub(super) fn find_shown(query: &str) -> Result<Vec<Win>, String> {
+    match find_in(query, shown(list_all())) {
+        Found::Some(w) => Ok(w),
+        Found::None => Err(format!("Nothing called \"{query}\" is open.")),
+        Found::Many(ask) => Err(ask),
+    }
+}
+
+/// The windows that aren't hidden by the shell (another virtual desktop, a
+/// suspended Store app). Store apps' frames stay in.
+pub(super) fn shown(wins: Vec<Win>) -> Vec<Win> {
+    wins.into_iter().filter(|w| w.cloaked == 0).collect()
 }
 
 /// [`find`] among these windows.

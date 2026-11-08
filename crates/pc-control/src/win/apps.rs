@@ -49,8 +49,12 @@ pub struct Index {
 }
 
 impl Index {
-    /// Whether a program lives in a game's install folder.
+    /// Whether a program is a game: one known by its name (wherever it's
+    /// installed), or one in a game's install folder.
     pub fn is_game(&self, exe_path: &str) -> bool {
+        if crate::activity::known_program(&crate::activity::exe_stem(exe_path)).is_some() {
+            return true;
+        }
         let p = exe_path.to_lowercase().replace('/', "\\");
         !NOT_GAMES.iter().any(|n| p.contains(n))
             && self.game_roots.iter().any(|r| p.starts_with(r.as_str()))
@@ -65,17 +69,23 @@ impl Index {
 
 /// Where launchers with no install list we read put their games, under Program
 /// Files. The launchers themselves stay closable, like the Riot Client.
-const LAUNCHER_FOLDERS: [&str; 5] = [
+const LAUNCHER_FOLDERS: [&str; 6] = [
     "EA Games",
     "Ubisoft\\Ubisoft Game Launcher\\games",
     "Call of Duty",
     "Overwatch",
     "Roblox\\Versions",
+    "Rockstar Games",
 ];
 
-/// Lowercase ends of paths in a game's folder that aren't games: Roblox keeps
-/// Studio, its editor, right beside the player.
-const NOT_GAMES: [&str; 1] = ["\\robloxstudio"];
+/// Lowercase parts of paths in a game's folder that aren't games: Roblox keeps
+/// Studio, its editor, right beside the player, and Rockstar's launcher and
+/// Social Club sit beside its games.
+const NOT_GAMES: [&str; 3] = [
+    "\\robloxstudio",
+    "\\rockstar games\\launcher\\",
+    "\\rockstar games\\social club\\",
+];
 
 /// Game folders found by where they usually are, not from a launcher's list:
 /// the Xbox app's on every fixed drive (`drives` as "C:\\"), and the defaults
@@ -154,6 +164,7 @@ pub fn build(policy: &Policy) -> Index {
     riot(&mut apps, &mut game_roots);
     steam(&mut apps, &mut game_roots);
     epic(&mut apps, &mut game_roots);
+    battle_net(&mut game_roots);
     let program_files: Vec<String> = ["ProgramFiles", "ProgramFiles(x86)"]
         .iter()
         .filter_map(|v| std::env::var(v).ok())
@@ -343,6 +354,115 @@ fn epic(apps: &mut Vec<App>, roots: &mut Vec<String>) {
     }
 }
 
+/// Battle.net's install list is bigger than this only when something's wrong.
+const PRODUCT_DB_MAX: u64 = 4 * 1024 * 1024;
+
+/// Battle.net games' folders (they go wherever the person chose, often
+/// another drive), from the agent's install list. Only their windows are
+/// protected; Battle.net itself stays closable, like the Riot Client.
+fn battle_net(roots: &mut Vec<String>) {
+    let data = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into());
+    let db = Path::new(&data).join("Battle.net\\Agent\\product.db");
+    if !std::fs::metadata(&db).is_ok_and(|m| m.len() <= PRODUCT_DB_MAX) {
+        return;
+    }
+    if let Ok(bytes) = std::fs::read(&db) {
+        roots.extend(battle_net_roots(&bytes));
+    }
+}
+
+/// One protobuf varint at `*i`, or None when it runs past the end.
+fn varint(b: &[u8], i: &mut usize) -> Option<u64> {
+    let mut v = 0u64;
+    for shift in (0..64).step_by(7) {
+        let c = *b.get(*i)?;
+        *i += 1;
+        v |= u64::from(c & 0x7f) << shift;
+        if c < 0x80 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// The length-delimited fields of a protobuf message, as (number, bytes).
+/// Stops at the first thing it can't read, so a cut-off file gives what came
+/// before the cut.
+fn pb_fields(b: &[u8]) -> Vec<(u64, &[u8])> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let Some(key) = varint(b, &mut i) else { break };
+        let skip = match key & 7 {
+            0 => varint(b, &mut i).map(|_| 0),
+            1 => Some(8),
+            2 => {
+                let Some(n) = varint(b, &mut i) else { break };
+                let Some(end) = usize::try_from(n)
+                    .ok()
+                    .and_then(|n| i.checked_add(n))
+                    .filter(|&e| e <= b.len())
+                else {
+                    break;
+                };
+                out.push((key >> 3, &b[i..end]));
+                Some(end - i)
+            }
+            5 => Some(4),
+            _ => None,
+        };
+        match skip
+            .and_then(|s| i.checked_add(s))
+            .filter(|&e| e <= b.len())
+        {
+            Some(e) => i = e,
+            None => break,
+        }
+    }
+    out
+}
+
+/// Install folders in Battle.net's `product.db`: each product install, field
+/// one, holds its uid (field one), product code (two) and settings (three),
+/// whose first field is the folder. Lowercase with a closing backslash, like
+/// the other roots.
+fn battle_net_roots(db: &[u8]) -> Vec<String> {
+    let mut roots = Vec::new();
+    for (n, install) in pb_fields(db) {
+        if n != 1 {
+            continue;
+        }
+        let fields = pb_fields(install);
+        let text = |n: u64| {
+            fields
+                .iter()
+                .find(|(f, _)| *f == n)
+                .and_then(|(_, v)| std::str::from_utf8(v).ok())
+        };
+        // Battle.net itself, its agent and its runtime.
+        let own = ["agent", "battle.net", "bna", "bdk"];
+        if text(1).is_some_and(|u| own.contains(&u)) || text(2).is_some_and(|c| own.contains(&c)) {
+            continue;
+        }
+        let Some(path) = fields
+            .iter()
+            .find(|(f, _)| *f == 3)
+            .and_then(|(_, s)| pb_fields(s).into_iter().find(|(f, _)| *f == 1))
+            .and_then(|(_, p)| std::str::from_utf8(p).ok())
+        else {
+            continue;
+        };
+        let p = path.trim().replace('/', "\\").to_lowercase();
+        let p = p.trim_end_matches('\\');
+        // A folder, not a bare drive.
+        if p.split('\\').filter(|s| !s.is_empty()).count() < 2 {
+            continue;
+        }
+        roots.push(format!("{p}\\"));
+    }
+    roots
+}
+
 /// VALORANT and League of Legends through the Riot Client.
 fn riot(apps: &mut Vec<App>, roots: &mut Vec<String>) {
     let Ok(text) = std::fs::read_to_string("C:\\ProgramData\\Riot Games\\RiotClientInstalls.json")
@@ -505,7 +625,122 @@ pub fn list(index: &Index, filter: &str) -> Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{Index, other_roots, vdf_values};
+    use super::{Index, battle_net_roots, other_roots, vdf_values};
+
+    fn index(game_roots: Vec<String>) -> Index {
+        Index {
+            apps: Vec::new(),
+            game_roots,
+            built: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn known_games_are_games_wherever_they_are() {
+        let index = index(Vec::new());
+        assert!(index.is_game("E:\\Anywhere\\Grand Theft Auto V\\GTA5.exe"));
+        assert!(index.is_game("D:\\Games\\Call of Duty\\_retail_\\cod.exe"));
+        assert!(index.is_protected("D:\\Games\\Apex\\r5apex_dx12.exe"));
+        // Java isn't a game by its name; only Minecraft's title would say so.
+        assert!(!index.is_game("C:\\Program Files\\Java\\bin\\javaw.exe"));
+        assert!(!index.is_game("C:\\Windows\\System32\\notepad.exe"));
+    }
+
+    #[test]
+    fn rockstar_games_are_games_and_its_launcher_isnt() {
+        let index = index(other_roots(&[], None, &["C:\\Program Files".to_string()]));
+        assert!(
+            index.is_game("C:\\Program Files\\Rockstar Games\\Red Dead Redemption 2\\RDR2.exe")
+        );
+        assert!(!index.is_game("C:\\Program Files\\Rockstar Games\\Launcher\\Launcher.exe"));
+        assert!(
+            !index.is_game("C:\\Program Files\\Rockstar Games\\Social Club\\SocialClubHelper.exe")
+        );
+        assert_eq!(
+            crate::activity::folder_name(
+                "c:\\program files\\rockstar games\\",
+                "C:\\Program Files\\Rockstar Games\\Red Dead Redemption 2\\RDR2.exe"
+            )
+            .as_deref(),
+            Some("Red Dead Redemption 2")
+        );
+    }
+
+    /// A protobuf length-delimited field.
+    fn field(n: u8, body: &[u8]) -> Vec<u8> {
+        assert!(body.len() < 128);
+        let mut v = vec![(n << 3) | 2, body.len() as u8];
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn install(uid: &str, code: &str, path: &str) -> Vec<u8> {
+        let mut v = field(1, uid.as_bytes());
+        v.extend(field(2, code.as_bytes()));
+        // A varint field before the path, as real settings have.
+        let mut settings = field(1, path.as_bytes());
+        settings.extend([2 << 3, 1]);
+        v.extend(field(3, &settings));
+        v.extend([4 << 3, 0x96, 0x01]);
+        field(1, &v)
+    }
+
+    #[test]
+    fn reads_battle_net_game_folders() {
+        let mut db = install("agent", "agent", "C:/ProgramData/Battle.net/Agent");
+        db.extend(install(
+            "battle.net",
+            "bna",
+            "C:/Program Files (x86)/Battle.net",
+        ));
+        db.extend(install("example", "exmp", "D:/Games/Example Game"));
+        db.extend(install("other", "othr", "E:\\Library\\Other\\"));
+        db.extend(install("bare", "bare", "F:/"));
+        // Other top-level fields, then a cut-off install at the end.
+        db.extend([6 << 3, 0xA3, 0xD6, 0xFB, 0x01]);
+        db.extend(field(8, b"opaque"));
+        let mut cut = install("cut", "cut", "G:/Games/Cut");
+        cut.truncate(cut.len() - 5);
+        db.extend(cut);
+        let roots = battle_net_roots(&db);
+        assert_eq!(
+            roots,
+            vec![
+                "d:\\games\\example game\\".to_string(),
+                "e:\\library\\other\\".to_string()
+            ]
+        );
+        let index = index(roots);
+        assert!(index.is_game("D:\\Games\\Example Game\\_retail_\\Example.exe"));
+        assert!(!index.is_game("C:\\Program Files (x86)\\Battle.net\\Battle.net.exe"));
+        assert!(!index.is_game("D:\\Games\\Example Gamebar\\x.exe"));
+        assert_eq!(
+            crate::activity::folder_name(
+                "d:\\games\\example game\\",
+                "D:\\Games\\Example Game\\_retail_\\Example.exe"
+            )
+            .as_deref(),
+            Some("Example Game")
+        );
+    }
+
+    #[test]
+    fn never_trips_on_a_broken_install_list() {
+        for junk in [
+            &[][..],
+            &[0x0A][..],
+            &[0x0A, 0xFF][..],
+            &[
+                0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+            ][..],
+            &[0x0A, 0x7F, 0x01][..],
+            &[0x0B][..],
+            &[0x09, 1, 2, 3][..],
+            &[0xFF; 32][..],
+        ] {
+            assert!(battle_net_roots(junk).is_empty(), "{junk:?}");
+        }
+    }
 
     #[test]
     fn knows_game_folders() {

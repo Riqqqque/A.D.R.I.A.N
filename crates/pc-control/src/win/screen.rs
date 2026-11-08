@@ -42,10 +42,9 @@ use windows::Win32::UI::Shell::{
     QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
-    GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, IsZoomed, PW_RENDERFULLCONTENT, SetWindowDisplayAffinity,
-    WDA_EXCLUDEFROMCAPTURE, WINDOW_DISPLAY_AFFINITY,
+    EnumWindows, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, PW_RENDERFULLCONTENT,
+    SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WINDOW_DISPLAY_AFFINITY,
 };
 use windows::core::{PWSTR, VARIANT, w};
 
@@ -352,33 +351,42 @@ fn fullscreen_in_front() -> bool {
         unsafe { SHQueryUserNotificationState() },
         Ok(s) if s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE
     );
-    if quns {
-        return true;
-    }
-    // Borderless full-screen windows the shell doesn't flag: one that covers
-    // its whole screen without being maximized.
-    // SAFETY: plain window queries.
-    let fg = unsafe { GetForegroundWindow() };
-    if fg.is_invalid() || pid_of(fg) == std::process::id() {
+    // SAFETY: no arguments.
+    quns || borderless_in_front(unsafe { GetForegroundWindow() })
+}
+
+/// Whether `fg` is a borderless full-screen window, which the shell doesn't
+/// always report: its visible frame covers its whole monitor and it isn't
+/// merely maximized. The desktop, the taskbar and this app's own windows
+/// never are. Reads only; any thread.
+pub(super) fn borderless_in_front(fg: HWND) -> bool {
+    if fg.is_invalid() || pid_of(fg) == std::process::id() || wnd::is_desktop(fg) {
         return false;
     }
+    // Real pixels for both rectangles, whatever this thread was set to.
+    let _dpi = Dpi::real_pixels();
     let (Some(f), Some(m)) = (frame_of(fg), monitor_of(fg)) else {
         return false;
     };
-    let shell = wnd::list().iter().all(|w| w.hwnd != fg); // the desktop, the taskbar
-    !shell
-        && unsafe { !IsZoomed(fg).as_bool() }
-        && f.left <= m.left
-        && f.top <= m.top
-        && f.right >= m.right
-        && f.bottom >= m.bottom
+    // SAFETY: plain window query.
+    covers(f, m, unsafe { IsZoomed(fg).as_bool() })
+}
+
+/// A frame covering its monitor, not maximized.
+pub fn covers(frame: RECT, monitor: RECT, zoomed: bool) -> bool {
+    !zoomed
+        && frame.left <= monitor.left
+        && frame.top <= monitor.top
+        && frame.right >= monitor.right
+        && frame.bottom >= monitor.bottom
 }
 
 /// The window they mean: the one named, else the one in front (or, when
 /// A.D.R.I.A.N.'s own window is in front, the next one down).
 fn pick(name: &str) -> Result<wnd::Win, String> {
     if !name.is_empty() {
-        let wins = wnd::find(name)?;
+        // Store apps (Calculator, Settings) by name too.
+        let wins = wnd::find_shown(name)?;
         let mine = wins.iter().all(is_ours);
         return wins
             .into_iter()
@@ -416,15 +424,9 @@ fn front_window(fg: HWND) -> Option<wnd::Win> {
     if fg.is_invalid() {
         return None;
     }
-    let mut class = [0u16; 64];
     // SAFETY: plain window queries with sized buffers.
     unsafe {
-        if fg == GetShellWindow() || fg == GetDesktopWindow() || !IsWindowVisible(fg).as_bool() {
-            return None;
-        }
-        let n = GetClassNameW(fg, &mut class) as usize;
-        let class = from_wide(&class[..n.min(class.len())]);
-        if DESKTOP_CLASSES.contains(&class.as_str()) {
+        if wnd::is_desktop(fg) || !IsWindowVisible(fg).as_bool() {
             return None;
         }
         // A Store app's frame: named by the app inside it.
@@ -447,14 +449,6 @@ fn front_window(fg: HWND) -> Option<wnd::Win> {
     }
 }
 
-/// The desktop and the taskbars.
-const DESKTOP_CLASSES: [&str; 4] = [
-    "Progman",
-    "WorkerW",
-    "Shell_TrayWnd",
-    "Shell_SecondaryTrayWnd",
-];
-
 fn refuse_protected(index: &Index, w: &wnd::Win) -> Result<(), String> {
     if index.is_game(&w.exe) {
         return Err(format!(
@@ -466,6 +460,47 @@ fn refuse_protected(index: &Index, w: &wnd::Win) -> Result<(), String> {
         return Err("I can't tell which program that window belongs to (it might be a game), so I won't take a picture of it.".into());
     }
     Ok(())
+}
+
+/// A whole-screen picture would show `others` (the windows on that screen,
+/// minimized ones left out): why not, if one of them is a game, a program
+/// that can't be identified (it might be one), or a copy of this app running
+/// as another program.
+fn screen_blocker(index: &Index, others: &[wnd::Win]) -> Option<String> {
+    for other in others {
+        if index.is_game(&other.exe) {
+            return Some(format!(
+                "{} is on that screen, and I don't take pictures of games. Ask for one window instead.",
+                label(other)
+            ));
+        }
+        if index.is_protected(&other.exe) {
+            return Some("A window on that screen belongs to a program I can't identify (it might be a game), so I won't take a picture of the whole screen. Ask for one window instead.".into());
+        }
+        if is_ours(other) && pid_of(other.hwnd) != std::process::id() {
+            return Some(
+                "My own window is on that screen. Minimize it, or ask for one window instead."
+                    .into(),
+            );
+        }
+    }
+    None
+}
+
+/// PrintWindow waits for the window to draw itself: a window that isn't
+/// answering (or runs as administrator) is never asked.
+fn refuse_unresponsive(w: &wnd::Win) -> Result<(), String> {
+    match super::layout::responsive(w.hwnd, pid_of(w.hwnd)) {
+        Ok(()) => Ok(()),
+        Err(super::layout::Fail::Admin) => Err(format!(
+            "{} runs as administrator, so Windows won't let me take a picture of it. I can take one of the whole screen instead.",
+            label(w)
+        )),
+        Err(_) => Err(format!(
+            "{} isn't responding, so I can't take a picture of it on its own. I can take one of the whole screen instead.",
+            label(w)
+        )),
+    }
 }
 
 unsafe extern "system" fn collect_own(hwnd: HWND, lp: LPARAM) -> BOOL {
@@ -613,36 +648,32 @@ pub fn run(index: &Index, action: &str, name: &str) -> Outcome {
     if let Err(e) = refuse_protected(index, &w) {
         return Outcome::no(e);
     }
-    let title: String = w.title.chars().take(80).collect();
     let shot = if action == "monitor" {
         let Some(m) = monitor_of(w.hwnd) else {
             return Outcome::no("Couldn't find that screen.");
         };
-        // A game anywhere on that screen stays out of it, and so does a copy
-        // of this app running as another program.
-        for other in wnd::list() {
-            let on_it = frame_of(other.hwnd).is_some_and(|f| {
-                f.left < m.right && f.right > m.left && f.top < m.bottom && f.bottom > m.top
-            });
+        // Every window on that screen, Store apps' frames included.
+        let on_it: Vec<wnd::Win> = wnd::shown(wnd::list_all())
+            .into_iter()
+            .filter(|other| {
+                frame_of(other.hwnd).is_some_and(|f| {
+                    f.left < m.right && f.right > m.left && f.top < m.bottom && f.bottom > m.top
+                })
+            })
             // SAFETY: plain window query.
-            if !on_it || unsafe { IsIconic(other.hwnd).as_bool() } {
-                continue;
-            }
-            if index.is_game(&other.exe) {
-                return Outcome::no(format!(
-                    "{} is on that screen, and I don't take pictures of games. Ask for one window instead.",
-                    label(&other)
-                ));
-            }
-            if is_ours(&other) && pid_of(other.hwnd) != std::process::id() {
-                return Outcome::no(
-                    "My own window is on that screen. Minimize it, or ask for one window instead.",
-                );
-            }
+            .filter(|other| unsafe { !IsIconic(other.hwnd).as_bool() })
+            .collect();
+        if let Some(why) = screen_blocker(index, &on_it) {
+            return Outcome::no(why);
         }
         shoot_monitor(m).map(|i| (i, format!("the whole screen {} is on", label(&w))))
     } else {
-        shoot_window(&w).map(|i| (i, format!("{} (\"{title}\")", label(&w))))
+        if let Err(e) = refuse_unresponsive(&w) {
+            return Outcome::no(e);
+        }
+        // The app's name only: a title can hold a document's or a page's
+        // name, and the picture shows it anyway.
+        shoot_window(&w).map(|i| (i, label(&w)))
     };
     match shot {
         Ok((img, what)) => Outcome::ok(format!(
@@ -815,5 +846,141 @@ mod tests {
                 .contains("might be a game")
         );
         assert!(refuse_protected(&index, &win("C:\\Windows\\notepad.exe")).is_ok());
+    }
+
+    fn win(exe: &str) -> wnd::Win {
+        wnd::Win {
+            hwnd: HWND::default(),
+            title: "Some document - Example".into(),
+            exe: exe.into(),
+            cloaked: 0,
+            frame_host: false,
+        }
+    }
+
+    #[test]
+    fn a_whole_screen_with_a_game_or_an_unknown_program_isnt_pictured() {
+        let index = Index {
+            apps: vec![],
+            game_roots: vec!["c:\\games\\".into()],
+            built: std::time::Instant::now(),
+        };
+        let fine = [
+            win("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"),
+            win("C:\\Windows\\explorer.exe"),
+        ];
+        assert_eq!(screen_blocker(&index, &fine), None);
+        let game = [fine[0].clone(), win("C:\\Games\\shooter.exe")];
+        assert!(
+            screen_blocker(&index, &game)
+                .unwrap()
+                .contains("Shooter is on that screen")
+        );
+        // Known by its name, outside every game folder.
+        let known = [win("D:\\Somewhere\\GTA5.exe")];
+        assert!(screen_blocker(&index, &known).unwrap().contains("games"));
+        // A program that can't be read might be a game (anti-cheat), and so
+        // might a Store frame whose app couldn't be found.
+        let unknown = [fine[0].clone(), win("")];
+        assert!(
+            screen_blocker(&index, &unknown)
+                .unwrap()
+                .contains("can't identify")
+        );
+        let store = [wnd::Win {
+            frame_host: true,
+            ..win("")
+        }];
+        assert!(screen_blocker(&index, &store).is_some());
+    }
+
+    #[test]
+    fn borderless_means_covering_the_monitor_without_being_maximized() {
+        let r = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let m = r(2560, 0, 6400, 2160);
+        assert!(covers(r(2560, 0, 6400, 2160), m, false));
+        assert!(covers(r(2550, -10, 6410, 2170), m, false));
+        // Maximized (the taskbar auto-hides), or one pixel short.
+        assert!(!covers(r(2560, 0, 6400, 2160), m, true));
+        assert!(!covers(r(2560, 0, 6400, 2159), m, false));
+        assert!(!covers(r(0, 0, 2560, 1440), m, false));
+    }
+
+    /// A hidden message-only window on its own thread; `pump` says whether
+    /// that thread answers messages or is frozen like a hung app.
+    fn test_window(pump: bool) -> (HWND, impl FnOnce()) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
+            PeekMessageW, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let flag = stop.clone();
+        let t = std::thread::spawn(move || {
+            // SAFETY: a window of our own, destroyed on the thread that made it.
+            unsafe {
+                let h = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("test"),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    HWND_MESSAGE,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("a test window");
+                tx.send(h.0 as isize).unwrap();
+                let mut msg = MSG::default();
+                while !flag.load(Ordering::SeqCst) {
+                    if pump {
+                        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                            DispatchMessageW(&msg);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let _ = DestroyWindow(h);
+            }
+        });
+        let hwnd = HWND(rx.recv().unwrap() as *mut _);
+        (hwnd, move || {
+            stop.store(true, Ordering::SeqCst);
+            t.join().unwrap();
+        })
+    }
+
+    #[test]
+    fn never_asks_a_window_that_isnt_answering_to_draw() {
+        let (hwnd, done) = test_window(false);
+        let frozen = wnd::Win {
+            hwnd,
+            ..win("C:\\Tools\\frozen.exe")
+        };
+        let start = std::time::Instant::now();
+        let e = refuse_unresponsive(&frozen).unwrap_err();
+        assert!(e.contains("Frozen isn't responding"), "{e}");
+        assert!(!e.contains("Some document"), "{e}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        done();
+
+        let (hwnd, done) = test_window(true);
+        let fine = wnd::Win {
+            hwnd,
+            ..win("C:\\Tools\\fine.exe")
+        };
+        assert_eq!(refuse_unresponsive(&fine), Ok(()));
+        done();
     }
 }
