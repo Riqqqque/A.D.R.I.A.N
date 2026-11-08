@@ -56,7 +56,7 @@ const KNOWN: [(&str, &str); 16] = [
 ];
 
 /// Full screen but not a game: video players, browsers (a full-screen show), slides.
-const NOT_GAMES: [&str; 18] = [
+const NOT_GAMES: [&str; 19] = [
     "chrome",
     "msedge",
     "firefox",
@@ -75,6 +75,8 @@ const NOT_GAMES: [&str; 18] = [
     "video.ui",
     "powerpnt",
     "explorer",
+    // Store apps (Netflix, Movies & TV) show their windows through it.
+    "applicationframehost",
 ];
 
 /// "C:\\Games\\Foo\\foo.exe" → "foo".
@@ -274,6 +276,7 @@ mod tests {
             "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
             "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe",
             "C:\\Windows\\explorer.exe",
+            "C:\\Windows\\System32\\ApplicationFrameHost.exe",
         ] {
             let f = Front {
                 fullscreen: true,
