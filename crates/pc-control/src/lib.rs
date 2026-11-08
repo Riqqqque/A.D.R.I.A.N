@@ -44,6 +44,7 @@ impl Outcome {
 fn allowed(p: &Policy, name: &str, action: &str) -> Option<bool> {
     Some(match name {
         "pc_apps" => p.apps,
+        "pc_windows" => p.windows,
         "pc_open" => p.open,
         "pc_media" => p.media,
         "pc_volume" => p.volume,
@@ -140,6 +141,24 @@ mod tests {
     }
 
     // Never with `confirmed: true`: if this ever regressed it would really restart.
+    #[test]
+    fn window_layout_has_its_own_setting() {
+        let off = Policy {
+            windows: false,
+            ..Policy::default()
+        };
+        assert_eq!(allowed(&off, "pc_windows", "snap"), Some(false));
+        assert_eq!(
+            allowed(&Policy::default(), "pc_windows", "monitors"),
+            Some(true)
+        );
+        let o = Pc::new(off).run("pc_windows", &json!({"action": "monitors"}));
+        assert!(!o.ok && o.text.contains("turned off"), "{}", o.text);
+        // Settings saved by older apps have no `windows`: it's on.
+        let old: Policy = serde_json::from_str(r#"{"apps": true}"#).unwrap();
+        assert!(old.windows);
+    }
+
     #[test]
     fn restart_has_its_own_setting() {
         let policy = Policy {
