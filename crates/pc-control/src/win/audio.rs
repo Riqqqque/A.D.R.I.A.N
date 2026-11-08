@@ -26,7 +26,7 @@ fn endpoint() -> windows::core::Result<windows::Win32::Media::Audio::IMMDevice> 
 
 /// Programs whose sound is never "the music": voice chat, the assistant
 /// itself, and the parts of Windows and launchers that make sound.
-const NOT_MUSIC: [&str; 16] = [
+const NOT_MUSIC: [&str; 17] = [
     "discord",
     "discordptb",
     "discordcanary",
@@ -43,6 +43,8 @@ const NOT_MUSIC: [&str; 16] = [
     "adrian-desktop",
     "audiodg",
     "explorer",
+    // Flashback, an instant-replay recorder (Flashback.Desktop\current\Flashback.exe).
+    "flashback",
 ];
 
 /// How long to listen for sound before deciding what's playing: a quiet
@@ -336,4 +338,42 @@ fn what_plays(action: &str, args: &Value, index: &Index) -> windows::core::Resul
         }
     }
     Ok(Outcome::ok(format!("{}.", said.join(", "))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(path: &str) -> AppVolume {
+        AppVolume {
+            name: exe_stem(path),
+            path: path.into(),
+            controls: Vec::new(),
+            meters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_replay_recorder_and_voice_chat_are_never_the_music() {
+        let index = Index {
+            apps: vec![],
+            game_roots: vec![r"c:\games\".into()],
+            built: std::time::Instant::now(),
+        };
+        for path in [
+            r"C:\Users\Alex\AppData\Local\Flashback.Desktop\current\Flashback.exe",
+            r"C:\Users\Alex\AppData\Local\Discord\app-1.0\Discord.exe",
+            r"C:\Games\shooter.exe",
+        ] {
+            assert!(!could_be_music(&index, &app(path)), "{path}");
+        }
+        for path in [
+            r"C:\Users\Alex\AppData\Roaming\Spotify\Spotify.exe",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            // Only the recorder itself, not anything with a similar name.
+            r"C:\Program Files\Flashbacks Radio\flashbacks.exe",
+        ] {
+            assert!(could_be_music(&index, &app(path)), "{path}");
+        }
+    }
 }
