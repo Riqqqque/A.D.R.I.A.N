@@ -21,7 +21,8 @@ pub struct Front {
     /// (an elevated or protected process).
     pub exe: String,
     pub title: String,
-    /// A full-screen app is in front (Windows says "busy", "D3D full screen" or "presentation").
+    /// A full-screen app is in front (Windows says "busy", "D3D full screen" or
+    /// "presentation", or the window fills its monitor borderless).
     pub fullscreen: bool,
     /// Steam's `RunningAppID`: a game started through Steam is running (0: none).
     pub steam_app: u32,
