@@ -55,9 +55,10 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOTOWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowThreadProcessId, HWND_TOP, IsHungAppWindow, IsIconic, IsWindow,
-    IsZoomed, SMTO_ABORTIFHUNG, SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetWindowPos,
-    ShowWindow, WM_NULL, WS_CAPTION, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_THICKFRAME,
+    IsWindowVisible, IsZoomed, SMTO_ABORTIFHUNG, SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SendMessageTimeoutW, SetWindowPos, ShowWindow, WM_NULL, WS_CAPTION, WS_EX_TOPMOST,
+    WS_MAXIMIZEBOX, WS_THICKFRAME,
 };
 
 use geo::{Mon, Rect, Zone};
@@ -642,6 +643,35 @@ pub mod geo {
         clamp_into(Rect::sized(ncx - w / 2, ncy - h / 2, w, h), to.work)
     }
 
+    /// Where a window that can't be resized goes in zone `z` of `to`: against
+    /// the zone's outer edges at the size it will have there, since a monitor
+    /// with another DPI rescales it (the app itself, or Windows for an app that
+    /// isn't DPI aware).
+    pub fn fixed_anchor(normal: Rect, from: &Mon, to: &Mon, z: Zone) -> Rect {
+        let w = scaled(normal.w(), to.dpi, from.dpi);
+        let h = scaled(normal.h(), to.dpi, from.dpi);
+        anchor(zone_rect(to.work, z), w, h, Some(z), to.work)
+    }
+
+    /// What a change may do to a window, given what's around it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Allowed {
+        /// Bring it to the top.
+        pub raise: bool,
+        /// Maximize it (which also brings it to the front).
+        pub maximize: bool,
+    }
+
+    /// `busy`: Windows says a full-screen app is in front. `game_in_front`: a
+    /// game (or a program that might be one) has the focus. `full_screen_there`:
+    /// another window is full screen on the monitor it ends up on.
+    pub fn allowed(busy: bool, game_in_front: bool, full_screen_there: bool) -> Allowed {
+        Allowed {
+            raise: !full_screen_there && !game_in_front,
+            maximize: !busy && !game_in_front && !full_screen_there,
+        }
+    }
+
     /// Words that mean the window in front rather than an app's name.
     pub fn means_front(name: &str) -> bool {
         let n = normalize(name);
@@ -672,8 +702,8 @@ pub mod geo {
 }
 
 use geo::{
-    anchor, centered, describe, fit_note, insets, is_fullscreen, map_rect, means_front, monitor_of,
-    needs_names, outer_for, pick, summary, zone_rect,
+    allowed, anchor, centered, describe, fit_note, fixed_anchor, insets, is_fullscreen, map_rect,
+    means_front, monitor_of, needs_names, outer_for, pick, summary, zone_rect,
 };
 
 /// How a window was before a change, so "put it back" can undo it.
@@ -724,7 +754,7 @@ impl Drop for DpiScope {
 
 /// Why a window couldn't be changed.
 #[derive(Debug, PartialEq)]
-enum Fail {
+pub(super) enum Fail {
     Admin,
     Hung,
     Other,
@@ -963,8 +993,10 @@ fn runs_above_us(pid: u32) -> bool {
     theirs.is_some_and(|t| t > ours)
 }
 
-/// A window that's alive and taking messages, or why not.
-fn responsive(hwnd: HWND, pid: u32) -> Result<(), Fail> {
+/// A window that's alive and taking messages, or why not. Waits at most
+/// 300 ms. Also used before a picture of a window (PrintWindow would wait for
+/// a hung one for as long as it hangs).
+pub(super) fn responsive(hwnd: HWND, pid: u32) -> Result<(), Fail> {
     if runs_above_us(pid) {
         return Err(Fail::Admin);
     }
@@ -1318,8 +1350,8 @@ fn change(index: &Index, action: &str, name: &str, side: &str, spec: &str) -> Ou
     }
     let fg = unsafe { GetForegroundWindow() };
     let game_in_front = fg != hwnd && is_protected_window(index, fg);
-    let raise = blocker.is_none() && !game_in_front;
-    let maximize_ok = !busy && !game_in_front;
+    let may = allowed(busy, game_in_front, blocker.is_some());
+    let (raise, maximize_ok) = (may.raise, may.maximize);
 
     let was = Saved {
         hwnd: hwnd.0 as isize,
@@ -1346,6 +1378,12 @@ fn change(index: &Index, action: &str, name: &str, side: &str, spec: &str) -> Ou
             }
             if style(hwnd) & WS_MAXIMIZEBOX.0 == 0 {
                 return Outcome::no(format!("{app} can't be maximized."));
+            }
+            if let Some((other, _)) = &blocker {
+                return Outcome::no(format!(
+                    "{other} is full screen on {}, so I won't maximize {app} over it. I can snap it instead.",
+                    describe(&mons, dest)
+                ));
             }
             if !maximize_ok {
                 return Outcome::no(format!(
@@ -1408,8 +1446,17 @@ fn change(index: &Index, action: &str, name: &str, side: &str, spec: &str) -> Ou
                     }
                 })
             } else {
-                let a = anchor(want, normal.w(), normal.h(), Some(z), work);
-                place(hwnd, a, raise, false)
+                // At the size it will have there, then once more at the size it
+                // really got, in case the app rescaled itself differently.
+                let a = fixed_anchor(normal, &src, &to, z);
+                place(hwnd, a, raise, false).and_then(|got| {
+                    let a = anchor(want, got.w(), got.h(), Some(z), work);
+                    if a.near(&got, 1) {
+                        Ok(got)
+                    } else {
+                        place(hwnd, a, false, false)
+                    }
+                })
             };
             finish(r, &|got| {
                 let place_words = format!("{}{on}", z.words());
@@ -1494,8 +1541,12 @@ fn change(index: &Index, action: &str, name: &str, side: &str, spec: &str) -> Ou
                 }
                 let d = describe(&mons, dest);
                 if was.zoomed && !rezoom {
+                    let what = match &blocker {
+                        Some((other, _)) => format!("{other} is full screen there"),
+                        None => "Something is full screen in front".to_string(),
+                    };
                     Outcome::ok(format!(
-                        "{app} is on {d}. Something is full screen in front, so I didn't maximize it again."
+                        "{app} is on {d}. {what}, so I didn't maximize it again."
                     ))
                 } else {
                     Outcome::ok(format!("{app} is on {d}."))
@@ -1544,19 +1595,47 @@ fn back(index: &Index, name: &str, all: &[Win]) -> Outcome {
     if index.is_protected(&w.exe) {
         return protected_says(index, &w, &app);
     }
+    // Things may have changed since: the same rules as any other change.
+    // `cloaked` is only known for windows in the list, so ask the shell too.
+    let shown = unsafe { IsWindowVisible(hwnd).as_bool() };
+    if !shown || w.cloaked != 0 || !on_current_desktop(hwnd) {
+        return Outcome::no(format!(
+            "{app} is hidden or on another virtual desktop now, so I left it there."
+        ));
+    }
+    let mons = monitors(false);
+    if mons.is_empty() {
+        return Outcome::no("I can't find any monitors.");
+    }
+    if fullscreen(&w, &mons) {
+        return Outcome::no(format!("{app} is full screen now, so I left it as it is."));
+    }
+    let dest = monitor_of(s.normal, &mons);
+    let blocker = fullscreen_on(index, all, &mons, dest, hwnd);
+    if let Some((other, true)) = &blocker {
+        return Outcome::no(format!(
+            "{other} is full screen on {}, so I left {app} where it is.",
+            describe(&mons, dest)
+        ));
+    }
     if let Err(f) = responsive(hwnd, s.pid) {
         return says(f, &app);
     }
     let (_, busy) = full_screen_state();
     let fg = unsafe { GetForegroundWindow() };
     let game_in_front = fg != hwnd && is_protected_window(index, fg);
+    let may = allowed(busy, game_in_front, blocker.is_some());
     normalize_state(hwnd);
     let resizable = style(hwnd) & WS_THICKFRAME.0 != 0;
     if let Err(f) = place(hwnd, s.normal, false, resizable) {
         return says(f, &app);
     }
-    if s.zoomed && !busy && !game_in_front {
+    if s.zoomed && may.maximize {
         maximize_now(hwnd);
+    } else if s.zoomed {
+        return Outcome::ok(format!(
+            "{app} is back where it was. Something is full screen, so I didn't maximize it again."
+        ));
     } else if s.iconic {
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
@@ -1619,6 +1698,46 @@ mod tests {
             )
         };
         vec![m(1, 0, true), m(2, -1920, false), m(3, 1920, false)]
+    }
+
+    #[test]
+    fn a_fixed_size_window_lands_in_the_corner_at_its_new_size() {
+        let m = two();
+        // A 400x300 dialog on the 125% main monitor, to the TV's bottom right
+        // corner at 150%: it will be 480x360 there.
+        let dialog = Rect::sized(500, 400, 400, 300);
+        let a = fixed_anchor(dialog, &m[1], &m[0], Zone::BottomRight);
+        assert_eq!((a.w(), a.h()), (480, 360));
+        assert_eq!((a.r, a.b), (m[0].work.r, m[0].work.b));
+        assert!(m[0].work.covers(&a));
+        // And back: 150% to 125% shrinks it, still against the corner.
+        let big = Rect::sized(-2000, 200, 480, 360);
+        let b = fixed_anchor(big, &m[0], &m[1], Zone::TopRight);
+        assert_eq!((b.w(), b.h()), (400, 300));
+        assert_eq!((b.r, b.t), (m[1].work.r, m[1].work.t));
+        // Same monitor: same size.
+        let c = fixed_anchor(dialog, &m[1], &m[1], Zone::Left);
+        assert_eq!((c.l, c.w(), c.h()), (m[1].work.l, 400, 300));
+    }
+
+    #[test]
+    fn nothing_is_maximized_over_a_full_screen_window() {
+        // A show full screen on the TV while working on the main monitor:
+        // Windows isn't "busy", but nothing goes over it.
+        let a = allowed(false, false, true);
+        assert!(!a.maximize);
+        assert!(!a.raise);
+        assert_eq!(
+            allowed(false, false, false),
+            Allowed {
+                raise: true,
+                maximize: true
+            }
+        );
+        assert!(!allowed(true, false, false).maximize);
+        assert!(allowed(true, false, false).raise);
+        let game = allowed(false, true, false);
+        assert!(!game.maximize && !game.raise);
     }
 
     #[test]
