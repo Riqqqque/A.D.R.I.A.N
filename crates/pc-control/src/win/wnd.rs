@@ -11,9 +11,10 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SW_MINIMIZE,
-    SW_RESTORE, SetForegroundWindow, ShowWindow, WM_CLOSE, WS_EX_TOOLWINDOW,
+    EnumChildWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, PostMessageW, SW_MINIMIZE, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    WM_CLOSE, WS_EX_TOOLWINDOW,
 };
 use windows::core::PWSTR;
 
@@ -21,7 +22,13 @@ use windows::core::PWSTR;
 pub struct Win {
     pub hwnd: HWND,
     pub title: String,
+    /// For a Store app's frame, the app's own program, not ApplicationFrameHost.
     pub exe: String,
+    /// DWMWA_CLOAKED: nonzero when the shell or the app hides it (another
+    /// virtual desktop, a suspended Store app).
+    pub cloaked: u32,
+    /// A Store (UWP) app's ApplicationFrameHost frame.
+    pub frame_host: bool,
 }
 
 /// Programs whose windows aren't apps people mean.
@@ -55,13 +62,22 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
 
 /// Real app windows: visible, titled, top-level, not tool windows, not hidden by the shell.
 pub fn list() -> Vec<Win> {
+    list_all()
+        .into_iter()
+        .filter(|w| w.cloaked == 0 && !w.frame_host)
+        .collect()
+}
+
+/// Like [`list`], in z-order (front first), plus cloaked windows and Store
+/// apps' frames, each named by the app inside it.
+pub fn list_all() -> Vec<Win> {
     let mut all: Vec<HWND> = Vec::new();
     unsafe {
         let _ = EnumWindows(Some(collect), LPARAM(&mut all as *mut Vec<HWND> as isize));
     }
     let me = std::process::id();
     let mut out = Vec::new();
-    for hwnd in all {
+    for &hwnd in &all {
         unsafe {
             if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
                 continue;
@@ -75,9 +91,6 @@ pub fn list() -> Vec<Win> {
             let mut cloaked = 0u32;
             let _ =
                 DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), 4);
-            if cloaked != 0 {
-                continue;
-            }
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
             if pid == me {
@@ -86,21 +99,83 @@ pub fn list() -> Vec<Win> {
             let mut buf = [0u16; 512];
             let n = GetWindowTextW(hwnd, &mut buf) as usize;
             let title = from_wide(&buf[..n.min(buf.len())]);
-            let exe = exe_path(pid).unwrap_or_default();
-            // Shell windows aren't apps, except Explorer folder windows.
+            let mut exe = exe_path(pid).unwrap_or_default();
+            // Shell windows aren't apps, except Explorer folder windows and
+            // the frames Store apps run in.
             let stem = exe_stem(&exe);
-            if SHELL.contains(&stem.as_str()) && !(stem == "explorer" && title != "Program Manager")
+            let frame_host = stem == "applicationframehost";
+            if frame_host {
+                exe = store_app(hwnd, pid, &title, &all).unwrap_or_default();
+            } else if SHELL.contains(&stem.as_str())
+                && !(stem == "explorer" && title != "Program Manager")
             {
                 continue;
             }
-            out.push(Win { hwnd, title, exe });
+            out.push(Win {
+                hwnd,
+                title,
+                exe,
+                cloaked,
+                frame_host,
+            });
         }
     }
     out
 }
 
-/// A friendly name for a program: "chrome" → "Chrome".
-fn label(w: &Win) -> String {
+unsafe extern "system" fn collect_children(hwnd: HWND, lp: LPARAM) -> BOOL {
+    let out = unsafe { &mut *(lp.0 as *mut Vec<HWND>) };
+    out.push(hwnd);
+    TRUE
+}
+
+fn class_of(hwnd: HWND) -> String {
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    from_wide(&buf[..n.min(buf.len())])
+}
+
+/// The program of the Store app inside an ApplicationFrameHost frame: its
+/// CoreWindow is a child of the frame, or, while the app is suspended or
+/// minimized, a top-level window of its own with the same title.
+fn store_app(frame: HWND, frame_pid: u32, title: &str, top: &[HWND]) -> Option<String> {
+    let mut kids: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumChildWindows(
+            frame,
+            Some(collect_children),
+            LPARAM(&mut kids as *mut Vec<HWND> as isize),
+        );
+    }
+    let pid_of = |h: HWND| {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        pid
+    };
+    let inner = kids
+        .into_iter()
+        .map(pid_of)
+        .find(|&p| p != 0 && p != frame_pid)
+        .or_else(|| {
+            top.iter()
+                .copied()
+                .filter(|&h| class_of(h) == "Windows.UI.Core.CoreWindow")
+                .find(|&h| {
+                    let mut buf = [0u16; 512];
+                    let n = unsafe { GetWindowTextW(h, &mut buf) } as usize;
+                    from_wide(&buf[..n.min(buf.len())]) == title
+                })
+                .map(pid_of)
+        })?;
+    exe_path(inner)
+}
+
+/// A friendly name for a program: "chrome" → "Chrome". A Store app goes by
+/// its window's title ("Calculator"), since its program names aren't.
+pub(super) fn label(w: &Win) -> String {
+    if w.frame_host && !w.title.is_empty() {
+        return w.title.clone();
+    }
     let s = exe_stem(&w.exe);
     let mut c = s.chars();
     match c.next() {
@@ -109,9 +184,26 @@ fn label(w: &Win) -> String {
     }
 }
 
+/// What a spoken name finds among some windows.
+pub(super) enum Found {
+    /// Every window of the best-matching program, front first.
+    Some(Vec<Win>),
+    None,
+    /// Several programs match: what to ask.
+    Many(String),
+}
+
 /// The windows a spoken name means: every window of the best-matching program.
 pub(super) fn find(query: &str) -> Result<Vec<Win>, String> {
-    let wins = list();
+    match find_in(query, list()) {
+        Found::Some(w) => Ok(w),
+        Found::None => Err(format!("Nothing called \"{query}\" is open.")),
+        Found::Many(ask) => Err(ask),
+    }
+}
+
+/// [`find`] among these windows.
+pub(super) fn find_in(query: &str, wins: Vec<Win>) -> Found {
     let q = normalize(alias(query).unwrap_or(query));
     let q2 = normalize(query);
     let mut best = 0;
@@ -141,7 +233,7 @@ pub(super) fn find(query: &str) -> Result<Vec<Win>, String> {
         .map(|(_, w)| w)
         .collect();
     if top.is_empty() {
-        return Err(format!("Nothing called \"{query}\" is open."));
+        return Found::None;
     }
     let mut programs: Vec<String> = top.iter().map(|w| exe_stem(&w.exe)).collect();
     programs.sort();
@@ -152,12 +244,12 @@ pub(super) fn find(query: &str) -> Result<Vec<Win>, String> {
             .map(|w| format!("{} ({})", w.title, label(w)))
             .take(6)
             .collect();
-        return Err(format!(
+        return Found::Many(format!(
             "Several open windows match \"{query}\": {}. Ask which one.",
             names.join(", ")
         ));
     }
-    Ok(top)
+    Found::Some(top)
 }
 
 pub fn act(index: &Index, action: &str, name: &str) -> Outcome {

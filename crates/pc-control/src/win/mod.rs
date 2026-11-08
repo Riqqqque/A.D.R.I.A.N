@@ -5,6 +5,7 @@ mod audio;
 mod clipboard;
 mod health;
 mod info;
+mod layout;
 mod media;
 mod nvml;
 mod open;
@@ -118,6 +119,7 @@ pub fn run(inner: &Inner, policy: &Policy, name: &str, action: &str, args: &Valu
                 ),
             }
         }
+        "pc_windows" => layout::run(&inner.index(policy), action, args),
         "pc_open" => open::run(args),
         "pc_media" => media::run(action, &s("app")),
         "pc_volume" => audio::run(action, args, || inner.index(policy)),

@@ -427,12 +427,21 @@ fn front_window(fg: HWND) -> Option<wnd::Win> {
         if DESKTOP_CLASSES.contains(&class.as_str()) {
             return None;
         }
+        // A Store app's frame: named by the app inside it.
+        if let Some(w) = wnd::list_all()
+            .into_iter()
+            .find(|w| w.hwnd == fg && w.cloaked == 0)
+        {
+            return (!is_ours(&w)).then_some(w);
+        }
         let mut title = [0u16; 512];
         let n = GetWindowTextW(fg, &mut title) as usize;
         let w = wnd::Win {
             hwnd: fg,
             title: from_wide(&title[..n.min(title.len())]),
             exe: wnd::exe_path(pid_of(fg)).unwrap_or_default(),
+            cloaked: 0,
+            frame_host: false,
         };
         (!is_ours(&w)).then_some(w)
     }
@@ -792,6 +801,8 @@ mod tests {
             hwnd: HWND::default(),
             title: "t".into(),
             exe: exe.into(),
+            cloaked: 0,
+            frame_host: false,
         };
         assert!(
             refuse_protected(&index, &win("C:\\Games\\shooter.exe"))
