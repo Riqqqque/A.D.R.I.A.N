@@ -17,6 +17,8 @@ pub struct Settings {
     pub pc: Policy,
     /// Don't install new versions by themselves (only say there is one).
     pub updates_off: bool,
+    /// Don't tell the server when a game is being played (so no quiet mode).
+    pub quiet_off: bool,
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -54,6 +56,8 @@ pub struct Form {
     /// The shortcuts box, as typed. It replaces whatever shortcuts `pc` holds.
     pub shortcuts: String,
     pub auto_update: Option<bool>,
+    /// "Quiet while I play". None from a page that doesn't have the switch.
+    pub quiet_while_playing: Option<bool>,
 }
 
 /// What a Save changed that needs acting on.
@@ -102,6 +106,9 @@ pub fn commit(
     };
     if let Some(on) = form.auto_update {
         next.updates_off = !on;
+    }
+    if let Some(on) = form.quiet_while_playing {
+        next.quiet_off = !on;
     }
     write(&next)?;
     let saved = Saved {
@@ -294,6 +301,7 @@ mod tests {
             pc: Policy::default(),
             shortcuts: String::new(),
             auto_update: None,
+            quiet_while_playing: None,
         }
     }
 
@@ -325,6 +333,24 @@ mod tests {
         assert_eq!(s.server_url, "a:8791");
         assert!(s.pc.shutdown);
         assert!(!s.updates_off);
+    }
+
+    #[test]
+    fn quiet_while_playing_is_on_unless_turned_off() {
+        let mut s = on_server_a();
+        assert!(!s.quiet_off);
+        // A page without the switch leaves it as it was.
+        commit(&mut s, form("a:8791"), |_| Ok(())).unwrap();
+        assert!(!s.quiet_off);
+        let off = Form {
+            quiet_while_playing: Some(false),
+            ..form("a:8791")
+        };
+        commit(&mut s, off, |_| Ok(())).unwrap();
+        assert!(s.quiet_off);
+        // Older settings files don't have it: on.
+        let old: Settings = serde_json::from_str(r#"{"server_url":"a:8791"}"#).unwrap();
+        assert!(!old.quiet_off);
     }
 
     #[test]

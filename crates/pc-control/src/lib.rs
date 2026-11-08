@@ -9,6 +9,7 @@
 //! flags that), no killing processes, and only the PC's own shortcuts besides
 //! installed apps can be started.
 
+pub mod activity;
 pub mod matching;
 pub mod policy;
 
@@ -86,6 +87,20 @@ impl Pc {
     pub fn refresh(&self) {
         #[cfg(windows)]
         self.inner.refresh(&self.policy);
+    }
+
+    /// The game in front right now, if any (see [`activity`]). Cheap enough for
+    /// every couple of seconds, and never waits for the app index.
+    pub fn game_in_front(&self, fullscreen: bool) -> Option<activity::Playing> {
+        #[cfg(windows)]
+        {
+            win::activity::game_in_front(&self.inner, fullscreen)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = fullscreen;
+            None
+        }
     }
 
     /// Do one action. Never panics; anything unexpected comes back as `ok: false`.

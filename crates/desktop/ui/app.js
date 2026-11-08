@@ -180,6 +180,7 @@
     $('mic').value = Math.round(current.mic_threshold * 600);
     $('micHint').textContent = micLabel($('mic').value);
     $('autoUpdate').checked = current.auto_update;
+    $('quietPlaying').checked = current.quiet_while_playing !== false;
     renderUpdate();
     const list = $('toggles');
     list.textContent = '';
@@ -226,7 +227,7 @@
     save.disabled = true;
     save.textContent = 'Saving';
     try {
-      await invoke('save_settings', { serverUrl: $('server').value, token: $('token').value || null, micThreshold: Number($('mic').value) / 600, pc, shortcuts: $('shortcuts').value, autoUpdate: $('autoUpdate').checked });
+      await invoke('save_settings', { serverUrl: $('server').value, token: $('token').value || null, micThreshold: Number($('mic').value) / 600, pc, shortcuts: $('shortcuts').value, autoUpdate: $('autoUpdate').checked, quietWhilePlaying: $('quietPlaying').checked });
       closeSettings();
     } catch (err) {
       $('error').textContent = String(err);
