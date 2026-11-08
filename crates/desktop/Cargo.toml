@@ -24,6 +24,8 @@ rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs
 # Self-update from GitHub releases (TLS through the aws-lc-rs provider installed in main).
 ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "json"] }
 sha2 = "0.10.9"
+# Pictures for the server (pc_screen) go as base64 in JSON.
+base64 = "0.22.1"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.58.0", features = ["Win32_Media_Audio", "Win32_System_Com"] }
