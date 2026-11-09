@@ -3,8 +3,8 @@
 //! anything that can wait for after the match.
 //!
 //! Only what's in front counts: a game in a game folder (or known by name)
-//! whose window has the focus, or a full-screen app that isn't a video player
-//! or a browser. Everything is read from outside the game (the foreground
+//! whose window has the focus, or a full-screen app that isn't a video player,
+//! a browser or a Store app (those count only by name or game folder). Everything is read from outside the game (the foreground
 //! window, its program's path and title, Steam's registry value): nothing
 //! hooks into it or sends it messages.
 //!
@@ -28,6 +28,10 @@ pub struct Front {
     pub steam_app: u32,
     /// The game's name, when the program is in a game's install folder.
     pub game_folder: Option<String>,
+    /// `exe` is a Store app found inside its ApplicationFrameHost window. Full
+    /// screen alone never makes one a game: Store video and streaming apps
+    /// (Prime Video, Disney+, web apps in WWAHost) are full screen all the time.
+    pub in_store_frame: bool,
 }
 
 /// A game is being played: its name, if it can be told.
@@ -58,7 +62,7 @@ const KNOWN: [(&str, &str); 16] = [
 
 /// Full screen but not a game: video players, browsers (a full-screen show),
 /// slides, a friend's stream or a call shown full screen.
-const NOT_GAMES: [&str; 34] = [
+const NOT_GAMES: [&str; 35] = [
     "chrome",
     "msedge",
     "firefox",
@@ -96,6 +100,8 @@ const NOT_GAMES: [&str; 34] = [
     "teams",
     // Store apps (Netflix, Movies & TV) show their windows through it.
     "applicationframehost",
+    // Store web apps (many streaming apps) run inside it.
+    "wwahost",
 ];
 
 /// "C:\\Games\\Foo\\foo.exe" → "foo".
@@ -139,7 +145,9 @@ pub fn playing(f: &Front) -> Option<Playing> {
     if name.is_some() {
         return Some(Playing { name });
     }
-    if f.fullscreen && !NOT_GAMES.contains(&stem.as_str()) {
+    // A Store app from its frame counts only as a known game or by its folder
+    // (above): full screen is how its video and streaming apps always look.
+    if f.fullscreen && !f.in_store_frame && !NOT_GAMES.contains(&stem.as_str()) {
         return Some(Playing { name: None });
     }
     // A program that can't be read, with a Steam game running: most likely that
@@ -541,23 +549,42 @@ mod tests {
     #[test]
     fn a_store_game_is_judged_by_the_app_inside_its_frame() {
         // What game_in_front passes once it has looked inside ApplicationFrameHost.
-        let f = Front {
+        let store = |exe: &str| Front {
             fullscreen: true,
-            ..front("C:\\Program Files\\WindowsApps\\Example.Puzzle_1.0_x64__abc\\Puzzle.exe")
+            in_store_frame: true,
+            ..front(exe)
         };
-        assert_eq!(playing(&f), Some(Playing { name: None }));
-        let mc = front(
+        // Full screen alone says nothing: that's how Store video apps look.
+        let puzzle = "C:\\Program Files\\WindowsApps\\Example.Puzzle_1.0_x64__abc\\Puzzle.exe";
+        assert_eq!(playing(&store(puzzle)), None);
+        // The same program outside a frame is judged like any other.
+        let plain = Front {
+            in_store_frame: false,
+            ..store(puzzle)
+        };
+        assert_eq!(playing(&plain), Some(Playing { name: None }));
+        // In a game folder (XboxGames) it is a game.
+        let xbox = Front {
+            game_folder: Some("Some Game".into()),
+            ..store("D:\\XboxGames\\Some Game\\Content\\game.exe")
+        };
+        assert_eq!(playing(&xbox).unwrap().name.as_deref(), Some("Some Game"));
+        let mc = store(
             "C:\\Program Files\\WindowsApps\\Microsoft.MinecraftUWP_1.21.0_x64__8wekyb3d8bbwe\\Minecraft.Windows.exe",
         );
         assert_eq!(playing(&mc).unwrap().name.as_deref(), Some("Minecraft"));
-        // Movies & TV, looked inside, is still a show.
-        let movies = Front {
-            fullscreen: true,
-            ..front(
-                "C:\\Program Files\\WindowsApps\\Microsoft.ZuneVideo_10.0_x64__8wekyb3d8bbwe\\Video.UI.exe",
-            )
-        };
-        assert_eq!(playing(&movies), None);
+        // Movies & TV and Store web apps, looked inside, are still shows.
+        for show in [
+            "C:\\Program Files\\WindowsApps\\Microsoft.ZuneVideo_10.0_x64__8wekyb3d8bbwe\\Video.UI.exe",
+            "C:\\Windows\\System32\\WWAHost.exe",
+        ] {
+            assert_eq!(playing(&store(show)), None, "{show}");
+            let bare = Front {
+                in_store_frame: false,
+                ..store(show)
+            };
+            assert_eq!(playing(&bare), None, "{show}");
+        }
     }
 
     #[test]
