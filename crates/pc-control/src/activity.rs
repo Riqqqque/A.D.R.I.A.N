@@ -527,14 +527,14 @@ mod tests {
     #[test]
     fn a_stream_a_call_or_a_photo_full_screen_isnt_a_game() {
         for exe in [
-            "C:\\Users\\alex\\AppData\\Local\\Discord\\app-1.0.9\\Discord.exe",
-            "C:\\Users\\alex\\AppData\\Local\\DiscordPTB\\app-1.0.9\\DiscordPTB.exe",
+            "C:\\Users\\you\\AppData\\Local\\Discord\\app-1.0.9\\Discord.exe",
+            "C:\\Users\\you\\AppData\\Local\\DiscordPTB\\app-1.0.9\\DiscordPTB.exe",
             "C:\\Program Files\\WindowsApps\\Microsoft.ZuneMusic_11.0_x64__8wekyb3d8bbwe\\Microsoft.Media.Player.exe",
             "C:\\Program Files\\WindowsApps\\Microsoft.Windows.Photos_2024.0_x64__8wekyb3d8bbwe\\Photos.exe",
             "C:\\Program Files (x86)\\MPC-HC\\mpc-hc.exe",
             "C:\\Program Files (x86)\\DAUM\\PotPlayer\\PotPlayerMini.exe",
             "C:\\Program Files\\Kodi\\kodi.exe",
-            "C:\\Users\\alex\\AppData\\Local\\Programs\\Stremio\\stremio.exe",
+            "C:\\Users\\you\\AppData\\Local\\Programs\\Stremio\\stremio.exe",
             "C:\\Program Files\\Jellyfin\\Jellyfin Media Player\\JellyfinMediaPlayer.exe",
             "C:\\Program Files\\Zoom\\bin\\Zoom.exe",
             "C:\\Program Files\\WindowsApps\\MSTeams_24.0_x64__8wekyb3d8bbwe\\ms-teams.exe",
