@@ -28,7 +28,8 @@ pub struct Front {
     pub steam_app: u32,
     /// The game's name, when the program is in a game's install folder.
     pub game_folder: Option<String>,
-    /// `exe` is a Store app found inside its ApplicationFrameHost window. Full
+    /// `exe` is a Store app: found inside its ApplicationFrameHost window, or a
+    /// packaged app with its own window under WindowsApps. Full
     /// screen alone never makes one a game: Store video and streaming apps
     /// (Prime Video, Disney+, web apps in WWAHost) are full screen all the time.
     pub in_store_frame: bool,

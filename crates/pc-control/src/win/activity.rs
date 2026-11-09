@@ -77,8 +77,11 @@ fn judge(
     fullscreen: bool,
     steam_app: impl FnOnce() -> u32,
 ) -> Option<Playing> {
-    let in_store_frame = inside.is_some();
+    let framed = inside.is_some();
     let exe = inside.unwrap_or(exe);
+    // Packaged desktop apps (WinUI apps such as Apple TV) have their own window,
+    // no frame, but still live under WindowsApps: judged like framed Store apps.
+    let in_store_frame = framed || is_store_package(&exe);
     let game_folder = if exe.is_empty() {
         None
     } else {
@@ -101,6 +104,13 @@ fn judge(
         game_folder,
         in_store_frame,
     })
+}
+
+/// A program installed as a Store package (under `\WindowsApps\`).
+fn is_store_package(exe: &str) -> bool {
+    exe.to_lowercase()
+        .replace('/', "\\")
+        .contains("\\windowsapps\\")
 }
 
 #[cfg(test)]
@@ -226,6 +236,30 @@ mod tests {
             || 0,
         );
         assert_eq!(frame, None);
+    }
+
+    #[test]
+    fn a_packaged_app_with_its_own_window_is_judged_like_a_framed_one() {
+        // WinUI Store apps have a window of their own, no ApplicationFrameHost.
+        let tv = judge(
+            Some(&index()),
+            "C:\\Program Files\\WindowsApps\\AppleInc.AppleTV_1.0.0.0_x64__abc\\AppleTV.exe".into(),
+            None,
+            String::new(),
+            true,
+            || 0,
+        );
+        assert_eq!(tv, None);
+        // A known game still counts wherever it's installed.
+        let mc = judge(
+            Some(&index()),
+            "C:\\Program Files\\WindowsApps\\Microsoft.MinecraftUWP_1.0.0.0_x64__8w\\Minecraft.Windows.exe".into(),
+            None,
+            String::new(),
+            true,
+            || 0,
+        );
+        assert!(mc.is_some());
     }
 
     #[test]
