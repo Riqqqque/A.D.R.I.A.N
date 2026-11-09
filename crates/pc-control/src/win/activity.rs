@@ -59,8 +59,10 @@ pub fn game_in_front(inner: &Inner, fullscreen: bool) -> Option<Playing> {
     };
     // Borderless full screen, which the shell doesn't always report.
     let fullscreen = fullscreen || borderless_in_front(hwnd);
+    // Read before taking the index lock, so the registry read never holds it.
+    let steam = if exe.is_empty() { steam_app() } else { 0 };
     let index = inner.index.lock().unwrap_or_else(|e| e.into_inner());
-    judge(index.as_ref(), exe, inside, title, fullscreen, steam_app)
+    judge(index.as_ref(), exe, inside, title, fullscreen, || steam)
 }
 
 /// Whether the program in front is a game: `exe` is the window's own program,
