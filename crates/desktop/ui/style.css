@@ -123,3 +123,18 @@ code { font: 11.5px var(--mono); color: var(--fg); }
 .btn:disabled { opacity: 0.6; cursor: default; }
 
 @media (prefers-reduced-motion: reduce) { .chip[data-mode="thinking"] .dot { animation: none; } .sheet { animation: none; } }
+
+/* --- a ringing alarm ------------------------------------------------------ */
+.alarm {
+  position: fixed; left: 50%; top: 64px; transform: translateX(-50%); z-index: 4;
+  width: min(420px, calc(100% - 32px)); padding: 18px 20px 16px; border-radius: 14px;
+  background: color-mix(in srgb, var(--surface-2) 92%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(0, 0, 0, 0.4); text-align: center;
+  animation: alarm-in 180ms ease-out;
+}
+.alarm-label { font: 600 22px/1.25 var(--display); letter-spacing: 0.01em; }
+.alarm-sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
+.alarm-buttons { display: flex; gap: 10px; justify-content: center; margin-top: 14px; }
+.alarm-buttons .btn { height: 44px; min-width: 132px; font-size: 15px; }
+@keyframes alarm-in { from { opacity: 0; transform: translate(-50%, -6px); } }
+@media (prefers-reduced-motion: reduce) { .alarm { animation: none; } }

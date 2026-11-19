@@ -340,6 +340,25 @@ fn what_plays(action: &str, args: &Value, index: &Index) -> windows::core::Resul
     Ok(Outcome::ok(format!("{}.", said.join(", "))))
 }
 
+/// The default speakers' master level (0 to 1) and whether they're muted.
+pub(crate) fn master_level() -> Option<(f32, bool)> {
+    let _com = Com::init();
+    unsafe {
+        let v: IAudioEndpointVolume = endpoint().ok()?.Activate(CLSCTX_ALL, None).ok()?;
+        Some((v.GetMasterVolumeLevelScalar().ok()?, v.GetMute().ok()?.as_bool()))
+    }
+}
+
+/// Set the default speakers' master level and mute.
+pub(crate) fn set_master_level(level: f32, muted: bool) -> bool {
+    let _com = Com::init();
+    unsafe {
+        let Ok(d) = endpoint() else { return false };
+        let Ok(v) = d.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) else { return false };
+        v.SetMasterVolumeLevelScalar(level.clamp(0.0, 1.0), std::ptr::null()).is_ok() && v.SetMute(muted, std::ptr::null()).is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

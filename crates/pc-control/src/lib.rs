@@ -124,6 +124,31 @@ impl Pc {
         }
     }
 
+    /// The speakers' master volume (0 to 1) and mute, for an alarm that must be heard.
+    pub fn master_volume(&self) -> Option<(f32, bool)> {
+        #[cfg(windows)]
+        {
+            win::audio::master_level()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// Set the speakers' master volume and mute (alarms raise a muted PC, then put it back).
+    pub fn set_master_volume(&self, level: f32, muted: bool) -> bool {
+        #[cfg(windows)]
+        {
+            win::audio::set_master_level(level, muted)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (level, muted);
+            false
+        }
+    }
+
     /// Do one action. Never panics; anything unexpected comes back as `ok: false`.
     pub fn run(&self, name: &str, args: &Value) -> Outcome {
         let s = |k: &str| {

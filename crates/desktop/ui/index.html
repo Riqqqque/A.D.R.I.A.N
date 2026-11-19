@@ -21,6 +21,15 @@
     </span>
   </header>
 
+  <section class="alarm" id="alarm" role="alertdialog" aria-labelledby="alarmLabel" hidden>
+    <div class="alarm-label" id="alarmLabel">Alarm</div>
+    <div class="alarm-sub" id="alarmSub">Say “stop” or “snooze”, or use the buttons.</div>
+    <div class="alarm-buttons">
+      <button type="button" class="btn alarm-snooze" id="alarmSnooze">Snooze</button>
+      <button type="button" class="btn primary alarm-stop" id="alarmStop">Stop</button>
+    </div>
+  </section>
+
   <main class="stage">
     <section class="transcript" aria-live="polite">
       <p class="you" id="you" hidden></p>

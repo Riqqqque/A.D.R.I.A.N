@@ -5,6 +5,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod alarm;
 mod audio;
 mod config;
 mod link;
@@ -37,6 +38,8 @@ struct AppState {
     status: Mutex<StatusView>,
     /// What the tray shows now.
     tray: Mutex<Option<tray::View>>,
+    /// The tray's Stop alarm and Snooze items, on only while one rings.
+    alarm_items: Mutex<Option<(MenuItem<tauri::Wry>, MenuItem<tauri::Wry>)>>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -246,6 +249,39 @@ fn push_to_talk(app: AppHandle, state: tauri::State<'_, AppState>, down: bool) {
     }
 }
 
+fn epoch_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+/// Stop or Snooze, from the window or the tray.
+fn answer_alarm(app: &AppHandle, action: &'static str) {
+    let state = app.state::<AppState>();
+    match state.shared.alarms.answer(action, epoch_ms()) {
+        // Rung here by itself: quiet now; the server hears after the next welcome.
+        alarm::Answer::Here => state.shared.stop_reply(),
+        alarm::Answer::Server => {
+            if !link::offer(&state.shared, &state.cmds, Cmd::Alarm(action)) {
+                let _ = app.emit("not_sent", link::NOT_SENT);
+            }
+        }
+        alarm::Answer::Nothing => {}
+    }
+    let _ = app.emit("alarm", state.shared.alarms.view());
+}
+
+#[tauri::command]
+fn alarm_action(app: AppHandle, action: String) {
+    answer_alarm(&app, if action == "snooze" { "snooze" } else { "stop" });
+}
+
+#[tauri::command]
+fn alarm_state(state: tauri::State<'_, AppState>) -> alarm::View {
+    state.shared.alarms.view()
+}
+
 /// The page asks once at load, in case frames are paused then; after that it
 /// follows "frame" events.
 #[tauri::command]
@@ -301,6 +337,28 @@ fn show(app: &AppHandle) {
     let _ = w.unminimize();
     let _ = w.show();
     let _ = w.set_focus();
+}
+
+/// An alarm rings: the window comes up with its buttons, without taking the
+/// keyboard from whatever is in front (never over a full-screen game).
+fn show_for_alarm(app: &AppHandle) {
+    if fullscreen_app_in_front() {
+        return;
+    }
+    let w = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => {
+            let Some(cfg) = app.config().app.windows.first() else {
+                return;
+            };
+            match WebviewWindowBuilder::from_config(app, cfg).and_then(|b| b.focused(false).build()) {
+                Ok(w) => w,
+                Err(_) => return,
+            }
+        }
+    };
+    let _ = w.unminimize();
+    let _ = w.show();
 }
 
 /// Back to the tray: the window and its web view go away completely.
@@ -462,6 +520,7 @@ fn main() {
             pc: pc.clone(),
             status: Mutex::new(StatusView::default()),
             tray: Mutex::new(None),
+            alarm_items: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -472,7 +531,9 @@ fn main() {
             push_to_talk,
             her_state,
             orb_drawing,
-            audio_devices
+            audio_devices,
+            alarm_action,
+            alarm_state
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -481,7 +542,10 @@ fn main() {
             let show_item =
                 MenuItem::with_id(app, "show", "Show A.D.R.I.A.N.", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let stop_item = MenuItem::with_id(app, "alarm_stop", "Stop alarm", false, None::<&str>)?;
+            let snooze_item = MenuItem::with_id(app, "alarm_snooze", "Snooze alarm", false, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &stop_item, &snooze_item, &quit_item])?;
+            *app.state::<AppState>().alarm_items.lock().unwrap_or_else(|e| e.into_inner()) = Some((stop_item, snooze_item));
             let mut tray = TrayIconBuilder::with_id("main")
                 .tooltip("A.D.R.I.A.N.")
                 .menu(&menu)
@@ -491,6 +555,8 @@ fn main() {
             }
             tray.on_menu_event(|app, e| match e.id.as_ref() {
                 "show" => show(app),
+                "alarm_stop" => answer_alarm(app, "stop"),
+                "alarm_snooze" => answer_alarm(app, "snooze"),
                 "quit" => app.exit(0),
                 _ => {}
             })
@@ -529,6 +595,16 @@ fn main() {
                     }
                 }
                 Err(e) => eprintln!("push-to-talk hotkey unavailable: {e}"),
+            }
+
+            // Alarms: the copy to ring by itself, kept beside the settings. Speakers an
+            // alarm raised before a crash go back to how they were.
+            if let Some(dir) = config::path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+                shared.alarms.load(dir.join("alarms.json"));
+            }
+            if let Some((level, muted)) = shared.alarms.take_restore() {
+                let pc = pc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                pc.set_master_volume(level, muted);
             }
 
             // Audio and the server link.
@@ -579,6 +655,8 @@ fn main() {
                                     serde_json::json!({ "who": who, "text": text, "last": last }),
                                 );
                             }
+                            // The alarm thread below picks the change up within 200 ms.
+                            Event::Alarms => {}
                         }
                     }
                 });
@@ -687,6 +765,60 @@ fn main() {
                         let f = pacer.next(&shared, drawing == Some(true), tick % 10 == 0);
                         if let Some(f) = f {
                             let _ = handle.emit("frame", f);
+                        }
+                    }
+                });
+            }
+            // Alarms: rings here by itself when the server is out of reach, keeps
+            // the speakers audible while one rings, and the window and tray in step.
+            {
+                let (handle, shared, pc) = (handle.clone(), shared.clone(), pc.clone());
+                std::thread::spawn(move || {
+                    let mut beeper = alarm::Beeper::default();
+                    let mut pushed_until: Option<std::time::Instant> = None;
+                    let mut shown = alarm::View::default();
+                    let mut raised = false;
+                    loop {
+                        std::thread::sleep(Duration::from_millis(200));
+                        let local = shared.alarms.tick(epoch_ms());
+                        if local {
+                            let t = std::time::Instant::now();
+                            let ahead = pushed_until.map_or(Duration::ZERO, |u| u.saturating_duration_since(t));
+                            if ahead < Duration::from_millis(400) {
+                                shared.push_reply(&beeper.next(48_000));
+                                pushed_until = Some(t + ahead + Duration::from_secs(1));
+                            }
+                        } else {
+                            pushed_until = None;
+                        }
+                        let ringing = shared.alarms.ringing();
+                        if ringing != raised {
+                            raised = ringing;
+                            let pc = pc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            if ringing {
+                                if let Some(level) = pc.master_volume().and_then(|now| shared.alarms.plan_raise(now)) {
+                                    pc.set_master_volume(level, false);
+                                }
+                            } else if let Some((level, muted)) = shared.alarms.take_restore() {
+                                pc.set_master_volume(level, muted);
+                            }
+                        }
+                        let view = shared.alarms.view();
+                        if view != shown {
+                            if view.ringing && !shown.ringing {
+                                let h = handle.clone();
+                                let _ = handle.run_on_main_thread(move || show_for_alarm(&h));
+                            }
+                            let on = view.ringing;
+                            let h = handle.clone();
+                            let _ = handle.run_on_main_thread(move || {
+                                if let Some((stop, snooze)) = h.state::<AppState>().alarm_items.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                    let _ = stop.set_enabled(on);
+                                    let _ = snooze.set_enabled(on);
+                                }
+                            });
+                            let _ = handle.emit("alarm", view.clone());
+                            shown = view;
                         }
                     }
                 });
