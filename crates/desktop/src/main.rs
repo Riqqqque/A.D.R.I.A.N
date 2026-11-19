@@ -778,6 +778,8 @@ fn main() {
                     let mut pushed_until: Option<std::time::Instant> = None;
                     let mut shown = alarm::View::default();
                     let mut raised = false;
+                    // The window was opened by the alarm (it was in the tray): it goes again after.
+                    let mut opened = false;
                     loop {
                         std::thread::sleep(Duration::from_millis(200));
                         let local = shared.alarms.tick(epoch_ms());
@@ -806,8 +808,23 @@ fn main() {
                         let view = shared.alarms.view();
                         if view != shown {
                             if view.ringing && !shown.ringing {
+                                opened = handle.get_webview_window("main").is_none() && !fullscreen_app_in_front();
                                 let h = handle.clone();
                                 let _ = handle.run_on_main_thread(move || show_for_alarm(&h));
+                            } else if !view.ringing && shown.ringing && opened {
+                                // A few seconds to see it went off, then back to the tray, unless they're using it.
+                                opened = false;
+                                let h = handle.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(Duration::from_secs(4));
+                                    let h2 = h.clone();
+                                    let _ = h.run_on_main_thread(move || {
+                                        let busy = h2.get_webview_window("main").is_some_and(|w| w.is_focused().unwrap_or(false));
+                                        if !busy && !h2.state::<AppState>().shared.alarms.ringing() {
+                                            close(&h2);
+                                        }
+                                    });
+                                });
                             }
                             let on = view.ringing;
                             let h = handle.clone();
