@@ -2,7 +2,7 @@
 
 pub(crate) mod activity;
 mod apps;
-mod audio;
+pub(crate) mod audio;
 mod clipboard;
 mod health;
 mod info;

@@ -1,0 +1,425 @@
+//! Alarms on this PC. While one rings (the server streams its sound) the
+//! window and tray offer Stop and Snooze, and muted or nearly silent speakers
+//! are turned up, then put back. The server also sends the alarms coming up:
+//! if it can't be reached when one is due, the app rings it itself and tells
+//! the server how it was answered once the link is back.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// The server gets this long to ring an alarm before the PC does it itself.
+pub const GRACE_MS: f64 = 20_000.0;
+/// Speakers below this (or muted) are turned up while an alarm rings.
+pub const FLOOR: f32 = 0.3;
+/// Kept at most, so a bad message can't grow the file.
+const MAX_KEPT: usize = 64;
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct Replica {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    /// When it rings next, epoch ms.
+    pub at: f64,
+    /// The occurrence it's for, epoch ms.
+    pub base: f64,
+}
+
+/// An alarm the PC rang itself and someone answered here.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct Done {
+    pub id: String,
+    pub base: f64,
+    pub action: String,
+    pub at: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    list: Vec<Replica>,
+    done: Vec<Done>,
+    snooze_min: f64,
+    ring_min: f64,
+    /// The speakers' level and mute before an alarm raised them.
+    restore: Option<(f32, bool)>,
+}
+
+impl Default for Saved {
+    fn default() -> Self {
+        Saved {
+            list: vec![],
+            done: vec![],
+            snooze_min: 9.0,
+            ring_min: 10.0,
+            restore: None,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Debug, PartialEq, Default)]
+pub struct View {
+    pub ringing: bool,
+    /// "7:00 alarm: gym", "Pasta timer".
+    pub label: String,
+    pub timer: bool,
+    /// Rung by the PC itself (the server is out of reach).
+    pub local: bool,
+}
+
+#[derive(Default)]
+struct State {
+    saved: Saved,
+    /// What the server says is ringing now.
+    server: Vec<Replica>,
+    /// Ringing here by itself, since then.
+    local: Option<(Vec<Replica>, f64)>,
+    /// Occurrences already rung here (id, at), so one is never rung twice.
+    rung: HashSet<(String, u64)>,
+    /// The server's clock minus this PC's, ms: due times are the server's.
+    skew: f64,
+}
+
+/// What Stop or Snooze did.
+#[derive(Debug, PartialEq)]
+pub enum Answer {
+    /// Handled here (it was ringing by itself); the server hears later.
+    Here,
+    /// The server rings it: send it the order.
+    Server,
+    Nothing,
+}
+
+#[derive(Default)]
+pub struct Alarms {
+    s: Mutex<State>,
+    file: Mutex<Option<PathBuf>>,
+}
+
+fn read(m: &Value) -> Option<Replica> {
+    let s = |k: &str| m.get(k).and_then(Value::as_str).map(|x| x.chars().take(80).collect::<String>());
+    let n = |k: &str| m.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
+    Some(Replica {
+        id: s("id")?,
+        kind: s("kind").unwrap_or_else(|| "alarm".into()),
+        label: s("label").unwrap_or_default(),
+        at: n("at").or_else(|| n("base"))?,
+        base: n("base")?,
+    })
+}
+
+impl Alarms {
+    /// Use this file for the copy (the settings folder); loads what's there.
+    pub fn load(&self, file: PathBuf) {
+        if let Some(saved) = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Saved>(&t).ok()) {
+            self.lock().saved = saved;
+        }
+        *self.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.s.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn save(&self, st: &State) {
+        let Some(f) = self.file.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(t) = serde_json::to_string(&st.saved) {
+            let tmp = f.with_extension("tmp");
+            if std::fs::write(&tmp, t).is_ok() {
+                let _ = std::fs::rename(&tmp, &f);
+            }
+        }
+    }
+
+    /// The server's `alarms` message. The server is back: what it says wins,
+    /// and anything ringing here by itself stops (the server rings it now).
+    pub fn server_said(&self, m: &Value) {
+        let mut st = self.lock();
+        let list = |k: &str| -> Vec<Replica> { m.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(read).take(MAX_KEPT).collect()).unwrap_or_default() };
+        st.saved.list = list("list");
+        st.server = list("ringing");
+        if let Some(t) = m.get("now").and_then(Value::as_f64).filter(|t| t.is_finite()) {
+            let here = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(t);
+            st.skew = t - here;
+        }
+        if let Some(v) = m.get("snoozeMin").and_then(Value::as_f64).filter(|v| (1.0..=60.0).contains(v)) {
+            st.saved.snooze_min = v;
+        }
+        if let Some(v) = m.get("ringMin").and_then(Value::as_f64).filter(|v| (1.0..=30.0).contains(v)) {
+            st.saved.ring_min = v;
+        }
+        st.local = None;
+        self.save(&st);
+    }
+
+    /// The link to the server is gone. Whatever it was ringing keeps ringing,
+    /// here now: the server may be what died.
+    pub fn link_lost(&self, now: f64) {
+        let mut st = self.lock();
+        let was = std::mem::take(&mut st.server);
+        if !was.is_empty() && st.local.is_none() {
+            for a in &was {
+                st.rung.insert((a.id.clone(), a.at as u64));
+            }
+            st.local = Some((was, now + st.skew));
+        }
+    }
+
+    /// Once a tick. An alarm the server hasn't rung within the grace rings
+    /// here (the server may be down, or up but not ringing it); one ringing
+    /// here stops after the ring time. True: ringing here.
+    pub fn tick(&self, now: f64) -> bool {
+        let mut st = self.lock();
+        let now = now + st.skew;
+        let ring_ms = st.saved.ring_min * 60_000.0;
+        if st.local.as_ref().is_some_and(|(_, since)| now - since > ring_ms) {
+            st.local = None;
+        }
+        // A ringing alarm is the server's (it says which): only one it never started counts.
+        if st.local.is_none() {
+            let due: Vec<Replica> = st
+                .saved
+                .list
+                .iter()
+                .filter(|a| a.at + GRACE_MS <= now && now - a.at < ring_ms && !st.rung.contains(&(a.id.clone(), a.at as u64)) && !st.server.iter().any(|r| r.id == a.id))
+                .cloned()
+                .collect();
+            if !due.is_empty() {
+                for a in &due {
+                    st.rung.insert((a.id.clone(), a.at as u64));
+                }
+                st.local = Some((due, now));
+            }
+        }
+        st.local.is_some()
+    }
+
+    /// Stop or Snooze from the window or the tray.
+    pub fn answer(&self, action: &str, now: f64) -> Answer {
+        let mut st = self.lock();
+        let now = now + st.skew;
+        if let Some((list, _)) = st.local.take() {
+            let snooze = st.saved.snooze_min * 60_000.0;
+            for a in &list {
+                st.saved.done.push(Done { id: a.id.clone(), base: a.base, action: action.into(), at: now });
+                if action == "snooze" {
+                    // Still offline then: it rings here again.
+                    if let Some(r) = st.saved.list.iter_mut().find(|r| r.id == a.id) {
+                        r.at = now + snooze;
+                    }
+                } else {
+                    st.saved.list.retain(|r| r.id != a.id);
+                }
+            }
+            let n = st.saved.done.len();
+            if n > MAX_KEPT {
+                st.saved.done.drain(..n - MAX_KEPT);
+            }
+            self.save(&st);
+            return Answer::Here;
+        }
+        if st.server.is_empty() { Answer::Nothing } else { Answer::Server }
+    }
+
+    /// What was answered here, for the server (sent after the welcome). They
+    /// stay until `sent_done` says they went out.
+    pub fn pending_done(&self) -> Vec<Value> {
+        let st = self.lock();
+        st.saved.done.iter().map(|d| json!({ "type": "alarm_done", "id": d.id, "base": d.base, "action": d.action, "at": d.at })).collect()
+    }
+
+    /// The first `n` of `pending_done` reached the server.
+    pub fn sent_done(&self, n: usize) {
+        let mut st = self.lock();
+        let n = n.min(st.saved.done.len());
+        if n > 0 {
+            st.saved.done.drain(..n);
+            self.save(&st);
+        }
+    }
+
+    pub fn ringing(&self) -> bool {
+        let st = self.lock();
+        st.local.is_some() || !st.server.is_empty()
+    }
+
+    pub fn view(&self) -> View {
+        let st = self.lock();
+        let (list, local) = match &st.local {
+            Some((l, _)) => (l.clone(), true),
+            None => (st.server.clone(), false),
+        };
+        let Some(first) = list.first() else { return View::default() };
+        let timer = list.iter().all(|a| a.kind == "timer");
+        let label = if timer {
+            if first.label.is_empty() { "Timer".into() } else { format!("{} timer", first.label) }
+        } else if first.label.is_empty() {
+            "Alarm".into()
+        } else {
+            format!("Alarm: {}", first.label)
+        };
+        View { ringing: true, label, timer, local }
+    }
+
+    /// Before raising the speakers: remember how they were (saved first, so a
+    /// crash still puts them back). None: nothing to change.
+    pub fn plan_raise(&self, now: (f32, bool)) -> Option<f32> {
+        let mut st = self.lock();
+        if st.saved.restore.is_some() || (!now.1 && now.0 >= FLOOR) {
+            return None;
+        }
+        st.saved.restore = Some(now);
+        self.save(&st);
+        Some(now.0.max(FLOOR))
+    }
+
+    /// After: how they were, once.
+    pub fn take_restore(&self) -> Option<(f32, bool)> {
+        let mut st = self.lock();
+        let r = st.saved.restore.take();
+        if r.is_some() {
+            self.save(&st);
+        }
+        r
+    }
+}
+
+/// The PC's own alarm sound: classic beeps, 48 kHz mono s16le like her voice.
+#[derive(Default)]
+pub struct Beeper {
+    pos: usize,
+}
+
+impl Beeper {
+    const RATE: usize = 48_000;
+    /// One cycle: four beeps, then a pause.
+    const CYCLE: usize = Self::RATE * 16 / 10;
+
+    pub fn next(&mut self, samples: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(samples * 2);
+        for _ in 0..samples {
+            let c = self.pos % Self::CYCLE;
+            let t = c as f32 / Self::RATE as f32;
+            let beep = (t / 0.125) as usize;
+            let within = t - beep as f32 * 0.125;
+            let mut v = 0.0;
+            if beep < 4 && within < 0.07 {
+                let ph = std::f32::consts::TAU * 1000.0 * t;
+                // A soft square, with a few ms of fade at each edge.
+                let edge = (within / 0.003).min((0.07 - within) / 0.006).min(1.0);
+                v = (ph.sin() + (3.0 * ph).sin() / 3.0 + (5.0 * ph).sin() / 5.0) * 0.3 * edge;
+            }
+            out.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+            self.pos += 1;
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(at: f64) -> Value {
+        json!({ "type": "alarms", "ringing": [], "list": [{ "id": "a1", "kind": "alarm", "label": "gym", "at": at, "base": at }], "snoozeMin": 5, "ringMin": 10 })
+    }
+
+    #[test]
+    fn the_server_dying_mid_ring_leaves_it_ringing_here() {
+        let a = Alarms::default();
+        a.server_said(&json!({ "type": "alarms", "ringing": [{ "id": "a1", "kind": "alarm", "label": "gym", "base": 0.0 }], "list": [] }));
+        assert!(!a.tick(1_000.0), "the server rings it");
+        a.link_lost(2_000.0);
+        assert!(a.tick(2_200.0));
+        assert!(a.view().local);
+        assert_eq!(a.answer("stop", 3_000.0), Answer::Here);
+        assert_eq!(a.pending_done()[0]["action"], "stop");
+    }
+
+    #[test]
+    fn online_but_never_rung_by_the_server_it_rings_here() {
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(!a.tick(GRACE_MS - 1.0));
+        assert!(a.tick(GRACE_MS + 1.0), "the server is up but didn't ring it");
+    }
+
+    #[test]
+    fn offline_it_rings_by_itself_after_the_grace_and_only_once() {
+        let a = Alarms::default();
+        a.server_said(&state(1_000_000.0));
+        assert!(!a.tick(1_000_000.0 + 5_000.0), "the server still has time");
+        assert!(a.tick(1_000_000.0 + GRACE_MS + 1.0));
+        assert_eq!(a.view().label, "Alarm: gym");
+        assert!(a.view().local);
+        // The ring time runs out: it stops, and doesn't start again.
+        assert!(!a.tick(1_000_000.0 + 11.0 * 60_000.0));
+        assert!(!a.tick(1_000_000.0 + 11.0 * 60_000.0 + 1.0));
+    }
+
+    #[test]
+    fn answered_here_is_told_to_the_server_later_and_a_snooze_rings_again() {
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        assert_eq!(a.answer("snooze", 30_000.0), Answer::Here);
+        assert!(!a.tick(31_000.0));
+        assert!(a.tick(30_000.0 + 5.0 * 60_000.0 + GRACE_MS + 1.0), "rings again after the snooze");
+        assert_eq!(a.answer("stop", 400_000.0), Answer::Here);
+        let done = a.pending_done();
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[0]["action"], "snooze");
+        assert_eq!(done[1]["action"], "stop");
+        a.sent_done(1);
+        assert_eq!(a.pending_done().len(), 1, "only what went out is dropped");
+        a.sent_done(1);
+        assert!(a.pending_done().is_empty());
+        assert!(!a.tick(10_000_000.0), "a stopped one is gone");
+    }
+
+    #[test]
+    fn the_server_coming_back_wins() {
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        a.server_said(&json!({ "type": "alarms", "ringing": [{ "id": "a1", "kind": "alarm", "label": "gym", "base": 0.0 }], "list": [] }));
+        assert!(a.ringing());
+        assert!(!a.view().local);
+        assert_eq!(a.answer("stop", 50_000.0), Answer::Server);
+        a.server_said(&json!({ "type": "alarms", "ringing": [], "list": [] }));
+        assert_eq!(a.answer("stop", 60_000.0), Answer::Nothing);
+    }
+
+    #[test]
+    fn muted_speakers_go_up_and_back_once() {
+        let a = Alarms::default();
+        assert_eq!(a.plan_raise((0.6, false)), None, "loud enough already");
+        assert_eq!(a.plan_raise((0.1, false)), Some(FLOOR));
+        assert_eq!(a.plan_raise((0.3, false)), None, "already raised");
+        assert_eq!(a.take_restore(), Some((0.1, false)));
+        assert_eq!(a.take_restore(), None);
+        assert_eq!(a.plan_raise((0.8, true)), Some(0.8), "muted: unmuted at its own level");
+    }
+
+    #[test]
+    fn a_bad_message_changes_nothing_dangerous() {
+        let a = Alarms::default();
+        a.server_said(&json!({ "type": "alarms", "list": [{ "id": 5 }, { "id": "x", "base": "soon" }, { "id": "ok", "base": 1.0 }] }));
+        assert!(a.tick(GRACE_MS + 2.0));
+    }
+
+    #[test]
+    fn beeps_then_quiet() {
+        let mut b = Beeper::default();
+        let one = b.next(Beeper::CYCLE);
+        let at = |s: f32| i16::from_le_bytes([one[(s * 48_000.0) as usize * 2], one[(s * 48_000.0) as usize * 2 + 1]]);
+        assert!(one.chunks(2).take(3360).any(|x| i16::from_le_bytes([x[0], x[1]]).abs() > 5000));
+        assert_eq!(at(1.2), 0);
+        assert_eq!(one.len(), Beeper::CYCLE * 2);
+    }
+}

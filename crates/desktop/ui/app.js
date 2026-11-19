@@ -68,6 +68,28 @@
     render();
   });
 
+  // --- a ringing alarm ---------------------------------------------------------
+  const showAlarm = (v) => {
+    $('alarm').hidden = !v || !v.ringing;
+    if (!v || !v.ringing) return;
+    $('alarmLabel').textContent = v.label;
+    $('alarmSnooze').textContent = v.timer ? 'More time' : 'Snooze';
+    $('alarmSub').textContent = v.local
+      ? "The server can't be reached, so this PC is ringing it. Stop or Snooze here."
+      : 'Say “stop” or “snooze”, or use the buttons.';
+  };
+  listen('alarm', (e) => showAlarm(e.payload));
+  invoke('alarm_state').then(showAlarm);
+  // A press counts once: the buttons go quiet until the answer is back.
+  const answerAlarm = (action) => {
+    for (const id of ['alarmStop', 'alarmSnooze']) $(id).disabled = true;
+    invoke('alarm_action', { action }).finally(() => {
+      for (const id of ['alarmStop', 'alarmSnooze']) $(id).disabled = false;
+    });
+  };
+  $('alarmStop').addEventListener('click', () => answerAlarm('stop'));
+  $('alarmSnooze').addEventListener('click', () => answerAlarm('snooze'));
+
   // --- conversation ---------------------------------------------------------
   let fade;
   listen('transcript', (e) => {

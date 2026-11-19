@@ -96,6 +96,8 @@ pub struct Shared {
     /// Playing a game now (debounced), for the server's quiet mode. Sent after
     /// every welcome while it's on, and whenever it changes.
     pub activity: Mutex<adrian_pc_control::activity::Activity>,
+    /// Alarms: what rings now, and the copy to ring by itself (alarm.rs).
+    pub alarms: crate::alarm::Alarms,
 }
 
 impl Shared {
@@ -123,6 +125,7 @@ impl Shared {
             wake: Mutex::new(None),
             devices: Mutex::new((String::new(), String::new())),
             activity: Mutex::new(Default::default()),
+            alarms: Default::default(),
         })
     }
 

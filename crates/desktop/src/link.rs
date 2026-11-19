@@ -65,6 +65,8 @@ pub enum Event {
         text: String,
         last: bool,
     },
+    /// The server's alarm state changed (ringing, or the list).
+    Alarms,
 }
 
 pub enum Cmd {
@@ -73,6 +75,8 @@ pub enum Cmd {
     Ptt,
     /// Playing started or stopped: send `Shared::activity` as it is now.
     Activity,
+    /// Stop or Snooze on an alarm the server is ringing.
+    Alarm(&'static str),
 }
 
 pub struct Link {
@@ -146,6 +150,9 @@ pub async fn run(
         };
         // However it ended, the server is gone until a new welcome.
         shared.set_online(false);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0);
+        shared.alarms.link_lost(now);
+        let _ = events.send(Event::Alarms);
         shared.stop_reply();
         shared.clear_state();
         let _ = events.send(Event::Thinking(false));
@@ -295,6 +302,12 @@ async fn session(
                                 if playing.gaming {
                                     put(&mut tx, Message::Text(playing.message().to_string().into())).await?;
                                 }
+                                // Alarms rung here while the server was out of reach, and how they were
+                                // answered. Each is forgotten only once it's gone out.
+                                for d in shared.alarms.pending_done() {
+                                    put(&mut tx, Message::Text(d.to_string().into())).await?;
+                                    shared.alarms.sent_done(1);
+                                }
                             }
                             "denied" => return Err(refused(s("reason"))),
                             "mode" => { let _ = events.send(Event::Thinking(s("mode") == "thinking")); }
@@ -307,6 +320,10 @@ async fn session(
                                 let _ = events.send(Event::Transcript { who: s("who"), text: s("text"), last });
                             }
                             "audio_stop" => shared.stop_reply(),
+                            "alarms" if *welcomed => {
+                                shared.alarms.server_said(&m);
+                                let _ = events.send(Event::Alarms);
+                            }
                             // Nothing runs for a server that hasn't accepted this PC's token yet:
                             // whatever answers at the address could send it.
                             "action" if !*welcomed => {
@@ -348,6 +365,7 @@ async fn session(
                     Cmd::Text(t) => json!({ "type": "text", "text": t }),
                     Cmd::Stop => { shared.stop_reply(); json!({ "type": "stop" }) }
                     Cmd::Ptt => json!({ "type": "ptt", "down": true }),
+                    Cmd::Alarm(action) => json!({ "type": "alarm_action", "action": action }),
                     Cmd::Activity => shared.activity.lock().unwrap_or_else(|e| e.into_inner()).message(),
                 };
                 put(&mut tx, Message::Text(m.to_string().into())).await?;
