@@ -1,8 +1,10 @@
 //! The connection to the A.D.R.I.A.N. service: audio both ways, the window's
-//! state, and PC actions. Reconnects by itself (1, 2, 5, then every 10 s,
-//! starting over after a connection that held; every few minutes after a
-//! refusal). Input only counts while the server is there: nothing typed or
-//! pressed offline waits for the link to come back.
+//! state, and PC actions. Reconnects by itself: a quarter second after a
+//! connection that held ends, then about once a second while the server has
+//! been gone under half a minute (a restart takes 20-25 s), then slowing to
+//! every 10 s by the one-minute mark; every few minutes after a refusal.
+//! Input only counts while the server is there: nothing typed or pressed
+//! offline waits for the link to come back.
 
 use crate::audio::{Shared, Up};
 use adrian_pc_control::{Outcome, Pc};
@@ -48,6 +50,18 @@ const SEND_LIMIT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(10)
 };
+/// The first try after a connection that held: soon, since a dropped link to
+/// a server that's still up comes straight back.
+const FIRST_TRY: Duration = Duration::from_millis(250);
+/// While the server has been gone this long, tries come about once a second.
+/// A restart takes 20-25 s; this covers it with room to spare.
+const QUICK_FOR: Duration = Duration::from_secs(30);
+/// The wait between tries during the quick stretch.
+const QUICK_WAIT: Duration = Duration::from_secs(1);
+/// The longest wait between tries, reached once she's been gone a minute.
+const LONGEST: Duration = Duration::from_secs(10);
+/// How long one try may take to connect.
+const CONNECT_LIMIT: Duration = Duration::from_secs(8);
 /// What's said when input can't reach her.
 pub const NOT_SENT: &str = "Not sent, she's offline.";
 
@@ -77,6 +91,8 @@ pub enum Cmd {
     Activity,
     /// Stop or Snooze on an alarm the server is ringing.
     Alarm(&'static str),
+    /// An alarm rung here was answered here: tell the server now.
+    AlarmDone,
 }
 
 pub struct Link {
@@ -100,9 +116,11 @@ pub fn answer_alarm(
     now: f64,
 ) -> bool {
     match shared.alarms.answer(action, now) {
-        // Rung here by itself: quiet now; the server hears after the next welcome.
+        // Rung here by itself: quiet now. The server hears now if it's there,
+        // or after the next welcome (which sends whatever is still pending).
         crate::alarm::Answer::Here => {
             shared.stop_reply();
+            offer(shared, cmds, Cmd::AlarmDone);
             true
         }
         crate::alarm::Answer::Server => offer(shared, cmds, Cmd::Alarm(action)),
@@ -139,7 +157,8 @@ pub async fn run(
     events: mpsc::UnboundedSender<Event>,
 ) {
     let mut link = link;
-    let mut backoff = 0usize;
+    let mut retry = Retry::new();
+    let mut away = Away::default();
     loop {
         let target = link
             .borrow_and_update()
@@ -161,10 +180,10 @@ pub async fn run(
             text: "Connecting…".into(),
             owner: None,
         });
-        let mut welcomed = false;
+        let mut trace = Trace::default();
         let started = Instant::now();
         let outcome = tokio::select! {
-            r = session(&url, &token, &device, &mut up, &mut cmds, &shared, &pc, &events, &mut welcomed) => Some(r),
+            r = session(&url, &token, &device, &mut up, &mut cmds, &shared, &pc, &events, &mut trace, &mut away) => Some(r),
             _ = link.changed() => None,
         };
         // However it ended, the server is gone until a new welcome.
@@ -175,17 +194,22 @@ pub async fn run(
         shared.stop_reply();
         shared.clear_state();
         let _ = events.send(Event::Thinking(false));
+        let held = trace.welcomed && started.elapsed() >= HELD;
+        if trace.welcomed {
+            shared.log.line(&trace.ended(started.elapsed(), &shared, outcome.as_ref()));
+            away.down = Some(Instant::now());
+        } else if let Some(o) = &outcome {
+            away.failed(o, started.elapsed(), &shared);
+        }
         let Some(outcome) = outcome else {
-            backoff = 0;
+            retry = Retry::new();
+            away = Away::default();
             continue;
         };
-        if welcomed && started.elapsed() >= HELD {
-            backoff = 0;
-        }
         let (text, wait) = match outcome {
             Ok(()) => (
                 "Disconnected. Reconnecting…".to_string(),
-                Duration::from_secs(next_wait(&mut backoff)),
+                retry.next(trace.answered, held),
             ),
             // Not the usual backoff: that would hammer the lockout.
             Err(Fail::Denied(r)) => (
@@ -194,7 +218,7 @@ pub async fn run(
             ),
             Err(Fail::Other(e)) => (
                 format!("Can't reach the server: {e}"),
-                Duration::from_secs(next_wait(&mut backoff)),
+                retry.next(trace.answered, held),
             ),
         };
         let _ = events.send(Event::Status {
@@ -208,17 +232,191 @@ pub async fn run(
                 if r.is_err() {
                     return;
                 }
-                backoff = 0;
+                retry = Retry::new();
+                away = Away::default();
             }
         }
     }
 }
 
-/// Seconds to wait before the next try.
-fn next_wait(backoff: &mut usize) -> u64 {
-    let wait = [1, 2, 5, 10][(*backoff).min(3)];
-    *backoff += 1;
-    wait
+/// When to try again. The schedule follows how long the server has been out
+/// of reach, so tries come quickly through a restart and slow down for a long
+/// outage. A server that answers and then doesn't keep the connection (it
+/// drops it soon after the welcome, or never welcomes it) is backed off on its
+/// own count as well: another PC on the same token, or a server too busy to
+/// read the hello (which counts toward its lockout), mustn't get a new
+/// connection every second.
+struct Retry {
+    /// When the server was last known to be fine: the end of the last
+    /// connection that held, or the start.
+    since: Instant,
+    /// Tries that failed since then.
+    tries: u32,
+    /// Connections the server answered and didn't keep, in a row.
+    short: usize,
+}
+
+impl Retry {
+    fn new() -> Self {
+        Retry {
+            since: Instant::now(),
+            tries: 0,
+            short: 0,
+        }
+    }
+
+    /// The wait after a connection ended (`answered`: the server took it;
+    /// `held`: it lasted long enough after the welcome to count as working).
+    fn next(&mut self, answered: bool, held: bool) -> Duration {
+        if held {
+            *self = Retry::new();
+        }
+        let mut wait = retry_wait(self.tries, self.since.elapsed());
+        if answered && !held {
+            wait = wait.max(Duration::from_secs(short_wait(self.short)));
+            self.short += 1;
+        }
+        self.tries += 1;
+        wait
+    }
+}
+
+/// The wait before the next try, `tries` failed tries into an outage that
+/// began `gone` ago.
+fn retry_wait(tries: u32, gone: Duration) -> Duration {
+    if tries == 0 {
+        FIRST_TRY
+    } else if gone < QUICK_FOR {
+        QUICK_WAIT
+    } else {
+        // From once a second up to `LONGEST` over the next half minute.
+        let ramp = Duration::from_secs_f64(((gone - QUICK_FOR).as_secs_f64() * 0.3).min(60.0));
+        (QUICK_WAIT + ramp).min(LONGEST)
+    }
+}
+
+/// Seconds to wait after the `n`-th connection in a row that the server
+/// answered and didn't keep.
+fn short_wait(n: usize) -> u64 {
+    [1, 2, 5, 10][n.min(3)]
+}
+
+/// What's known about one connection, for the log.
+#[derive(Default)]
+struct Trace {
+    /// The server took the connection (the WebSocket opened).
+    answered: bool,
+    /// The server accepted this PC.
+    welcomed: bool,
+    /// How it ended, when that isn't in the error.
+    how: String,
+    /// When the server was last heard from.
+    heard: Option<Instant>,
+    /// Pings unanswered when it ended.
+    unanswered: u32,
+    /// The latest a ping went out after it was due: a sign the app was held up.
+    late: Duration,
+}
+
+impl Trace {
+    /// The log line for a connection that was welcomed, once it's over.
+    fn ended(&self, lasted: Duration, shared: &Shared, outcome: Option<&Result<(), Fail>>) -> String {
+        let how = match outcome {
+            None => "new settings".to_string(),
+            Some(Err(Fail::Other(e))) => e.clone(),
+            Some(Err(Fail::Denied(r))) => format!("refused: {r}"),
+            Some(Ok(())) if self.how.is_empty() => "closed".to_string(),
+            Some(Ok(())) => self.how.clone(),
+        };
+        let heard = self
+            .heard
+            .map_or_else(|| "-".to_string(), |h| format!("{:.1}", h.elapsed().as_secs_f64()));
+        format!(
+            "link ended: {how}; lasted {:.0} s, heard from {heard} s before, {} ping(s) unanswered, pings up to {} ms late; {}",
+            lasted.as_secs_f64(),
+            self.unanswered,
+            self.late.as_millis(),
+            here(shared)
+        )
+    }
+}
+
+/// What this PC was doing, for the log.
+fn here(shared: &Shared) -> String {
+    let gaming = shared.activity.lock().unwrap_or_else(|e| e.into_inner()).gaming;
+    format!(
+        "quiet mode {}, game {}",
+        if shared.quiet.load(Ordering::Relaxed) { "on" } else { "off" },
+        if gaming { "in front" } else { "no" }
+    )
+}
+
+/// The tries made while the server was out of reach, for one log line when
+/// she's back (and one at the first failure, in case she never is).
+#[derive(Default)]
+struct Away {
+    /// When the last link ended, or the first try failed.
+    down: Option<Instant>,
+    tries: u32,
+    refused: u32,
+    timed_out: u32,
+    other: u32,
+    last: String,
+    /// The longest one try took to fail.
+    slowest: Duration,
+}
+
+impl Away {
+    fn failed(&mut self, outcome: &Result<(), Fail>, took: Duration, shared: &Shared) {
+        let what = match outcome {
+            Ok(()) => "closed before the welcome".to_string(),
+            Err(Fail::Denied(r)) => format!("refused: {r}"),
+            Err(Fail::Other(e)) => e.clone(),
+        };
+        self.down.get_or_insert_with(Instant::now);
+        if self.tries == 0 {
+            shared.log.line(&format!(
+                "can't reach the server: {what} (after {} ms); {}",
+                took.as_millis(),
+                here(shared)
+            ));
+        }
+        self.tries += 1;
+        let lower = what.to_lowercase();
+        if lower.contains("refused") {
+            self.refused += 1;
+        } else if lower.contains("timed out") {
+            self.timed_out += 1;
+        } else {
+            self.other += 1;
+        }
+        self.slowest = self.slowest.max(took);
+        self.last = what;
+    }
+
+    /// Welcomed: the line for the outage, if there was one.
+    fn back(&mut self, shared: &Shared) {
+        match self.down {
+            None => shared.log.line(&format!("link up; {}", here(shared))),
+            Some(down) if self.tries == 0 => shared.log.line(&format!(
+                "link back after {:.1} s, at the first try; {}",
+                down.elapsed().as_secs_f64(),
+                here(shared)
+            )),
+            Some(down) => shared.log.line(&format!(
+                "link back after {:.1} s: {} failed tries ({} refused, {} timed out, {} other; slowest {} ms), last: {}; {}",
+                down.elapsed().as_secs_f64(),
+                self.tries,
+                self.refused,
+                self.timed_out,
+                self.other,
+                self.slowest.as_millis(),
+                self.last,
+                here(shared)
+            )),
+        }
+        *self = Away::default();
+    }
 }
 
 enum Fail {
@@ -261,7 +459,22 @@ where
     }
 }
 
-/// One connection, until it ends. `welcomed` is set when the server accepts this PC.
+/// Tell the server how the alarms rung here were answered. Each is forgotten
+/// only once it has gone out.
+async fn send_done<S, E>(tx: &mut S, alarms: &crate::alarm::Alarms) -> Result<(), Fail>
+where
+    S: Sink<Message, Error = E> + Unpin,
+    E: Display,
+{
+    for d in alarms.pending_done() {
+        put(tx, Message::Text(d.to_string().into())).await?;
+        alarms.sent_done(1);
+    }
+    Ok(())
+}
+
+/// One connection, until it ends. `trace` notes how it went (`welcomed` once
+/// the server accepts this PC); `away` hears about the welcome.
 #[allow(clippy::too_many_arguments)]
 async fn session(
     url: &str,
@@ -272,15 +485,14 @@ async fn session(
     shared: &Arc<Shared>,
     pc: &Arc<Mutex<Arc<Pc>>>,
     events: &mpsc::UnboundedSender<Event>,
-    welcomed: &mut bool,
+    trace: &mut Trace,
+    away: &mut Away,
 ) -> Result<(), Fail> {
-    let (ws, _) = tokio::time::timeout(
-        Duration::from_secs(8),
-        tokio_tungstenite::connect_async(url),
-    )
+    let (ws, _) = tokio::time::timeout(CONNECT_LIMIT, tokio_tungstenite::connect_async(url))
     .await
     .map_err(|_| Fail::Other("timed out".into()))?
     .map_err(|e| Fail::Other(e.to_string()))?;
+    trace.answered = true;
     let (mut tx, mut rx) = ws.split();
     let hello = json!({ "type": "hello", "token": token, "device": device, "version": env!("CARGO_PKG_VERSION") });
     put(&mut tx, Message::Text(hello.to_string().into())).await?;
@@ -298,9 +510,14 @@ async fn session(
     loop {
         tokio::select! {
             msg = rx.next() => {
-                let Some(msg) = msg else { return Ok(()) };
+                let Some(msg) = msg else {
+                    trace.how = "the connection ended without a close".into();
+                    return Ok(());
+                };
                 let msg = msg.map_err(|e| Fail::Other(e.to_string()))?;
+                trace.heard = Some(Instant::now());
                 unanswered = 0;
+                trace.unanswered = 0;
                 match msg {
                     Message::Binary(b) => shared.push_reply(&b),
                     Message::Text(t) => {
@@ -308,7 +525,8 @@ async fn session(
                         let s = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_string();
                         match s("type").as_str() {
                             "welcome" => {
-                                *welcomed = true;
+                                trace.welcomed = true;
+                                away.back(shared);
                                 shared.set_online(true);
                                 let owner = s("owner");
                                 let _ = events.send(Event::Status { connected: true, text: format!("Connected as {}", s("name")), owner: (!owner.is_empty()).then_some(owner) });
@@ -321,12 +539,8 @@ async fn session(
                                 if playing.gaming {
                                     put(&mut tx, Message::Text(playing.message().to_string().into())).await?;
                                 }
-                                // Alarms rung here while the server was out of reach, and how they were
-                                // answered. Each is forgotten only once it's gone out.
-                                for d in shared.alarms.pending_done() {
-                                    put(&mut tx, Message::Text(d.to_string().into())).await?;
-                                    shared.alarms.sent_done(1);
-                                }
+                                // Alarms rung here while the server was out of reach, and how they were answered.
+                                send_done(&mut tx, &shared.alarms).await?;
                             }
                             "denied" => return Err(refused(s("reason"))),
                             "mode" => { let _ = events.send(Event::Thinking(s("mode") == "thinking")); }
@@ -339,13 +553,13 @@ async fn session(
                                 let _ = events.send(Event::Transcript { who: s("who"), text: s("text"), last });
                             }
                             "audio_stop" => shared.stop_reply(),
-                            "alarms" if *welcomed => {
+                            "alarms" if trace.welcomed => {
                                 shared.alarms.server_said(&m);
                                 let _ = events.send(Event::Alarms);
                             }
                             // Nothing runs for a server that hasn't accepted this PC's token yet:
                             // whatever answers at the address could send it.
-                            "action" if !*welcomed => {
+                            "action" if !trace.welcomed => {
                                 let _ = done_tx.send(json!({ "type": "action_result", "id": s("id"), "ok": false, "result": "Not connected yet." }).to_string());
                             }
                             "action" => {
@@ -361,7 +575,13 @@ async fn session(
                             _ => {}
                         }
                     }
-                    Message::Close(f) => return closed(*welcomed, f),
+                    Message::Close(f) => {
+                        trace.how = match &f {
+                            Some(f) => format!("the server closed it ({} {})", u16::from(f.code), f.reason),
+                            None => "the server closed it".into(),
+                        };
+                        return closed(trace.welcomed, f);
+                    }
                     _ => {}
                 }
             }
@@ -371,13 +591,13 @@ async fn session(
                     Up::Pcm(b) => Message::Binary(b.into()),
                     Up::End => Message::Text(json!({ "type": "speech_end" }).to_string().into()),
                 };
-                if *welcomed {
+                if trace.welcomed {
                     put(&mut tx, m).await?;
                 }
             }
             Some(c) = cmds.recv() => {
                 // Input is only taken once welcomed; this is one that slipped in.
-                if !*welcomed {
+                if !trace.welcomed {
                     continue;
                 }
                 let m = match c {
@@ -386,19 +606,27 @@ async fn session(
                     Cmd::Ptt => json!({ "type": "ptt", "down": true }),
                     Cmd::Alarm(action) => json!({ "type": "alarm_action", "action": action }),
                     Cmd::Activity => shared.activity.lock().unwrap_or_else(|e| e.into_inner()).message(),
+                    Cmd::AlarmDone => {
+                        send_done(&mut tx, &shared.alarms).await?;
+                        continue;
+                    }
                 };
                 put(&mut tx, Message::Text(m.to_string().into())).await?;
             }
             Some(r) = done_rx.recv() => {
                 put(&mut tx, Message::Text(r.into())).await?;
             }
-            _ = ping.tick() => {
+            due = ping.tick() => {
+                // Late by more than a moment: this app was held up (asleep, or
+                // starved of the CPU), which the log should show.
+                trace.late = trace.late.max(tokio::time::Instant::now().saturating_duration_since(due));
                 // Anything from the server counts as an answer. A process that
                 // hangs leaves the socket open, so nothing else would notice.
                 if unanswered >= UNANSWERED {
                     return Err(Fail::Other("it stopped answering".into()));
                 }
                 unanswered += 1;
+                trace.unanswered = unanswered;
                 put(&mut tx, Message::Text(json!({ "type": "ping" }).to_string().into())).await?;
             }
         }
@@ -454,12 +682,84 @@ mod tests {
     }
 
     #[test]
-    fn waits_1_2_5_then_10_and_starts_over_after_a_reset() {
-        let mut backoff = 0;
-        let waits: Vec<u64> = (0..5).map(|_| next_wait(&mut backoff)).collect();
+    fn tries_quickly_through_a_restart_and_slowly_through_a_long_outage() {
+        let ms = |d: Duration| d.as_millis() as u64;
+        let s = Duration::from_secs;
+        assert_eq!(ms(retry_wait(0, Duration::ZERO)), 250);
+        assert_eq!(ms(retry_wait(1, s(1))), 1000);
+        assert_eq!(ms(retry_wait(9, s(29))), 1000);
+        assert_eq!(ms(retry_wait(12, s(40))), 4000);
+        assert_eq!(ms(retry_wait(15, s(60))), 10_000);
+        assert_eq!(ms(retry_wait(40, s(3600))), 10_000);
+        // Waits never shrink as an outage goes on.
+        let mut last = Duration::ZERO;
+        for t in 1..600 {
+            let w = retry_wait(t, Duration::from_millis(u64::from(t) * 250));
+            assert!(w >= last, "{t}");
+            last = w;
+        }
+    }
+
+    #[test]
+    fn a_server_that_answers_and_doesnt_keep_it_is_backed_off_1_2_5_then_10() {
+        let mut r = Retry::new();
+        let waits: Vec<u64> = (0..5).map(|_| r.next(true, false).as_secs()).collect();
         assert_eq!(waits, [1, 2, 5, 10, 10]);
-        backoff = 0;
-        assert_eq!(next_wait(&mut backoff), 1);
+        // One that held starts it over.
+        assert_eq!(r.next(true, true), FIRST_TRY);
+        assert_eq!(r.next(false, false), QUICK_WAIT);
+    }
+
+    /// The tries made in an outage of `secs` under the schedule, with each
+    /// failed try costing `cost` s (a refused connect takes 2 s on Windows, one
+    /// that hangs takes the 8 s connect limit),
+    /// and how long after the server is back the next try comes.
+    fn model(policy: &dyn Fn(u32, f64) -> f64, secs: f64, cost: f64) -> (f64, u32) {
+        let (mut t, mut tries) = (0.0, 0);
+        loop {
+            t += policy(tries, t);
+            tries += 1;
+            if t >= secs {
+                return (t - secs, tries);
+            }
+            t += cost;
+        }
+    }
+
+    /// Not a check: the schedule before and after, over outages of 0.1 to 120 s.
+    /// `cargo test -p adrian-desktop reconnect_schedule_sweep -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn reconnect_schedule_sweep() {
+        let old = |tries: u32, _: f64| [1.0, 2.0, 5.0, 10.0][(tries as usize).min(3)];
+        let new = |tries: u32, t: f64| retry_wait(tries, Duration::from_secs_f64(t)).as_secs_f64();
+        for cost in [0.02, 2.0, 8.0] {
+            for (name, p) in [("before", &old as &dyn Fn(u32, f64) -> f64), ("after", &new)] {
+                let stats = |lo: f64, hi: f64| {
+                    let mut late: Vec<f64> = (1..=1200)
+                        .map(|k| k as f64 / 10.0)
+                        .filter(|s| (lo..=hi).contains(s))
+                        .map(|s| model(p, s, cost).0)
+                        .collect();
+                    late.sort_by(f64::total_cmp);
+                    (late[late.len() / 2], late[late.len() - 1])
+                };
+                let (m, x) = stats(0.0, 120.0);
+                let (rm, rx) = stats(15.0, 30.0);
+                let at: Vec<String> = [3.0, 10.0, 21.0, 60.0]
+                    .iter()
+                    .map(|&s| format!("{:.2}", model(p, s, cost).0))
+                    .collect();
+                let tries = |s: f64| model(p, s, cost).1;
+                println!(
+                    "{name:6} try cost {cost:4} s: 0-120 s outages late median {m:.2} max {x:.2}; 15-30 s median {rm:.2} max {rx:.2}; at 3/10/21/60 s {}; tries by 60 s {}, 60-120 s {}, 120-300 s {}",
+                    at.join("/"),
+                    tries(60.0),
+                    tries(120.0) - tries(60.0),
+                    tries(300.0) - tries(120.0)
+                );
+            }
+        }
     }
 
     async fn listen() -> (TcpListener, String) {
@@ -584,7 +884,7 @@ mod tests {
         cmds: &mut mpsc::UnboundedReceiver<Cmd>,
         events: &mpsc::UnboundedSender<Event>,
     ) -> (Result<(), Fail>, bool) {
-        let mut welcomed = false;
+        let mut trace = Trace::default();
         let ended = session(
             url,
             "token",
@@ -594,10 +894,11 @@ mod tests {
             shared,
             &pc(),
             events,
-            &mut welcomed,
+            &mut trace,
+            &mut Away::default(),
         )
         .await;
-        (ended, welcomed)
+        (ended, trace.welcomed)
     }
 
     async fn connect(
@@ -650,13 +951,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_a_connection_that_held_the_next_try_comes_after_one_second() {
+    async fn after_a_connection_that_held_the_next_try_comes_within_a_second() {
         let (listener, url) = listen().await;
         let server = async {
             // Turned away twice: waits of 1 s and 2 s, with 5 s next.
             serve(&listener, &[], false).await;
             serve(&listener, &[], false).await;
-            // A connection that worked, then a restart: back to 1 s.
+            // A connection that worked, then a restart: a quarter second.
             serve_for(&listener, &[WELCOME], false, HELD * 2).await;
             let closed = Instant::now();
             let _ = listener.accept().await;
@@ -664,7 +965,7 @@ mod tests {
         };
         tokio::select! {
             _ = reconnect_loop(url) => panic!("the link gave up"),
-            waited = server => assert!(waited < Duration::from_secs(3), "{waited:?}"),
+            waited = server => assert!(waited < Duration::from_millis(900), "{waited:?}"),
         }
     }
 
@@ -1231,6 +1532,198 @@ mod tests {
         let (heard, _) = tokio::join!(orders(&listener, || {}, &[WELCOME], "new order"), client);
         let done = heard.iter().filter(|t| t.contains("\"alarm_done\"")).count();
         assert_eq!(done, 1, "{heard:?}");
+        assert!(shared.alarms.pending_done().is_empty());
+    }
+
+    /// A log file of its own under the temp folder, for one test.
+    fn temp_log(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("adrian-link-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("link.log")
+    }
+
+    /// The number before `after` in the first line holding `line`.
+    fn number_before(log: &str, line: &str, after: &str) -> Option<u64> {
+        let l = log.lines().find(|l| l.contains(line))?;
+        let head = &l[..l.find(after)?];
+        head.rsplit(' ').next()?.parse().ok()
+    }
+
+    /// A PC held up past the server's keep-alive (the server drops it after a
+    /// missed ping, like server.ts) is back soon after it wakes, and the log
+    /// says it was held up.
+    #[test]
+    fn a_pc_held_up_past_the_servers_keep_alive_is_back_soon_after_it_wakes() {
+        const BEAT: Duration = Duration::from_millis(300);
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = server_rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (welcomed_tx, welcomed) = std::sync::mpsc::channel::<Instant>();
+        server_rt.spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                ws.next().await;
+                ws.send(Message::Text(WELCOME.into())).await.unwrap();
+                let _ = welcomed_tx.send(Instant::now());
+                let mut alive = true;
+                let mut beat = tokio::time::interval(BEAT);
+                beat.tick().await;
+                loop {
+                    tokio::select! {
+                        m = ws.next() => match m {
+                            Some(Ok(Message::Pong(_))) => alive = true,
+                            Some(Ok(Message::Text(t))) if t.contains("\"ping\"") => {
+                                let _ = ws.send(Message::Text(r#"{"type":"pong"}"#.into())).await;
+                            }
+                            Some(Ok(_)) => {}
+                            _ => break,
+                        },
+                        _ = beat.tick() => {
+                            // A missed ping: dropped without a close, as `terminate()` does.
+                            if !alive {
+                                break;
+                            }
+                            alive = false;
+                            let _ = ws.send(Message::Ping(Default::default())).await;
+                        }
+                    }
+                }
+            }
+        });
+        let file = temp_log("held-up");
+        let log = file.clone();
+        let woke = Arc::new(Mutex::new(None::<Instant>));
+        let woke_at = woke.clone();
+        let (stop_tx, stop) = tokio::sync::oneshot::channel::<()>();
+        let client = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let (_link_tx, link) = watch::channel(Some(Link {
+                    url,
+                    token: "token".into(),
+                    device: "test".into(),
+                }));
+                let (_up_tx, up) = mpsc::channel(4);
+                let (_cmds_tx, cmds) = mpsc::unbounded_channel();
+                let (events, mut seen) = mpsc::unbounded_channel();
+                let shared = Shared::new(0.0);
+                shared.log.to(log);
+                let stall = async {
+                    until_status(&mut seen, true).await;
+                    // A link that held, then everything here stops.
+                    tokio::time::sleep(HELD * 2).await;
+                    std::thread::sleep(BEAT * 5);
+                    *woke_at.lock().unwrap() = Some(Instant::now());
+                    std::future::pending::<()>().await
+                };
+                tokio::select! {
+                    _ = run(link, up, cmds, shared.clone(), pc(), events) => {}
+                    _ = stall => {}
+                    _ = stop => {}
+                }
+            });
+        });
+        welcomed.recv_timeout(Duration::from_secs(10)).expect("never connected");
+        // The first welcome after it woke (a busy machine may have cost it a
+        // link before the stall too; that one doesn't count).
+        let (again, woke) = loop {
+            let at = welcomed.recv_timeout(Duration::from_secs(10)).expect("never came back");
+            let w = *woke.lock().unwrap();
+            if let Some(w) = w
+                && at > w
+            {
+                break (at, w);
+            }
+        };
+        let _ = stop_tx.send(());
+        client.join().unwrap();
+        drop(server_rt);
+        let back = again.saturating_duration_since(woke);
+        println!("back {} ms after waking", back.as_millis());
+        assert!(back < Duration::from_millis(700), "back {back:?} after waking");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let held_up = text
+            .lines()
+            .filter(|l| l.contains("link ended"))
+            .filter_map(|l| number_before(l, "link ended", " ms late"))
+            .max()
+            .expect(&text);
+        assert!(held_up >= (BEAT * 3).as_millis() as u64, "{text}");
+        assert!(text.contains("at the first try"), "{text}");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_outage_is_logged_once_with_its_tries_and_nothing_secret() {
+        let file = temp_log("outage");
+        let shared = Shared::new(0.0);
+        shared.log.to(file.clone());
+        let (listener, url) = listen().await;
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (_link_tx, link) = watch::channel(Some(Link {
+            url,
+            token: "sat_secret".into(),
+            device: "test".into(),
+        }));
+        let (_up_tx, up) = mpsc::channel(4);
+        let (_cmds_tx, cmds) = mpsc::unbounded_channel();
+        let (events, mut seen) = mpsc::unbounded_channel();
+        let server = async {
+            // Out of reach for two tries, then back.
+            let mut fails = 0;
+            while fails < 2 {
+                if let Some(Event::Status { text, .. }) = seen.recv().await
+                    && text.starts_with("Can't reach")
+                {
+                    fails += 1;
+                }
+            }
+            let listener = TcpListener::bind(addr).await.unwrap();
+            serve(&listener, &[WELCOME], false).await;
+            until_status(&mut seen, false).await;
+        };
+        tokio::select! {
+            _ = run(link, up, cmds, shared.clone(), pc(), events) => panic!("the link gave up"),
+            r = tokio::time::timeout(Duration::from_secs(20), server) => r.expect("never came back"),
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text.matches("can't reach the server").count(), 1, "{text}");
+        assert_eq!(text.matches("link back after").count(), 1, "{text}");
+        assert!(number_before(&text, "link back after", " failed tries").unwrap() >= 2, "{text}");
+        assert!(text.contains("quiet mode off, game no"), "{text}");
+        assert!(!text.contains("sat_secret") && !text.contains(&addr.port().to_string()), "{text}");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_fails_to_go_out_stays_pending() {
+        let shared = Shared::new(0.0);
+        let now = ringing_here(&shared);
+        let (cmds_tx, _cmds) = mpsc::unbounded_channel();
+        assert!(answer_alarm(&shared, &cmds_tx, "stop", now));
+        let broken = futures_util::sink::unfold((), |_, _m: Message| async {
+            Err::<(), _>("the socket is gone")
+        });
+        let mut broken = std::pin::pin!(broken);
+        assert!(send_done(&mut broken, &shared.alarms).await.is_err());
+        assert_eq!(shared.alarms.pending_done().len(), 1, "kept for the next welcome");
+        let mut sent = Vec::new();
+        {
+            let fine = futures_util::sink::unfold(&mut sent, |sent, m: Message| async move {
+                sent.push(m);
+                Ok::<_, std::convert::Infallible>(sent)
+            });
+            let mut fine = std::pin::pin!(fine);
+            assert!(send_done(&mut fine, &shared.alarms).await.is_ok());
+        }
+        assert_eq!(sent.len(), 1);
         assert!(shared.alarms.pending_done().is_empty());
     }
 

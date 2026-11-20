@@ -1,8 +1,9 @@
 //! Alarms on this PC. While one rings (the server streams its sound) the
 //! window and tray offer Stop and Snooze, and muted or nearly silent speakers
 //! are turned up, then put back. The server also sends the alarms coming up:
-//! if it can't be reached when one is due, the app rings it itself and tells
-//! the server how it was answered once the link is back.
+//! if it can't be reached when one is due (or doesn't ring it), the app rings
+//! it itself and tells the server how it was answered: right away when the
+//! link is up, or once it's back.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -85,7 +86,7 @@ struct State {
 /// What Stop or Snooze did.
 #[derive(Debug, PartialEq)]
 pub enum Answer {
-    /// Handled here (it was ringing by itself); the server hears later.
+    /// Handled here (it was ringing by itself); the server hears as soon as it can.
     Here,
     /// The server rings it: send it the order.
     Server,

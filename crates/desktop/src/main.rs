@@ -9,6 +9,7 @@ mod alarm;
 mod audio;
 mod config;
 mod link;
+mod linklog;
 mod quiet;
 mod single;
 mod tray;
@@ -594,6 +595,7 @@ fn main() {
             // alarm raised before a crash go back to how they were.
             if let Some(dir) = config::path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
                 shared.alarms.load(dir.join("alarms.json"));
+                shared.log.to(dir.join("link.log"));
             }
             if let Some((level, muted)) = shared.alarms.take_restore() {
                 let pc = pc.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -685,6 +687,7 @@ fn main() {
                             if quiet != Some(!busy) {
                                 quiet = Some(!busy);
                                 quiet::background(!busy);
+                                shared.quiet.store(!busy, Ordering::Relaxed);
                                 if !busy {
                                     quiet::trim();
                                 }

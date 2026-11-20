@@ -104,6 +104,10 @@ pub struct Shared {
     pub activity: Mutex<adrian_pc_control::activity::Activity>,
     /// Alarms: what rings now, and the copy to ring by itself (alarm.rs).
     pub alarms: crate::alarm::Alarms,
+    /// In efficiency mode now (quiet.rs), for the link's log.
+    pub quiet: AtomicBool,
+    /// The link's own record (linklog.rs).
+    pub log: crate::linklog::LinkLog,
 }
 
 impl Shared {
@@ -133,6 +137,8 @@ impl Shared {
             devices: Mutex::new((String::new(), String::new())),
             activity: Mutex::new(Default::default()),
             alarms: Default::default(),
+            quiet: AtomicBool::new(false),
+            log: Default::default(),
         })
     }
 
