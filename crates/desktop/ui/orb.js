@@ -83,6 +83,7 @@
     let prevTick = 0;
     let tickAvg = 0;
     let skipped = 0;
+    let every = 1;
     const tgt = new Float32Array(RINGS);
 
     // Dust: far specks, nearer specks, and a few large out-of-focus motes.
@@ -284,10 +285,17 @@
       raf = global.requestAnimationFrame(frame);
       const now = ms / 1000;
       // Learn the refresh rate (ignoring pauses) and let the extra refreshes pass.
+      // Only gaps after a quick callback count: one after a drawing that ran
+      // past a refresh would make the screen look slower than it is.
       const gap = prevTick ? now - prevTick : 0;
       prevTick = now;
-      if (gap > 0 && gap < 0.1) tickAvg = tickAvg ? tickAvg + (gap - tickAvg) * 0.05 : gap;
-      const every = tickAvg ? Math.max(1, Math.floor(1 / MAX_FPS / tickAvg + 0.25)) : 1;
+      if (gap > 0 && gap < 0.1 && (skipped > 0 || every === 1)) tickAvg = tickAvg ? tickAvg + (gap - tickAvg) * 0.05 : gap;
+      // Refreshes per drawing, about refresh/60; it moves only when clearly past a
+      // boundary, so a 165 Hz screen (right on one) doesn't flip between 55 and 82 fps.
+      if (tickAvg) {
+        const x = 1 / MAX_FPS / tickAvg + 0.25;
+        if (x >= every + 1.1 || x < every - 0.1) every = Math.max(1, Math.floor(x));
+      }
       if (++skipped < every) return;
       skipped = 0;
       const dt = last ? Math.max(0, Math.min(0.05, now - last)) : 1 / 60;
