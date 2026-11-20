@@ -164,6 +164,9 @@ pub async fn run(
             .borrow_and_update()
             .as_ref()
             .map(|l| (l.url.clone(), l.token.clone(), l.device.clone()));
+        if let Some((url, token, _)) = &target {
+            shared.log.hide(vec![host_of(url), token.clone()]);
+        }
         let Some((url, token, device)) = target else {
             let _ = events.send(Event::Status {
                 connected: false,
@@ -199,7 +202,7 @@ pub async fn run(
             shared.log.line(&trace.ended(started.elapsed(), &shared, outcome.as_ref()));
             away.down = Some(Instant::now());
         } else if let Some(o) = &outcome {
-            away.failed(o, started.elapsed(), &shared);
+            away.failed(o, &trace, started.elapsed(), &shared);
         }
         let Some(outcome) = outcome else {
             retry = Retry::new();
@@ -314,11 +317,30 @@ struct Trace {
     heard: Option<Instant>,
     /// Pings unanswered when it ended.
     unanswered: u32,
-    /// The latest a ping went out after it was due: a sign the app was held up.
-    late: Duration,
+    /// When the session started waiting for its next event.
+    waiting: Option<Instant>,
+    /// The longest wait for an event beyond `PING`. The ping timer fires at
+    /// least that often, so anything longer means this app was held up
+    /// (asleep, or starved of the CPU).
+    held_up: Duration,
+    /// What kind of failure a try that never got a welcome was.
+    kind: &'static str,
 }
 
 impl Trace {
+    /// An event came: note how long the wait for it was.
+    fn woke(&mut self) {
+        if let Some(t) = self.waiting.take() {
+            self.held_up = self.held_up.max(t.elapsed().saturating_sub(PING));
+        }
+    }
+
+    /// The longest hold-up, the wait it ended in included.
+    fn longest_hold_up(&self) -> Duration {
+        let now = self.waiting.map_or(Duration::ZERO, |t| t.elapsed().saturating_sub(PING));
+        self.held_up.max(now)
+    }
+
     /// The log line for a connection that was welcomed, once it's over.
     fn ended(&self, lasted: Duration, shared: &Shared, outcome: Option<&Result<(), Fail>>) -> String {
         let how = match outcome {
@@ -332,10 +354,10 @@ impl Trace {
             .heard
             .map_or_else(|| "-".to_string(), |h| format!("{:.1}", h.elapsed().as_secs_f64()));
         format!(
-            "link ended: {how}; lasted {:.0} s, heard from {heard} s before, {} ping(s) unanswered, pings up to {} ms late; {}",
+            "link ended: {how}; lasted {:.0} s, heard from {heard} s before, {} ping(s) unanswered, longest hold-up {} ms; {}",
             lasted.as_secs_f64(),
             self.unanswered,
-            self.late.as_millis(),
+            self.longest_hold_up().as_millis(),
             here(shared)
         )
     }
@@ -358,20 +380,20 @@ struct Away {
     /// When the last link ended, or the first try failed.
     down: Option<Instant>,
     tries: u32,
-    refused: u32,
-    timed_out: u32,
-    other: u32,
+    /// Failed tries by kind (`kind_of`, or how the server turned it away).
+    kinds: Vec<(&'static str, u32)>,
     last: String,
     /// The longest one try took to fail.
     slowest: Duration,
 }
 
 impl Away {
-    fn failed(&mut self, outcome: &Result<(), Fail>, took: Duration, shared: &Shared) {
-        let what = match outcome {
-            Ok(()) => "closed before the welcome".to_string(),
-            Err(Fail::Denied(r)) => format!("refused: {r}"),
-            Err(Fail::Other(e)) => e.clone(),
+    fn failed(&mut self, outcome: &Result<(), Fail>, trace: &Trace, took: Duration, shared: &Shared) {
+        let (what, kind) = match outcome {
+            Ok(()) => ("closed before the welcome".to_string(), "turned away"),
+            Err(Fail::Denied(r)) => (format!("refused: {r}"), "turned away"),
+            Err(Fail::Other(e)) if trace.answered => (e.clone(), "turned away"),
+            Err(Fail::Other(e)) => (e.clone(), if trace.kind.is_empty() { "other" } else { trace.kind }),
         };
         self.down.get_or_insert_with(Instant::now);
         if self.tries == 0 {
@@ -382,13 +404,9 @@ impl Away {
             ));
         }
         self.tries += 1;
-        let lower = what.to_lowercase();
-        if lower.contains("refused") {
-            self.refused += 1;
-        } else if lower.contains("timed out") {
-            self.timed_out += 1;
-        } else {
-            self.other += 1;
+        match self.kinds.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n += 1,
+            None => self.kinds.push((kind, 1)),
         }
         self.slowest = self.slowest.max(took);
         self.last = what;
@@ -404,12 +422,10 @@ impl Away {
                 here(shared)
             )),
             Some(down) => shared.log.line(&format!(
-                "link back after {:.1} s: {} failed tries ({} refused, {} timed out, {} other; slowest {} ms), last: {}; {}",
+                "link back after {:.1} s: {} failed tries ({}; slowest {} ms), last: {}; {}",
                 down.elapsed().as_secs_f64(),
                 self.tries,
-                self.refused,
-                self.timed_out,
-                self.other,
+                self.kinds.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", "),
                 self.slowest.as_millis(),
                 self.last,
                 here(shared)
@@ -445,6 +461,38 @@ fn closed(welcomed: bool, frame: Option<CloseFrame>) -> Result<(), Fail> {
         Some(f) if !f.reason.is_empty() => Fail::Other(f.reason.to_string()),
         _ => Fail::Other("closed".into()),
     })
+}
+
+/// The host in a server address (`ws://name:port/path`), for keeping it out of the log.
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    host.to_string()
+}
+
+/// What kind of failure a connect was, for the log.
+fn kind_of(e: &tokio_tungstenite::tungstenite::Error) -> &'static str {
+    use std::io::ErrorKind as K;
+    use tokio_tungstenite::tungstenite::Error as E;
+    match e {
+        // WSAHOST_NOT_FOUND / WSATRY_AGAIN: the name didn't resolve.
+        E::Io(io) if matches!(io.raw_os_error(), Some(11001 | 11002)) => "name not found",
+        E::Io(io) => match io.kind() {
+            K::ConnectionRefused => "refused",
+            K::TimedOut => "timed out",
+            K::HostUnreachable | K::NetworkUnreachable => "unreachable",
+            K::ConnectionReset | K::ConnectionAborted => "reset",
+            _ => "other",
+        },
+        E::Tls(_) => "tls",
+        E::Http(_) | E::HttpFormat(_) => "not a satellite server",
+        _ => "other",
+    }
 }
 
 /// Send one message, within `SEND_LIMIT`.
@@ -488,10 +536,17 @@ async fn session(
     trace: &mut Trace,
     away: &mut Away,
 ) -> Result<(), Fail> {
-    let (ws, _) = tokio::time::timeout(CONNECT_LIMIT, tokio_tungstenite::connect_async(url))
-    .await
-    .map_err(|_| Fail::Other("timed out".into()))?
-    .map_err(|e| Fail::Other(e.to_string()))?;
+    let ws = match tokio::time::timeout(CONNECT_LIMIT, tokio_tungstenite::connect_async(url)).await {
+        Ok(Ok((ws, _))) => ws,
+        Ok(Err(e)) => {
+            trace.kind = kind_of(&e);
+            return Err(Fail::Other(e.to_string()));
+        }
+        Err(_) => {
+            trace.kind = "timed out";
+            return Err(Fail::Other("timed out".into()));
+        }
+    };
     trace.answered = true;
     let (mut tx, mut rx) = ws.split();
     let hello = json!({ "type": "hello", "token": token, "device": device, "version": env!("CARGO_PKG_VERSION") });
@@ -508,8 +563,10 @@ async fn session(
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut unanswered = 0;
     loop {
+        trace.waiting = Some(Instant::now());
         tokio::select! {
             msg = rx.next() => {
+                trace.woke();
                 let Some(msg) = msg else {
                     trace.how = "the connection ended without a close".into();
                     return Ok(());
@@ -586,6 +643,7 @@ async fn session(
                 }
             }
             Some(u) = up.recv() => {
+                trace.woke();
                 let m = match u {
                     Up::Start => Message::Text(json!({ "type": "speech_start" }).to_string().into()),
                     Up::Pcm(b) => Message::Binary(b.into()),
@@ -596,6 +654,7 @@ async fn session(
                 }
             }
             Some(c) = cmds.recv() => {
+                trace.woke();
                 // Input is only taken once welcomed; this is one that slipped in.
                 if !trace.welcomed {
                     continue;
@@ -614,12 +673,11 @@ async fn session(
                 put(&mut tx, Message::Text(m.to_string().into())).await?;
             }
             Some(r) = done_rx.recv() => {
+                trace.woke();
                 put(&mut tx, Message::Text(r.into())).await?;
             }
-            due = ping.tick() => {
-                // Late by more than a moment: this app was held up (asleep, or
-                // starved of the CPU), which the log should show.
-                trace.late = trace.late.max(tokio::time::Instant::now().saturating_duration_since(due));
+            _ = ping.tick() => {
+                trace.woke();
                 // Anything from the server counts as an answer. A process that
                 // hangs leaves the socket open, so nothing else would notice.
                 if unanswered >= UNANSWERED {
@@ -1284,6 +1342,14 @@ mod tests {
     }
 
     #[test]
+    fn the_server_address_is_read_for_hiding() {
+        assert_eq!(host_of("ws://homebox:8791/satellite"), "homebox");
+        assert_eq!(host_of("wss://example.test/satellite?x=1"), "example.test");
+        assert_eq!(host_of("ws://[::1]:8791"), "::1");
+        assert_eq!(host_of("ws://10.1.2.3"), "10.1.2.3");
+    }
+
+    #[test]
     fn no_hello_is_a_slow_server_not_a_refusal() {
         assert!(matches!(refused("bad token".into()), Fail::Denied(_)));
         assert!(matches!(refused("no hello".into()), Fail::Other(_)));
@@ -1641,6 +1707,13 @@ mod tests {
                 break (at, w);
             }
         };
+        // The welcome went out; give the client a moment to read it and log it.
+        let end = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < end
+            && !std::fs::read_to_string(&file).is_ok_and(|t| t.contains("at the first try"))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = stop_tx.send(());
         client.join().unwrap();
         drop(server_rt);
@@ -1651,7 +1724,7 @@ mod tests {
         let held_up = text
             .lines()
             .filter(|l| l.contains("link ended"))
-            .filter_map(|l| number_before(l, "link ended", " ms late"))
+            .filter_map(|l| number_before(l, "link ended", " ms; quiet"))
             .max()
             .expect(&text);
         assert!(held_up >= (BEAT * 3).as_millis() as u64, "{text}");
@@ -1697,6 +1770,7 @@ mod tests {
         assert_eq!(text.matches("can't reach the server").count(), 1, "{text}");
         assert_eq!(text.matches("link back after").count(), 1, "{text}");
         assert!(number_before(&text, "link back after", " failed tries").unwrap() >= 2, "{text}");
+        assert!(text.contains("(refused "), "{text}");
         assert!(text.contains("quiet mode off, game no"), "{text}");
         assert!(!text.contains("sat_secret") && !text.contains(&addr.port().to_string()), "{text}");
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
