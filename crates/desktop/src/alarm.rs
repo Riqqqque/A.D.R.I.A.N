@@ -38,10 +38,27 @@ pub struct Done {
     pub at: f64,
 }
 
+/// An occurrence answered here. Until the server's list shows it moved on, a
+/// list that still has it at or before `answered` was made before the server
+/// heard the answer (the hourly resync, one that crossed the PC's
+/// `alarm_done`, or the list sent at connect, before the answers go out).
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+struct Answered {
+    id: String,
+    base: f64,
+    /// When it was answered (the server's clock).
+    answered: f64,
+    /// Snoozed: when it rings again. None: stopped.
+    until: Option<f64>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Saved {
     list: Vec<Replica>,
     done: Vec<Done>,
+    /// Files from before 0.17.2 don't have it.
+    #[serde(default)]
+    answered: Vec<Answered>,
     snooze_min: f64,
     ring_min: f64,
     /// The speakers' level and mute before an alarm raised them.
@@ -53,6 +70,7 @@ impl Default for Saved {
         Saved {
             list: vec![],
             done: vec![],
+            answered: vec![],
             snooze_min: 9.0,
             ring_min: 10.0,
             restore: None,
@@ -75,6 +93,8 @@ struct State {
     saved: Saved,
     /// What the server says is ringing now.
     server: Vec<Replica>,
+    /// When each of those was first seen ringing (the server's clock).
+    server_seen: Vec<(String, f64)>,
     /// Ringing here by itself, since then.
     local: Option<(Vec<Replica>, f64)>,
     /// Occurrences already rung here (id, at), so one is never rung twice.
@@ -143,15 +163,40 @@ impl Alarms {
     /// server still lists as due but isn't ringing keeps ringing here: the
     /// server resends the list every hour and on every change, and that alone
     /// mustn't silence an alarm nobody answered.
+    ///
+    /// An occurrence answered here that the list still shows unanswered keeps
+    /// the answer (see `Answered`): a snoozed one rings at its new time, a
+    /// stopped one is left out.
     pub fn server_said(&self, m: &Value) {
+        let here = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0);
+        self.said(m, here);
+    }
+
+    fn said(&self, m: &Value, here: f64) {
         let mut st = self.lock();
         let list = |k: &str| -> Vec<Replica> { m.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(read).take(MAX_KEPT).collect()).unwrap_or_default() };
-        st.saved.list = list("list");
+        let mut fresh = list("list");
         st.server = list("ringing");
         if let Some(t) = m.get("now").and_then(Value::as_f64).filter(|t| t.is_finite()) {
-            let here = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(t);
             st.skew = t - here;
         }
+        let now = here + st.skew;
+        // Answers the list doesn't know about yet. The server moved it on (a
+        // later time, another occurrence) or dropped it: then it knows.
+        let answered = std::mem::take(&mut st.saved.answered);
+        st.saved.answered = answered
+            .into_iter()
+            .filter(|w| fresh.iter().any(|r| r.id == w.id && r.base == w.base && r.at <= w.answered))
+            .collect();
+        fresh.retain_mut(|r| match st.saved.answered.iter().find(|w| w.id == r.id && w.base == r.base) {
+            Some(w) => w.until.map(|t| r.at = t).is_some(),
+            None => true,
+        });
+        st.saved.list = fresh;
+        // When each ringing one was first seen, so one carried over when the
+        // link goes rings only for what's left of its ring time.
+        let seen = std::mem::take(&mut st.server_seen);
+        st.server_seen = st.server.iter().map(|r| (r.id.clone(), seen.iter().find(|s| s.0 == r.id).map_or(now, |s| s.1))).collect();
         if let Some(v) = m.get("snoozeMin").and_then(Value::as_f64).filter(|v| (1.0..=60.0).contains(v)) {
             st.saved.snooze_min = v;
         }
@@ -159,10 +204,15 @@ impl Alarms {
             st.saved.ring_min = v;
         }
         if let Some((list, since)) = st.local.take() {
-            let keep: Vec<Replica> = list
+            // Not even due yet by the server's clock: this PC's clock jumped
+            // ahead since the last list. It rings at its real time instead.
+            let (keep, early): (Vec<Replica>, Vec<Replica>) = list
                 .into_iter()
                 .filter(|a| !st.server.iter().any(|r| r.id == a.id) && st.saved.list.iter().any(|r| r.id == a.id && r.at == a.at))
-                .collect();
+                .partition(|a| a.at + GRACE_MS <= now);
+            for a in early {
+                st.rung.remove(&(a.id, a.at as u64));
+            }
             if !keep.is_empty() {
                 st.local = Some((keep, since));
             }
@@ -175,10 +225,14 @@ impl Alarms {
     pub fn link_lost(&self, now: f64) {
         let mut st = self.lock();
         let was = std::mem::take(&mut st.server);
+        let seen = std::mem::take(&mut st.server_seen);
         for a in &was {
             st.rung.insert((a.id.clone(), a.at as u64));
         }
-        let since = now + st.skew;
+        // It has been ringing since the server started it (a PC that slept
+        // through the rest of its ring time doesn't start it over on waking).
+        let now = now + st.skew;
+        let since = was.iter().filter_map(|a| seen.iter().find(|s| s.0 == a.id).map(|s| s.1)).fold(now, f64::min);
         match &mut st.local {
             // Already ringing one here: the server's join it.
             Some((list, _)) => {
@@ -230,6 +284,11 @@ impl Alarms {
             let snooze = st.saved.snooze_min * 60_000.0;
             for a in &list {
                 st.saved.done.push(Done { id: a.id.clone(), base: a.base, action: action.into(), at: now });
+                st.saved.answered.retain(|w| w.id != a.id);
+                let until = (action == "snooze").then_some(now + snooze);
+                if st.saved.answered.len() < MAX_KEPT {
+                    st.saved.answered.push(Answered { id: a.id.clone(), base: a.base, answered: now, until });
+                }
                 if action == "snooze" {
                     // Still offline then: it rings here again. One the server was
                     // ringing when the link went isn't in the copy (the server leaves
@@ -455,6 +514,168 @@ mod tests {
         assert!(a.view().local);
         assert_eq!(a.answer("stop", 60_000.0), Answer::Here);
         assert_eq!(a.pending_done().len(), 1, "and the server hears how it was answered");
+    }
+
+    #[test]
+    fn snoozed_here_while_linked_a_stale_resync_doesnt_lose_the_snooze() {
+        // The server is up but didn't ring it; the PC did, and it's snoozed here.
+        // The server's next list (hourly, or one that crossed the PC's alarm_done)
+        // still shows the occurrence at the time it already rang.
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        assert_eq!(a.answer("snooze", 30_000.0), Answer::Here);
+        a.server_said(&state(0.0));
+        assert!(!a.tick(31_000.0), "not before the snooze is up");
+        assert!(a.tick(30_000.0 + 5.0 * 60_000.0 + GRACE_MS + 1.0), "the snooze was lost");
+    }
+
+    #[test]
+    fn once_the_server_has_the_snooze_its_time_wins() {
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        assert_eq!(a.answer("snooze", 30_000.0), Answer::Here);
+        // The server applied it with its own snooze length (this alarm's is 7 min).
+        let theirs = 30_000.0 + 7.0 * 60_000.0;
+        a.server_said(&json!({ "type": "alarms", "ringing": [], "snoozeMin": 5,
+            "list": [{ "id": "a1", "kind": "alarm", "label": "gym", "at": theirs, "base": 0.0 }] }));
+        assert!(!a.tick(30_000.0 + 5.0 * 60_000.0 + GRACE_MS + 1.0), "rang at the PC's time, not the server's");
+        assert!(a.tick(theirs + GRACE_MS + 1.0));
+    }
+
+    #[test]
+    fn snoozed_here_then_stopped_or_moved_on_elsewhere_it_stays_quiet() {
+        // Stopped from Discord after the PC's snooze: the server lists the next occurrence.
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        assert_eq!(a.answer("snooze", 30_000.0), Answer::Here);
+        a.server_said(&state(86_400_000.0));
+        assert!(!a.tick(30_000.0 + 5.0 * 60_000.0 + GRACE_MS + 1.0));
+        // Deleted there: gone from the list altogether.
+        let b = Alarms::default();
+        b.server_said(&state(0.0));
+        assert!(b.tick(GRACE_MS + 1.0));
+        assert_eq!(b.answer("snooze", 30_000.0), Answer::Here);
+        b.server_said(&json!({ "type": "alarms", "ringing": [], "list": [] }));
+        assert!(!b.tick(30_000.0 + 5.0 * 60_000.0 + GRACE_MS + 1.0));
+    }
+
+    #[test]
+    fn stopped_here_while_linked_a_stale_resync_doesnt_ring_it_again() {
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        assert_eq!(a.answer("snooze", 30_000.0), Answer::Here);
+        assert!(a.tick(30_000.0 + 5.0 * 60_000.0 + GRACE_MS + 1.0));
+        assert_eq!(a.answer("stop", 400_000.0), Answer::Here);
+        // The server hasn't heard either answer yet.
+        a.server_said(&state(0.0));
+        assert!(!a.tick(401_000.0));
+        assert!(!a.tick(30_000.0 + 10.0 * 60_000.0 + GRACE_MS + 1.0), "a stopped one rang again");
+    }
+
+    #[test]
+    fn a_stale_resync_while_the_snooze_rings_doesnt_silence_it() {
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        assert_eq!(a.answer("snooze", 30_000.0), Answer::Here);
+        let again = 30_000.0 + 5.0 * 60_000.0 + GRACE_MS + 1.0;
+        assert!(a.tick(again));
+        a.server_said(&state(0.0));
+        assert!(a.ringing(), "the snoozed ring stopped without anyone answering it");
+        assert!(a.tick(again + 1_000.0));
+    }
+
+    #[test]
+    fn a_snooze_survives_a_restart_before_the_server_hears_it() {
+        let dir = std::env::temp_dir().join(format!("adrian-alarm-snooze-{}", std::process::id()));
+        let file = dir.join("alarms.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let a = Alarms::default();
+            a.load(file.clone());
+            a.server_said(&state(0.0));
+            assert!(a.tick(GRACE_MS + 1.0));
+            assert_eq!(a.answer("snooze", 30_000.0), Answer::Here);
+            // ...an update restarts the app.
+        }
+        let b = Alarms::default();
+        b.load(file.clone());
+        // The list sent at connect comes before the answers go out.
+        b.server_said(&state(0.0));
+        assert!(!b.tick(31_000.0), "it rang again straight away");
+        assert!(b.tick(30_000.0 + 5.0 * 60_000.0 + GRACE_MS + 1.0), "the snooze was lost");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_from_before_answers_were_kept_still_loads() {
+        let dir = std::env::temp_dir().join(format!("adrian-alarm-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("alarms.json");
+        std::fs::write(
+            &file,
+            r#"{"list":[{"id":"a1","kind":"alarm","label":"gym","at":5000.0,"base":5000.0}],"done":[{"id":"a0","base":1.0,"action":"stop","at":2.0}],"snooze_min":9.0,"ring_min":10.0,"restore":[0.1,false]}"#,
+        )
+        .unwrap();
+        let a = Alarms::default();
+        a.load(file);
+        assert_eq!(a.pending_done().len(), 1);
+        assert_eq!(a.take_restore(), Some((0.1, false)));
+        assert!(a.tick(5_000.0 + GRACE_MS + 1.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rung_early_because_this_pcs_clock_jumped_ahead_it_waits_for_its_real_time() {
+        let s = 1_000_000_000.0;
+        let hour = 3_600_000.0;
+        let list = |now: f64| json!({ "type": "alarms", "ringing": [], "now": now,
+            "list": [{ "id": "a1", "kind": "alarm", "label": "", "at": s + hour, "base": s + hour }] });
+        let a = Alarms::default();
+        a.said(&list(s), s);
+        // The PC's clock is set an hour and a minute ahead: by its old skew the
+        // alarm looks a minute overdue.
+        let jumped = s + hour + 60_000.0;
+        assert!(a.tick(jumped + 1_000.0));
+        // The next list says what time it really is (a few seconds later).
+        a.said(&list(s + 5_000.0), jumped + 5_000.0);
+        assert!(!a.ringing(), "still ringing an alarm an hour early");
+        assert!(!a.tick(jumped + 10_000.0));
+        // And it rings at its time on the server's clock.
+        assert!(a.tick(jumped + 5_000.0 + (hour - 5_000.0) + GRACE_MS + 1.0), "it never rang");
+    }
+
+    #[test]
+    fn waking_from_sleep_long_after_the_server_rang_it_doesnt_start_it_over() {
+        // The server rang it, the PC slept mid-ring, and the dead link is only
+        // noticed after waking, hours later.
+        let ringing = json!({ "type": "alarms", "ringing": [{ "id": "a1", "kind": "alarm", "label": "gym", "base": 0.0 }], "list": [] });
+        let a = Alarms::default();
+        a.said(&ringing, 1_000.0);
+        a.link_lost(5.0 * 3_600_000.0);
+        assert!(!a.tick(5.0 * 3_600_000.0 + 200.0), "rang for ten minutes, five hours late");
+        // A link lost two minutes in rings here for the rest of its ring time.
+        let b = Alarms::default();
+        b.said(&ringing, 1_000.0);
+        b.link_lost(121_000.0);
+        assert!(b.tick(121_200.0));
+        assert!(b.tick(1_000.0 + 9.0 * 60_000.0));
+        assert!(!b.tick(1_000.0 + 10.0 * 60_000.0 + 1_000.0));
+    }
+
+    #[test]
+    fn asleep_through_its_whole_ring_time_it_stays_quiet_on_waking() {
+        // Rung here offline; the PC sleeps longer than the ring time.
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        assert!(!a.tick(GRACE_MS + 30.0 * 60_000.0), "the ring time ran out while it slept");
+        assert!(!a.tick(GRACE_MS + 30.0 * 60_000.0 + 200.0), "and it doesn't start over");
+        assert_eq!(a.answer("stop", GRACE_MS + 31.0 * 60_000.0), Answer::Nothing);
     }
 
     #[test]
