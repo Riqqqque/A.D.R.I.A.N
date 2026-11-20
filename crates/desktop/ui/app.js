@@ -56,6 +56,9 @@
   // The mic and speakers she's using: Windows' defaults, followed as they change.
   const showDevices = (d) => {
     if (d && (d.mic || d.speakers)) $('devices').textContent = `Using ${d.mic || 'no mic'} and ${d.speakers || 'no speakers'} (the Windows defaults; she follows them when they change).`;
+    // Ticked when they're headphones; Windows itself saying so leaves nothing to mark.
+    $('headphones').checked = d?.kind === 'headphones';
+    $('headphones').disabled = !d?.speakers || (d.kind === 'headphones' && !d.marked);
   };
   listen('devices', (e) => showDevices(e.payload));
   invoke('audio_devices').then(showDevices);
@@ -206,6 +209,7 @@
     $('micHint').textContent = micLabel($('mic').value);
     $('autoUpdate').checked = current.auto_update;
     $('quietPlaying').checked = current.quiet_while_playing !== false;
+    invoke('audio_devices').then(showDevices);
     renderUpdate();
     const list = $('toggles');
     list.textContent = '';
@@ -252,7 +256,7 @@
     save.disabled = true;
     save.textContent = 'Saving';
     try {
-      await invoke('save_settings', { serverUrl: $('server').value, token: $('token').value || null, micThreshold: Number($('mic').value) / 600, pc, shortcuts: $('shortcuts').value, autoUpdate: $('autoUpdate').checked, quietWhilePlaying: $('quietPlaying').checked });
+      await invoke('save_settings', { serverUrl: $('server').value, token: $('token').value || null, micThreshold: Number($('mic').value) / 600, pc, shortcuts: $('shortcuts').value, autoUpdate: $('autoUpdate').checked, quietWhilePlaying: $('quietPlaying').checked, headphones: $('headphones').disabled ? null : $('headphones').checked });
       closeSettings();
     } catch (err) {
       $('error').textContent = String(err);

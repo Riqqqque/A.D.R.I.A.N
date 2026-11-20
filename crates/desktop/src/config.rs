@@ -19,6 +19,10 @@ pub struct Settings {
     pub updates_off: bool,
     /// Don't tell the server when a game is being played (so no quiet mode).
     pub quiet_off: bool,
+    /// Outputs (Windows names) that are really headphones or earphones. Many
+    /// USB DACs and docks say "speakers" whatever is plugged in, and with
+    /// speakers the server takes only push-to-talk while you're in a voice call.
+    pub headphones: Vec<String>,
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -58,6 +62,10 @@ pub struct Form {
     pub auto_update: Option<bool>,
     /// "Quiet while I play". None from a page that doesn't have the switch.
     pub quiet_while_playing: Option<bool>,
+    /// "These are headphones", for `speakers`. None from a page without it.
+    pub headphones: Option<bool>,
+    /// The output in use when Save was pressed (not from the page).
+    pub speakers: String,
 }
 
 /// What a Save changed that needs acting on.
@@ -110,6 +118,9 @@ pub fn commit(
     if let Some(on) = form.quiet_while_playing {
         next.quiet_off = !on;
     }
+    if let Some(on) = form.headphones {
+        mark_headphones(&mut next.headphones, &form.speakers, on);
+    }
     write(&next)?;
     let saved = Saved {
         connection: (next.url(), next.token()) != (s.url(), s.token()),
@@ -117,6 +128,18 @@ pub fn commit(
     };
     *s = next;
     Ok(saved)
+}
+
+/// Mark `name` as headphones or not. Nothing to mark without a name.
+pub fn mark_headphones(list: &mut Vec<String>, name: &str, on: bool) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    list.retain(|n| n != name);
+    if on {
+        list.push(name.to_string());
+    }
 }
 
 /// The shortcuts as lines for the settings box. With arguments the target is
@@ -302,7 +325,34 @@ mod tests {
             shortcuts: String::new(),
             auto_update: None,
             quiet_while_playing: None,
+            headphones: None,
+            speakers: String::new(),
         }
+    }
+
+    #[test]
+    fn headphones_are_marked_by_the_output_in_use_at_save() {
+        let mut s = on_server_a();
+        let mark = |on: Option<bool>, speakers: &str| Form {
+            headphones: on,
+            speakers: speakers.into(),
+            ..form("a:8791")
+        };
+        commit(&mut s, mark(Some(true), "Speakers (USB DAC)"), |_| Ok(())).unwrap();
+        assert_eq!(s.headphones, ["Speakers (USB DAC)"]);
+        // Marked twice is still once; another output is its own mark.
+        commit(&mut s, mark(Some(true), "Speakers (USB DAC)"), |_| Ok(())).unwrap();
+        commit(&mut s, mark(Some(true), "Headset (Dock)"), |_| Ok(())).unwrap();
+        assert_eq!(s.headphones, ["Speakers (USB DAC)", "Headset (Dock)"]);
+        // A page without the switch, or no output in use, leaves them alone.
+        commit(&mut s, mark(None, "Headset (Dock)"), |_| Ok(())).unwrap();
+        commit(&mut s, mark(Some(false), ""), |_| Ok(())).unwrap();
+        assert_eq!(s.headphones.len(), 2);
+        commit(&mut s, mark(Some(false), "Speakers (USB DAC)"), |_| Ok(())).unwrap();
+        assert_eq!(s.headphones, ["Headset (Dock)"]);
+        // Older settings files have none.
+        let old: Settings = serde_json::from_str(r#"{"server_url":"a:8791"}"#).unwrap();
+        assert!(old.headphones.is_empty());
     }
 
     #[test]
