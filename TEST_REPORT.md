@@ -1,33 +1,122 @@
-# Test report — Gate A + Gate B + local alarm replicas
+# Test report
 
-**Update 2026-10-14:** secrets encryption at rest, optional built-in TLS, and
-satellite local alarm replicas added. Rows `C-*` below cover them; `A-UNIT`
-and `A-CLIPPY` were re-run on the same toolchain plus a 1.88 MSRV check.
+This file has two parts:
 
-**Commits:** `1529f82` … `de88194`+ (see `git log`; this file is amended into the satellite commit)
-**Date:** 2026-09-17
-**OS/Hardware:** Windows 11 (x86_64), MSVC Build Tools 2022 (14.44), local dev machine
-**Toolchain:** rustc/cargo 1.94.1 stable-msvc · Node 24.12.0 · bundled SQLite 3.53.2
-**Evidence types:** `UNIT/FIXTURE` = automated unit/integration test · `LIVE SERVER` = real running server + real SQLite over real HTTP, no mocks, no external service · `REAL PROVIDER`/`REAL HARDWARE` = real external dependency · `NOT RUN`/`SKIPPED` = honest non-execution.
+1. **[Current test inventory](#current-test-inventory)**: what tests exist at commit `ac9708d`
+   (PC app 0.17.1, 2026-11-19), counted on 2026-11-20. The suite was **not re-run** for this
+   report, so it records no pass or fail for the current tree. Run the commands below to get one.
+2. **[Historical report](#historical-report-gate-a-gate-b-and-alarm-replicas)**: the
+   2026-09-17 report for the older Rust household server and old satellite (Gate A and
+   Gate B), updated 2026-10-14. Its results describe that date's code, not today's.
 
-Evidence for `LIVE SERVER` rows: terminal transcripts of curl invocations against
-`http://127.0.0.1:8787` with `ADRIAN_DATA_DIR=%TEMP%\adrian-test-data` (not committed;
-reproducible with the commands shown).
+There is no CI (no `.github` folder); every result here comes from a local run.
 
-## Automated
+## Current test inventory
+
+Counts are `#[test]` / `#[tokio::test]` attributes found with grep (Rust) and `test(` calls
+(web), not passes.
+
+| Crate or folder | Tests | Ignored by default | Notes |
+|---|---|---|---|
+| `crates/desktop` (PC app) | 73 | 0 | alarm 8, audio 6, config 10, link 24, main 4, single 2, tray 4, update 15; 6 Windows-only. `link.rs` tests run real WebSocket servers on `127.0.0.1:0` with shortened timings; `update.rs` Windows tests spawn `cmd`, `ping` and a copied `ping.exe` |
+| `crates/pc-control` (PC actions) | 109 | 1 (`live_notepad`) | activity 17, lib 5, matching 5, win/activity 6, apps 7, audio 1, clipboard 8, health 8, info 3, layout 25, media 2, nvml 2, open 7, screen 13. Everything under `win/` compiles only on Windows |
+| `crates/server` (older server) | 157 | 0 | 97 unit tests in `src/` (including a fake Home Assistant), plus integration tests: `http_flow.rs` 33, `usage_flow.rs` 11 (with a mock OpenAI-compatible SSE server), `ws_session.rs` 16 |
+| `crates/satellite` (old client) | 5 | 1 (live TLS) | Replica store and TLS client |
+| `crates/protocol` | 4 | 0 | Envelope parsing, unknown types |
+| `web/tests/audio.test.mjs` | 10 | | Browser-speaker logic in `src/lib/audio.ts` |
+
+How the counts grew (from the maintainer's dated records): server 38 to 157 and desktop 8 to
+61 over the night of 2026-10-31; pc-control 12 to 22 (2026-11-01) and to 109 (0.15.6,
+2026-11-08); desktop 61 to 65 (0.15.6) and to 73 (0.17.0, 2026-11-19).
+
+### Commands
+
+```
+cargo fmt --all --check
+cargo clippy --workspace
+cargo test --workspace                      # everything, including the older server
+cargo test -p adrian-desktop
+cargo test -p adrian-pc-control
+cargo test -p adrian-server
+cargo +1.88.0 check --workspace --all-targets          # MSRV
+cargo check -p adrian-satellite --features wake-word   # pulls the candle ML stack; slow
+cd web && npm ci && npm run check && npm run build && npm test
+```
+
+### Live and manual checks (not part of the default run)
+
+| Check | Command | Touches |
+|---|---|---|
+| Window layout on a real desktop | `cargo test -p adrian-pc-control live_notepad -- --ignored --nocapture` | Opens its own Notepad on a temporary file (refuses if any Notepad is open), moves it through every snap zone, closes it with `WM_CLOSE`, deletes the file |
+| Read-only PC actions | `pcctl pc_info '{"action":"health"}'`, `pcctl pc_windows '{"action":"monitors"}'`, `pcctl pc_volume '{"action":"get","playing":true}'` (see [docs/pc-control.md](docs/pc-control.md#pcctl)) | Nothing is changed |
+| Old satellite against a TLS server | `ADRIAN_TEST_TLS_URL=https://127.0.0.1:18787 ADRIAN_TEST_TLS_CA=cert.pem cargo test -p adrian-satellite -- --ignored` | Needs the older server running with a leaf test certificate (`basicConstraints=critical,CA:FALSE`) |
+| Echo probe | `cargo run --release -p adrian-desktop --example aec_probe -- <voice.wav> <out dir>` | Plays sound and records the mic |
+| Model routing of PC requests | `bench/pc-orders.mjs` in the bot repo | Calls the real model; needs keys |
+
+Never run, as a test, anything that locks, sleeps, restarts or shuts down the machine, launches
+games, or changes the volume or media on a machine someone is using. One existing test
+(`refuses_what_the_policy_turns_off`) sends a confirmed shutdown that only the policy stops;
+see [docs/pc-control.md](docs/pc-control.md#tests).
+
+### What the automated tests don't cover
+
+- The PC app's audio on real devices (mic gate by ear, barge-in, device switching), the tray
+  and the window's look, and a live alarm ring (it makes sound and opens a window).
+- `crates/desktop/packaging/Install.ps1` (no automated test).
+- `pc-control` against real games, multi-monitor moves with mixed DPI, real screen capture,
+  and quiet mode with real games: unit-tested logic only.
+- The older server against a real AI provider, a real speech-to-text service or a real Home
+  Assistant (see N-1, N-2, N-9, N-13 below; still true).
+
+## Historical report: Gate A, Gate B and alarm replicas
+
+**Scope:** `crates/server`, `crates/satellite`, `crates/protocol`, `web/` only. The PC app
+and `pc-control` did not exist yet.
+**Commits:** `1529f82` to `de88194` and the 2026-10-14 follow-ups (see `git log`).
+**Date:** 2026-09-17; the 2026-10-14 update added secrets encryption at rest, optional
+built-in TLS, satellite local alarm replicas and usage metering (rows `C-*` and `D-*`);
+`A-UNIT` and `A-CLIPPY` were re-run then, plus a 1.88 MSRV check.
+**OS:** Windows 11 (x86_64), MSVC Build Tools 2022 (14.44).
+**Toolchain:** rustc/cargo 1.94.1 stable-msvc, Node 24.12.0, bundled SQLite 3.53.2.
+**Evidence types:** `UNIT/FIXTURE` = automated unit or integration test; `LIVE SERVER` = a real
+running server and real SQLite over real HTTP, no mocks, no external service; `REAL
+PROVIDER`/`REAL HARDWARE` = a real external dependency; `NOT RUN`/`SKIPPED` = not executed.
+Evidence for `LIVE SERVER` rows: terminal transcripts of curl against `http://127.0.0.1:8787`
+with a temporary `ADRIAN_DATA_DIR` (not committed; reproducible with the commands shown).
+
+**Notes on rows that no longer match the code:**
+
+1. **A-UNIT** counted 45 tests then. Today the same crates have 157 + 5 + 4 test attributes
+   (see the inventory above).
+2. **B-WAV-LIMIT**: the utterance body limit is now 25 MiB and an oversized body gets 400
+   (`http_flow::utterance_body_stays_limited`).
+3. **A-INJECTION**: the model's light tool uses `tools::control_light_inner` with the same
+   checks; the UI and the fast path use `api::devices::execute_light`. They are two functions
+   with the same rules, not one shared function.
+4. The "unencrypted at rest" line in the old known limitations was wrong after 2026-10-14:
+   the secrets table is encrypted; the rest of the database and backups are not. Corrected below.
+5. The 2026-11-01 server work is not in these tables: roles and capabilities, the trusted
+   proxy, fact history, exact light commands, revoke ending live sessions, and reports of what
+   a failed turn already did. Tests in `crates/server` cover them (for example
+   `a_guest_can_chat_but_cannot_act_on_the_house`,
+   `forwarded_headers_are_ignored_from_anyone_but_the_trusted_proxy`,
+   `revoking_a_satellite_ends_its_live_session`,
+   `a_failed_later_round_still_reports_what_was_done`).
+
+### Automated (2026-09-17, re-run 2026-10-14)
 
 | ID | Procedure | Expected | Observed | Evidence | Result |
 |---|---|---|---|---|---|
-| A-FMT | `cargo fmt --all --check` | clean | clean | toolchain output | PASS |
-| A-CLIPPY | `cargo clippy --workspace` | 0 warnings | 0 warnings | toolchain output | PASS |
-| A-UNIT | `cargo test --workspace` | all pass | 45/45 pass (4 protocol, 4 satellite, 23 server lib, 7 HTTP integration, 1 usage integration, 7 WS session); 1 live TLS test ignored by default, run separately as C-TLS-SAT | toolchain output | PASS |
-| A-MSRV | `cargo +1.88.0 check --workspace --all-targets` | compiles on the declared `rust-version` | compiles | toolchain output | PASS |
-| A-WAKE-BUILD | `cargo check -p adrian-satellite --features wake-word` | compiles | compiles | toolchain output | PASS |
+| A-FMT | `cargo fmt --all --check` | clean | clean | toolchain output | PASS (then) |
+| A-CLIPPY | `cargo clippy --workspace` | 0 warnings | 0 warnings | toolchain output | PASS (then) |
+| A-UNIT | `cargo test --workspace` | all pass | 45/45 pass (4 protocol, 4 satellite, 23 server lib, 7 HTTP integration, 1 usage integration, 7 WS session); 1 live TLS test ignored by default, run separately as C-TLS-SAT | toolchain output | PASS (then; see note 1) |
+| A-MSRV | `cargo +1.88.0 check --workspace --all-targets` | compiles on the declared `rust-version` | compiles | toolchain output | PASS (then) |
+| A-WAKE-BUILD | `cargo check -p adrian-satellite --features wake-word` | compiles | compiles | toolchain output | PASS (then) |
 | A-FE-CHECK | `cd web && npm run check` | 0 errors, 0 warnings | 0 errors, 0 warnings (a11y warnings from previous report all fixed — controls wrapped in labels) | svelte-check output | PASS |
 | A-FE-BUILD | `cd web && npm run build` | static output emitted | `web/build/index.html` + `_app/` written | build log | PASS |
-| A-SAT-BUILD | `cargo check -p adrian-satellite` | compiles | compiles (real client: cpal mic, global-hotkey PTT, reqwest transport, tts output) | toolchain output | PASS |
+| A-SAT-BUILD | `cargo check -p adrian-satellite` | compiles | compiles (real client: cpal mic, global-hotkey PTT, reqwest transport, tts output) | toolchain output | PASS (then) |
 
-## Gate A behavior
+### Gate A behavior
 
 | ID | Procedure | Expected | Observed | Evidence | Result |
 |---|---|---|---|---|---|
@@ -46,7 +135,7 @@ reproducible with the commands shown).
 | A-EGRESS | strict_local + default provider = `api.openai.com`, send chat | refusal | `forbidden: strict-local mode blocks cloud egress — provider 'openai' (api.openai.com) is not a local endpoint`; same request under `hybrid` reaches the provider normally | live curl | PASS |
 | A-PROV-TIMEOUT | provider pointed at `127.0.0.1:1`, `POST …/test` | bounded failure | `ok:false, upstream error …` in ~2s, server healthy | live curl | PASS |
 | A-TOOL-POLICY | light command path validation | domain+allowlist+action+range checks | enforced in `tools::control_light_inner`/`execute_light` (bad action, unallowlisted entity, brightness>100 all rejected); no unrestricted `call_service` route exists | code review — HA cannot be exercised without an instance | PARTIAL — logic verified by inspection, real HA path NOT RUN |
-| A-INJECTION | tool-call args from model are re-validated | policy applied server-side | same validation functions run for model tool calls and UI calls (shared `execute_light`) | code inspection | PASS (design); live injection-vs-provider N/R — needs real model |
+| A-INJECTION | tool-call args from model are re-validated | policy applied server-side | same validation functions run for model tool calls and UI calls (shared `execute_light`) | code inspection | PASS (design; see note 3); live injection-vs-provider N/R — needs real model |
 | A-CHAT-HIST | `GET /api/chat/conversations` + `/{id}` | owner-scoped list + history | conversations list with last message; history returns ordered messages; cross-user id → 404 | live curl + code | PASS |
 | A-RECONCILE | crash while recurring alarm `ringing` | rescheduled, not killed | interrupted delivery marked failed; one-shot → `done`; recurring → next occurrence persisted; no duplicate delivery row | integration test | PASS |
 | A-RATELIMIT | >10 login attempts/min/IP | 429 lockout | limiter trips at threshold, recovers after window | unit test | PASS |
@@ -56,14 +145,14 @@ reproducible with the commands shown).
 | B-STRICT | strict_local + cloud STT base | refusal before egress | cloud base URL → 403 `strict-local … needs a local STT endpoint` | code path shared with A-EGRESS | PASS (same check) |
 | B-PAIR-RATE | >10 `POST /api/satellite/pair` attempts/min/IP | 429 lockout | 11th attempt → 429; pairing now shares the login/setup limiter | integration test `pair_is_rate_limited_and_one_use_is_atomic` | PASS |
 | B-PAIR-RACE | 6 concurrent redemptions of one pairing code | exactly one token issued | 1×200 + 5×403; the burn is an atomic `UPDATE … WHERE used=0 … RETURNING` | same test | PASS |
-| B-WAV-LIMIT | >2MB WAV body to `/api/satellite/utterance` | reaches handler (axum 2MB default lifted) | 3MB body → 412 (bad wav), not 413 | same test | PASS |
+| B-WAV-LIMIT | >2MB WAV body to `/api/satellite/utterance` | reaches handler (axum 2MB default lifted) | 3MB body → 412 (bad wav), not 413 | same test | PASS (then; see note 2) |
 | B-WS-AUTH | `GET /api/satellite/session` with no/bogus token vs valid token | 401 vs upgrade | no/bogus → HTTP error during handshake; valid → upgrades | ws_session test `session_requires_device_token` | PASS |
 | B-WS-PROTO | versioned envelopes over the WS: bad version, AudioSessionStart+binary+End, idempotency replay | nack / capturing+processing acks / duplicate ignored | all observed on a real TCP+WS round trip | ws_session test `session_protocol_envelopes` | PASS |
 | B-SAT-ALARM | satellite endpoint + due alarm, satellite connected | `Speak` pushed over WS, ack → delivery `played` | media_url envelope arrived; ack resolved the armed waiter; row `played` | ws_session test `satellite_alarm_is_delivered_over_ws` | PASS |
 | B-SAT-ALARM-OFF | same with satellite offline | honest failure | delivery row `failed`, detail "not connected" | ws_session test `satellite_alarm_offline_is_failed_not_silent` | PASS |
 | B-RESTORE | backup → mutate → `POST /api/diagnostics/restore` | original state returns; queries keep working | marker value restored; post-restore `/api/diagnostics` healthy; traversal + missing file rejected | integration test `backup_restore_roundtrip` | PASS |
 
-## Secrets, TLS, local alarm replicas
+### Secrets, TLS, local alarm replicas (2026-10-14)
 
 | ID | Procedure | Expected | Observed | Evidence | Result |
 |---|---|---|---|---|---|
@@ -78,7 +167,7 @@ reproducible with the commands shown).
 | C-LOCAL-FIRST | report before the server delivered; plus reports for another endpoint's alarm and an unknown occurrence | first recorded and the alarm advanced; others ignored | `1 recorded`, alarm `done`, nothing written for the foreign alarm | ws_session test `local_firing_before_server_delivery_advances_the_alarm` | PASS |
 | C-STORE | satellite replica store: grace while connected, ring-once, resync after a local firing, persistence, stale drop | no double ring; state survives restart | as expected | satellite unit tests in `replicas.rs` | PASS |
 
-## Usage metering, budgets, UI boot (2026-10-14)
+### Usage metering, budgets, UI boot (2026-10-14)
 
 | ID | Procedure | Expected | Observed | Evidence | Result |
 |---|---|---|---|---|---|
@@ -87,13 +176,13 @@ reproducible with the commands shown).
 | D-SOFT | spend crosses 80% of a household budget | one warning, then silence for the month | one warning (85%), second check empty | `usage_flow` test | PASS |
 | D-HARD | spend over the limit, cloud provider default | chat refused before any network call | SSE error "…budget…used up ($x of $y)…", no usage row added | `usage_flow` test | PASS |
 | D-LOCAL | same exhausted budget, local provider default | local chat still works | reply streamed, mock hit | `usage_flow` test | PASS |
-| D-MONTH | month window across DST and year end in America/Denver | local calendar month | March = 07:00Z..06:00Z next month; December rolls to January | `month_window_follows_local_time_across_dst` | PASS |
+| D-MONTH | month window across DST and year end in a US time zone with DST | local calendar month | March = 07:00Z..06:00Z next month; December rolls to January | `month_window_follows_local_time_across_dst` | PASS |
 | D-BADMONTH | `GET /api/usage?month=2026-13` | 400, no panic | 400 (found a panic first; fixed to use the fallible date constructor) | `usage_flow` test | PASS |
 | D-PROTO | unknown message type on the wire | parses as `Unknown`, ignored | parsed as `Unknown` | `unknown_message_types_parse_as_unknown` | PASS |
 | D-UI-BOOT | load the built UI in a real browser | app starts | **was broken**: the CSP header blocked SvelteKit's inline boot script (`script-src 'self'`), so the UI never rendered in a browser. Fixed by hashing the inline script into the CSP at startup; UI now loads, signs in, and the System page shows the usage panel with live data | live server + built-in browser; unit test `csp_allows_exactly_the_inline_boot_script` | PASS (after fix) |
 | D-LOGIN-MSG | open the UI while signed out | plain sign-in form | was "could not reach the server: unauthenticated"; now the form only | live browser | PASS (after fix) |
 
-## Not run / skipped — needs real external resources
+### Not run or skipped (needed real external resources)
 
 | ID | Item | Why |
 |---|---|---|
@@ -111,16 +200,16 @@ reproducible with the commands shown).
 | N-7 | Scheduler restart dedup while an alarm was `ringing` at shutdown | covered by the reconcile integration test (delivery row blocks refire; recurring reschedules); no manual crash drill → **SUPERSEDED by A-RECONCILE** |
 | N-8 | Rate-limiting lockout | covered by unit test → **SUPERSEDED by A-RATELIMIT** |
 
-## Known limitations
+### Known limitations (as of 2026-10-14, corrected)
 
-- No real provider or Home Assistant credentials were available — every
-  claim about those paths is code + unit/integration coverage only.
-- Secrets/database/backups are unencrypted at rest (see `docs/SECURITY.md`).
-- Satellite runs a persistent WS session (PTT + optional local wake word,
-  tray icon, alarm playback). Mic capture, TTS output, wake-word spotting and
-  the tray icon are compiled but not exercised on real hardware in this
-  report — the wake-word path additionally needs a user-supplied `.rpw`
-  model.
-- svelte-check reports 0 warnings (previous a11y findings fixed).
-- Windows Defender intermittently locked build artifacts during development;
-  transient `os error 32`/`5` retries were needed (environmental, not a code issue).
+- No real provider or Home Assistant credentials were available; every claim about those
+  paths is code plus unit and integration coverage only.
+- Only the secrets table is encrypted at rest; memory, chat history, the rest of the database
+  and backups are plaintext (see [docs/SECURITY.md](docs/SECURITY.md#the-older-rust-household-server)).
+- The old satellite runs a persistent WebSocket session (push-to-talk, optional local wake
+  word, tray icon, alarm playback). Mic capture, speech output, wake-word spotting and the tray
+  icon compiled but were not exercised on real hardware; the wake-word path also needs a
+  user-supplied `.rpw` model.
+- svelte-check reported 0 warnings.
+- Windows Defender intermittently locked build artifacts during development; transient
+  `os error 32` / `5` retries were needed (environmental, not a code issue).
