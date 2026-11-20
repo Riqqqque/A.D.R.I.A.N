@@ -71,6 +71,20 @@ enum Ctl {
 /// feeding the audio engine silence all day.
 const SPEAKER_IDLE: Duration = Duration::from_secs(3);
 
+/// What the default output is, for the server's call guard: "headphones"
+/// when the mic can't hear what plays (Windows says Headphones or Headset, or
+/// it's marked so in settings), "speakers" for anything else Windows names,
+/// and "unknown" when it can't tell (the server then plays it safe).
+pub fn output_kind(form: Option<i32>, marked: bool) -> &'static str {
+    // EndpointFormFactor: 3 Headphones, 5 Headset, 10 UnknownFormFactor.
+    match form {
+        _ if marked => "headphones",
+        Some(3 | 5) => "headphones",
+        Some(10) | None => "unknown",
+        Some(_) => "speakers",
+    }
+}
+
 pub enum Up {
     Start,
     Pcm(Vec<u8>),
@@ -116,6 +130,14 @@ pub struct Shared {
     wake: Mutex<Option<mpsc::Sender<Ctl>>>,
     /// The mic and speakers in use (names), for the settings page.
     pub devices: Mutex<(String, String)>,
+    /// The default speakers' form factor as Windows reports it
+    /// (PKEY_AudioEndpoint_FormFactor); None until read, or unreadable.
+    out_form: Mutex<Option<i32>>,
+    /// Output devices marked as headphones in settings (names): many USB DACs
+    /// and docks report Speakers whatever is plugged into them.
+    headphones: Mutex<Vec<String>>,
+    /// The speakers or the marks changed: the link says the output kind again.
+    pub output_changed: tokio::sync::Notify,
     /// Playing a game now (debounced), for the server's quiet mode. Sent after
     /// every welcome while it's on, and whenever it changes.
     pub activity: Mutex<adrian_pc_control::activity::Activity>,
@@ -153,6 +175,9 @@ impl Shared {
             mic_error: Mutex::new(None),
             wake: Mutex::new(None),
             devices: Mutex::new((String::new(), String::new())),
+            out_form: Mutex::new(None),
+            headphones: Mutex::new(Vec::new()),
+            output_changed: tokio::sync::Notify::new(),
             activity: Mutex::new(Default::default()),
             alarms: Default::default(),
             quiet: AtomicBool::new(false),
@@ -185,6 +210,36 @@ impl Shared {
 
     pub fn online(&self) -> bool {
         self.online.load(Ordering::Relaxed)
+    }
+
+    /// What plays her calls here, for the server: see `output_kind`.
+    pub fn output_kind(&self) -> &'static str {
+        let name = self.devices.lock().unwrap_or_else(|e| e.into_inner()).1.clone();
+        let form = *self.out_form.lock().unwrap_or_else(|e| e.into_inner());
+        output_kind(form, self.marked_headphones(&name))
+    }
+
+    /// `name` is an output marked as headphones in settings.
+    pub fn marked_headphones(&self, name: &str) -> bool {
+        !name.is_empty()
+            && self
+                .headphones
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|n| n == name)
+    }
+
+    /// The outputs marked as headphones (from settings).
+    pub fn set_headphones(&self, names: Vec<String>) {
+        *self.headphones.lock().unwrap_or_else(|e| e.into_inner()) = names;
+        self.output_changed.notify_one();
+    }
+
+    /// The default speakers (re)opened, with this form factor.
+    pub(crate) fn set_output_form(&self, form: Option<i32>) {
+        *self.out_form.lock().unwrap_or_else(|e| e.into_inner()) = form;
+        self.output_changed.notify_one();
     }
 
     /// The server welcomed this PC, or the link to it is gone. Push-to-talk goes
@@ -686,6 +741,7 @@ fn open_streams(
         input.name().unwrap_or_default(),
         output.name().unwrap_or_default(),
     );
+    shared.set_output_form(watch::default_output_form());
     let in_cfg = input.default_input_config().map_err(|e| e.to_string())?;
     let out_cfg = output.default_output_config().map_err(|e| e.to_string())?;
 
@@ -844,10 +900,11 @@ mod watch {
     use std::sync::Arc;
     use windows::Win32::Media::Audio::{
         DEVICE_STATE, EDataFlow, ERole, IMMDeviceEnumerator, IMMNotificationClient,
-        IMMNotificationClient_Impl, MMDeviceEnumerator, eConsole,
+        IMMNotificationClient_Impl, MMDeviceEnumerator, PKEY_AudioEndpoint_FormFactor, eConsole,
+        eRender,
     };
     use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STGM_READ,
     };
     use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
     use windows::core::{PCWSTR, implement};
@@ -885,6 +942,22 @@ mod watch {
         }
     }
 
+    /// The default speakers' form factor (EndpointFormFactor), the endpoint cpal
+    /// opens (console role). Read only; None when Windows can't say.
+    pub fn default_output_form() -> Option<i32> {
+        // SAFETY: plain COM calls. cpal already set COM up on this thread (its
+        // apartment stays as it is; a second CoInitializeEx just says so).
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let en: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+            let dev = en.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+            let store = dev.OpenPropertyStore(STGM_READ).ok()?;
+            let v = store.GetValue(&PKEY_AudioEndpoint_FormFactor).ok()?;
+            u32::try_from(&v).ok().and_then(|f| i32::try_from(f).ok())
+        }
+    }
+
     /// Registers on a thread of its own (COM's multithreaded apartment, apart
     /// from cpal's) and keeps the registration for the life of the app.
     pub fn start(shared: Arc<Shared>) {
@@ -919,6 +992,9 @@ mod watch {
 #[cfg(not(windows))]
 mod watch {
     pub fn start(_: std::sync::Arc<super::Shared>) {}
+    pub fn default_output_form() -> Option<i32> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -928,6 +1004,42 @@ mod tests {
     fn speech(secs: f32) -> Vec<u8> {
         let n = (RATE as f32 * secs) as usize;
         (0..n).flat_map(|i| (((i as f32 * 0.05).sin() * 8000.0) as i16).to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn headphones_are_what_windows_says_or_what_settings_mark() {
+        // EndpointFormFactor: 1 Speakers, 2 LineLevel, 3 Headphones, 5 Headset,
+        // 8 SPDIF, 9 HDMI, 10 Unknown.
+        assert_eq!(output_kind(Some(3), false), "headphones");
+        assert_eq!(output_kind(Some(5), false), "headphones");
+        for f in [0, 1, 2, 4, 6, 7, 8, 9] {
+            assert_eq!(output_kind(Some(f), false), "speakers", "{f}");
+        }
+        assert_eq!(output_kind(Some(10), false), "unknown");
+        assert_eq!(output_kind(None, false), "unknown");
+        // A USB DAC with earphones says Speakers: the mark wins.
+        assert_eq!(output_kind(Some(1), true), "headphones");
+        assert_eq!(output_kind(None, true), "headphones");
+
+        let shared = Shared::new(0.0);
+        *shared.devices.lock().unwrap() = (String::new(), "Speakers (USB DAC)".into());
+        shared.set_output_form(Some(1));
+        assert_eq!(shared.output_kind(), "speakers");
+        shared.set_headphones(vec!["Speakers (USB DAC)".into()]);
+        assert_eq!(shared.output_kind(), "headphones");
+        // Switched to other speakers: their own kind.
+        *shared.devices.lock().unwrap() = (String::new(), "Speakers (Monitor)".into());
+        assert_eq!(shared.output_kind(), "speakers");
+    }
+
+    /// Read-only: what Windows says the default speakers are here.
+    /// `cargo test -p adrian-desktop default_output_form_reads -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn default_output_form_reads() {
+        let f = watch::default_output_form();
+        println!("form factor {f:?}: {}", output_kind(f, false));
+        assert!(f.is_some());
     }
 
     #[test]

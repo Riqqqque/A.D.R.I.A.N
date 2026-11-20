@@ -190,7 +190,9 @@ fn save_settings(
     shortcuts: String,
     auto_update: Option<bool>,
     quiet_while_playing: Option<bool>,
+    headphones: Option<bool>,
 ) -> Result<(), String> {
+    let speakers = state.shared.devices.lock().unwrap_or_else(|e| e.into_inner()).1.clone();
     let form = config::Form {
         server_url,
         token,
@@ -199,9 +201,12 @@ fn save_settings(
         shortcuts,
         auto_update,
         quiet_while_playing,
+        headphones,
+        speakers,
     };
     let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
     let saved = config::commit(&mut s, form, config::save)?;
+    state.shared.set_headphones(s.headphones.clone());
     state
         .shared
         .threshold
@@ -287,6 +292,10 @@ fn her_state(state: tauri::State<'_, AppState>) -> Frame {
 struct Devices {
     mic: String,
     speakers: String,
+    /// What the server is told plays her calls here: headphones, speakers or unknown.
+    kind: &'static str,
+    /// The speakers in use are marked as headphones in settings.
+    marked: bool,
 }
 
 fn devices(shared: &Shared) -> Devices {
@@ -295,7 +304,12 @@ fn devices(shared: &Shared) -> Devices {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    Devices { mic, speakers }
+    Devices {
+        marked: shared.marked_headphones(&speakers),
+        mic,
+        speakers,
+        kind: shared.output_kind(),
+    }
 }
 
 /// The mic and speakers in use; the page follows "devices" events after this.
@@ -498,6 +512,7 @@ fn main() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let settings = config::load();
     let shared = Shared::new(settings.mic_threshold);
+    shared.set_headphones(settings.headphones.clone());
     let pc = Arc::new(Mutex::new(Arc::new(Pc::new(settings.pc.clone()))));
     let (link_tx, link_rx) = watch::channel(link_for(&settings));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();

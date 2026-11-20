@@ -87,6 +87,9 @@ pub enum Cmd {
     Text(String),
     Stop,
     Ptt,
+    /// The talk key went back up (apps from 0.17.2): the server takes what was
+    /// said between down and up as theirs, and nothing after.
+    PttUp,
     /// Playing started or stopped: send `Shared::activity` as it is now.
     Activity,
     /// Stop or Snooze on an alarm the server is ringing.
@@ -136,8 +139,44 @@ pub fn talk_key(shared: &Shared, cmds: &mpsc::UnboundedSender<Cmd>, down: bool) 
     shared.ptt.store(down, Ordering::Relaxed);
     if down {
         let _ = cmds.send(Cmd::Ptt);
+    } else if shared.online() {
+        // Offline there's no press to end: the server forgot it with the link.
+        let _ = cmds.send(Cmd::PttUp);
     }
     true
+}
+
+/// Push-to-talk going down. `hold` says a key-up will follow, so the server
+/// keeps it until then instead of giving the next thing heard to its owner.
+fn ptt_down() -> Value {
+    json!({ "type": "ptt", "down": true, "hold": true })
+}
+
+/// What plays her calls here (`Shared::output_kind`). Servers from 0.17.2 keep
+/// hands-free on with headphones while the owner is in a voice call; older
+/// ones ignore it.
+fn output_message(kind: &str) -> Value {
+    json!({ "type": "output", "kind": kind })
+}
+
+/// The soft two notes for a server `notice`: something said here was heard and
+/// left alone on purpose (her call plays through these speakers, so only
+/// push-to-talk counts). The window may be closed, and a game in front.
+pub fn notice_chime() -> Vec<u8> {
+    const RATE: f32 = 48_000.0;
+    let note = |freq: f32, secs: f32| {
+        let n = (RATE * secs) as usize;
+        (0..n).map(move |i| {
+            let t = i as f32 / RATE;
+            // A soft sine with a gentle rise and a long fall.
+            let env = (t / 0.01).min(1.0) * (1.0 - t / secs).max(0.0).powi(2);
+            (std::f32::consts::TAU * freq * t).sin() * 0.12 * env
+        })
+    };
+    note(880.0, 0.12)
+        .chain(note(660.0, 0.18))
+        .flat_map(|v| ((v.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+        .collect()
 }
 
 /// The talk hotkey went down or up. Nothing waits in a queue for it, but if it's
@@ -562,6 +601,8 @@ async fn session(
     // pings going unanswered.
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut unanswered = 0;
+    // The output kind last told to the server on this connection.
+    let mut sent_kind: Option<&'static str> = None;
     loop {
         trace.waiting = Some(Instant::now());
         tokio::select! {
@@ -589,8 +630,12 @@ async fn session(
                                 let _ = events.send(Event::Status { connected: true, text: format!("Connected as {}", s("name")), owner: (!owner.is_empty()).then_some(owner) });
                                 // The hotkey was down all along.
                                 if shared.ptt.load(Ordering::Relaxed) {
-                                    put(&mut tx, Message::Text(json!({ "type": "ptt", "down": true }).to_string().into())).await?;
+                                    put(&mut tx, Message::Text(ptt_down().to_string().into())).await?;
                                 }
+                                // What plays her calls here: the server starts every connection as unknown.
+                                let kind = shared.output_kind();
+                                put(&mut tx, Message::Text(output_message(kind).to_string().into())).await?;
+                                sent_kind = Some(kind);
                                 // In a game all along: the server starts every connection as not playing.
                                 let playing = shared.activity.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 if playing.gaming {
@@ -610,6 +655,7 @@ async fn session(
                                 let _ = events.send(Event::Transcript { who: s("who"), text: s("text"), last });
                             }
                             "audio_stop" => shared.stop_reply(),
+                            "notice" if trace.welcomed => shared.push_reply(&notice_chime()),
                             "alarms" if trace.welcomed => {
                                 shared.alarms.server_said(&m);
                                 let _ = events.send(Event::Alarms);
@@ -662,7 +708,8 @@ async fn session(
                 let m = match c {
                     Cmd::Text(t) => json!({ "type": "text", "text": t }),
                     Cmd::Stop => { shared.stop_reply(); json!({ "type": "stop" }) }
-                    Cmd::Ptt => json!({ "type": "ptt", "down": true }),
+                    Cmd::Ptt => ptt_down(),
+                    Cmd::PttUp => json!({ "type": "ptt", "down": false }),
                     Cmd::Alarm(action) => json!({ "type": "alarm_action", "action": action }),
                     Cmd::Activity => shared.activity.lock().unwrap_or_else(|e| e.into_inner()).message(),
                     Cmd::AlarmDone => {
@@ -675,6 +722,14 @@ async fn session(
             Some(r) = done_rx.recv() => {
                 trace.woke();
                 put(&mut tx, Message::Text(r.into())).await?;
+            }
+            _ = shared.output_changed.notified() => {
+                trace.woke();
+                let kind = shared.output_kind();
+                if trace.welcomed && sent_kind != Some(kind) {
+                    put(&mut tx, Message::Text(output_message(kind).to_string().into())).await?;
+                    sent_kind = Some(kind);
+                }
             }
             _ = ping.tick() => {
                 trace.woke();
@@ -891,12 +946,13 @@ mod tests {
         heard_until(ws, last).await
     }
 
-    /// Every order the server gets until `last`, leaving out pings, then close.
+    /// Every order the server gets until `last`, leaving out pings and the
+    /// output kind said after each welcome, then close.
     async fn heard_until(mut ws: WebSocketStream<TcpStream>, last: &str) -> Vec<String> {
         let mut heard = Vec::new();
         while let Some(Ok(m)) = ws.next().await {
             let Message::Text(t) = m else { continue };
-            if t.contains("\"ping\"") {
+            if t.contains("\"ping\"") || t.contains("\"type\":\"output\"") {
                 continue;
             }
             heard.push(t.to_string());
@@ -1148,6 +1204,139 @@ mod tests {
         assert_eq!(heard.len(), 1, "{heard:?}");
         assert!(heard[0].contains("\"ptt\""));
         assert!(shared.ptt.load(Ordering::Relaxed), "the mic has to follow");
+    }
+
+    #[test]
+    fn the_talk_key_going_up_is_said_only_while_she_is_there() {
+        let shared = Shared::new(0.0);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.set_online(true);
+        assert!(talk_key(&shared, &tx, true));
+        assert!(talk_key(&shared, &tx, false));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Ptt)));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::PttUp)));
+        // Let go offline: the server forgot the press with the link.
+        assert!(talk_key(&shared, &tx, true));
+        shared.set_online(false);
+        assert!(talk_key(&shared, &tx, false));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Ptt)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn push_to_talk_says_it_holds_and_when_the_key_goes_up() {
+        let (_up_tx, mut up) = mpsc::channel(4);
+        let (cmds_tx, mut cmds) = mpsc::unbounded_channel();
+        let (events, mut seen) = mpsc::unbounded_channel();
+        let shared = Shared::new(0.0);
+        let (listener, url) = listen().await;
+        let press = async {
+            until_status(&mut seen, true).await;
+            assert!(talk_key(&shared, &cmds_tx, true));
+            assert!(talk_key(&shared, &cmds_tx, false));
+            std::future::pending::<()>().await
+        };
+        let client = async {
+            tokio::select! {
+                _ = attempt_on(&shared, &url, &mut up, &mut cmds, &events) => {}
+                _ = press => {}
+            }
+        };
+        let (heard, _) = tokio::join!(
+            orders(&listener, || {}, &[WELCOME], "\"down\":false"),
+            client
+        );
+        let heard: Vec<Value> = heard.iter().map(|t| serde_json::from_str(t).unwrap()).collect();
+        assert_eq!(
+            heard,
+            [
+                json!({ "type": "ptt", "down": true, "hold": true }),
+                json!({ "type": "ptt", "down": false })
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_output_kind_is_said_after_the_welcome_and_again_when_it_changes() {
+        let (_up_tx, mut up) = mpsc::channel(4);
+        let (_cmds_tx, mut cmds) = mpsc::unbounded_channel();
+        let (events, _seen) = mpsc::unbounded_channel();
+        let shared = Shared::new(0.0);
+        let name = "Speakers (USB DAC)";
+        *shared.devices.lock().unwrap() = (String::new(), name.into());
+        shared.set_output_form(Some(1));
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
+        let (listener, url) = listen().await;
+        let server = async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.next().await;
+            ws.send(Message::Text(WELCOME.into())).await.unwrap();
+            let mut kinds = Vec::new();
+            let mut first = Some(first_tx);
+            while let Some(Ok(m)) = ws.next().await {
+                let Message::Text(t) = m else { continue };
+                let m: Value = serde_json::from_str(&t).unwrap();
+                if m["type"] != "output" {
+                    continue;
+                }
+                kinds.push(m["kind"].as_str().unwrap().to_string());
+                match first.take() {
+                    Some(tx) => tx.send(()).unwrap(),
+                    None => break,
+                }
+            }
+            let _ = ws.close(None).await;
+            while let Some(Ok(_)) = ws.next().await {}
+            kinds
+        };
+        let change = async {
+            first_rx.await.unwrap();
+            // Marked as headphones in settings: said at once, without a reconnect.
+            shared.set_headphones(vec![name.into()]);
+            std::future::pending::<()>().await
+        };
+        let client = async {
+            tokio::select! {
+                _ = attempt_on(&shared, &url, &mut up, &mut cmds, &events) => {}
+                _ = change => {}
+            }
+        };
+        let (kinds, _) = tokio::join!(server, client);
+        assert_eq!(kinds, ["speakers", "headphones"]);
+    }
+
+    #[tokio::test]
+    async fn a_notice_plays_a_soft_chime_here_once_welcomed() {
+        let (_up_tx, mut up) = mpsc::channel(4);
+        let (_cmds_tx, mut cmds) = mpsc::unbounded_channel();
+        let (events, _seen) = mpsc::unbounded_channel();
+        const NOTICE: &str = r#"{"type":"notice","kind":"ptt_only"}"#;
+        // Before the welcome: not from a server that took this PC.
+        let shared = Shared::new(0.0);
+        let (listener, url) = listen().await;
+        let _ = tokio::join!(
+            serve(&listener, &[NOTICE], false),
+            attempt_on(&shared, &url, &mut up, &mut cmds, &events)
+        );
+        assert!(!shared.playing());
+        let (listener, url) = listen().await;
+        let _ = tokio::join!(
+            serve(&listener, &[WELCOME, NOTICE], false),
+            attempt_on(&shared, &url, &mut up, &mut cmds, &events)
+        );
+        assert!(shared.playing(), "the chime is queued for the speakers");
+    }
+
+    #[test]
+    fn the_notice_chime_is_short_and_quiet() {
+        let pcm = notice_chime();
+        let samples: Vec<i16> = pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        let secs = samples.len() as f32 / 48_000.0;
+        assert!((0.2..0.5).contains(&secs), "{secs}");
+        let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap();
+        assert!(peak > 1000 && peak < 32767 / 6, "{peak}");
+        assert!(samples.last().unwrap().unsigned_abs() < 50, "it fades out");
     }
 
     #[tokio::test]
