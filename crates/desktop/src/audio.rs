@@ -9,9 +9,9 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 
@@ -40,6 +40,9 @@ const BARGE_OVER_ECHO: f32 = 3.0;
 const DUCK: f32 = 0.3;
 /// Most audio held for playback before old audio is dropped (seconds).
 const MAX_BUFFER_SECS: usize = 8;
+/// How long the speakers wait for a reply being queued (it takes microseconds)
+/// before they play silence for this buffer instead.
+const FILL_WAIT: Duration = Duration::from_millis(2);
 
 /// To the device thread: a stream failed, she has something to say, or
 /// Windows' default speakers or mic changed.
@@ -61,6 +64,9 @@ pub enum Up {
 
 pub struct Shared {
     out: Mutex<VecDeque<f32>>,
+    /// How much is in `out`, kept beside it so asking never takes its lock
+    /// (the speakers' callback shouldn't have to wait for the gate thread).
+    queued: AtomicUsize,
     out_rate: AtomicU32,
     down: Mutex<Resampler>,
     /// ms since `epoch` when her audio was last audible.
@@ -104,6 +110,7 @@ impl Shared {
     pub fn new(threshold: f32) -> Arc<Self> {
         Arc::new(Shared {
             out: Mutex::new(VecDeque::new()),
+            queued: AtomicUsize::new(0),
             out_rate: AtomicU32::new(RATE),
             down: Mutex::new(Resampler::new(RATE, RATE)),
             last_out_ms: AtomicU64::new(0),
@@ -195,7 +202,7 @@ impl Shared {
     pub fn playing(&self) -> bool {
         let last = self.last_out_ms.load(Ordering::Relaxed);
         last != 0 && self.now_ms().saturating_sub(last) < ECHO_TAIL_MS
-            || !self.out.lock().map(|q| q.is_empty()).unwrap_or(true)
+            || self.queued.load(Ordering::Relaxed) > 0
     }
 
     /// Reply audio from the server (48 kHz mono s16le).
@@ -211,19 +218,63 @@ impl Shared {
         if let Ok(mut q) = self.out.lock() {
             q.extend(converted);
             let cap = self.out_rate.load(Ordering::Relaxed) as usize * MAX_BUFFER_SECS;
-            while q.len() > cap {
-                q.pop_front();
-            }
+            let extra = q.len().saturating_sub(cap);
+            q.drain(..extra);
+            self.queued.store(q.len(), Ordering::Relaxed);
         }
         if let Some(tx) = self.wake.lock().ok().and_then(|w| w.clone()) {
             let _ = tx.send(Ctl::Wake);
         }
     }
 
+    /// The speakers (re)opened at `rate` (a new default device, or after an
+    /// error). What she was still saying carries on there, converted if the
+    /// new speakers run at another rate.
+    fn retarget(&self, rate: u32) {
+        let mut down = self.down.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        let old = self.out_rate.swap(rate, Ordering::Relaxed);
+        if old != rate && !q.is_empty() {
+            let mut converted = Vec::with_capacity(q.len() * rate as usize / old.max(1) as usize + 1);
+            Resampler::new(old, rate).push(q.make_contiguous(), &mut converted);
+            *q = converted.into();
+        }
+        self.queued.store(q.len(), Ordering::Relaxed);
+        *down = Resampler::new(RATE, rate);
+    }
+
+    /// The speakers' next `frames` samples: her queue, then silence. Runs on
+    /// the audio callback: a reply being queued holds the lock only for a
+    /// moment, so wait that out (briefly) rather than play a gap.
+    fn fill(&self, played: &mut Vec<f32>, frames: usize) {
+        played.clear();
+        let mut deadline = None;
+        let q = loop {
+            match self.out.try_lock() {
+                Ok(q) => break Some(q),
+                Err(TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    let until = *deadline.get_or_insert_with(|| Instant::now() + FILL_WAIT);
+                    if Instant::now() >= until {
+                        break None;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        };
+        if let Some(mut q) = q {
+            let n = frames.min(q.len());
+            played.extend(q.drain(..n));
+            self.queued.store(q.len(), Ordering::Relaxed);
+        }
+        played.resize(frames, 0.0);
+    }
+
     /// She was interrupted: drop what's still queued.
     pub fn stop_reply(&self) {
         if let Ok(mut q) = self.out.lock() {
             q.clear();
+            self.queued.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -487,7 +538,7 @@ pub fn start(shared: Arc<Shared>, up: Sender<Up>) {
                         let mut on = false;
                         let mut last_sound = Instant::now();
                         // Something queued before the streams existed (or before a switch).
-                        let pending = !shared.out.lock().map(|q| q.is_empty()).unwrap_or(true);
+                        let pending = shared.queued.load(Ordering::Relaxed) > 0;
                         if pending && speakers.play().is_ok() {
                             on = true;
                         }
@@ -572,10 +623,7 @@ fn open_streams(
         f => return Err(format!("Unsupported microphone format {f}.")),
     }?;
 
-    let out_rate = out_cfg.sample_rate().0;
-    shared.out_rate.store(out_rate, Ordering::Relaxed);
-    *shared.down.lock().unwrap_or_else(|e| e.into_inner()) = Resampler::new(RATE, out_rate);
-    shared.stop_reply();
+    shared.retarget(out_cfg.sample_rate().0);
     let out_ch = out_cfg.channels() as usize;
     let e2 = err;
     let on_err2 = move |e: cpal::StreamError| {
@@ -670,19 +718,13 @@ fn build_output<T>(
 where
     T: SizedSample + FromSample<f32>,
 {
+    let mut played = Vec::new();
     dev.build_output_stream(
         cfg,
         move |data: &mut [T], _| {
             audio_thread();
             let frames = data.len() / channels.max(1);
-            let mut played = Vec::with_capacity(frames);
-            if let Ok(mut q) = shared.out.try_lock() {
-                for _ in 0..frames {
-                    played.push(q.pop_front().unwrap_or(0.0));
-                }
-            } else {
-                played.resize(frames, 0.0);
-            }
+            shared.fill(&mut played, frames);
             let gain = if shared.duck.load(Ordering::Relaxed) {
                 DUCK
             } else {
@@ -797,6 +839,70 @@ mod watch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn speech(secs: f32) -> Vec<u8> {
+        let n = (RATE as f32 * secs) as usize;
+        (0..n).flat_map(|i| (((i as f32 * 0.05).sin() * 8000.0) as i16).to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn playing_never_waits_for_the_speakers_queue() {
+        // The gate asks every 20 ms; it must not queue up behind the speakers.
+        let shared = Shared::new(0.0);
+        shared.push_reply(&speech(0.2));
+        let held = shared.out.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let s2 = shared.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(s2.playing());
+        });
+        let answer = rx.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        assert_eq!(answer, Ok(true), "playing() waited on the queue's lock");
+    }
+
+    #[test]
+    fn the_speakers_wait_out_a_short_push_instead_of_playing_silence() {
+        let shared = Shared::new(0.0);
+        shared.push_reply(&speech(0.2));
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let s2 = shared.clone();
+        let holder = std::thread::spawn(move || {
+            let q = s2.out.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            // a push_reply's worth of time, spent busy (sleeps are coarse on Windows)
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_micros(200) {
+                std::hint::spin_loop();
+            }
+            drop(q);
+        });
+        locked_rx.recv().unwrap();
+        let mut played = Vec::new();
+        shared.fill(&mut played, 480);
+        holder.join().unwrap();
+        assert_eq!(played.len(), 480);
+        assert!(rms(&played) > 0.05, "played silence while her audio was queued");
+    }
+
+    #[test]
+    fn a_device_switch_keeps_what_she_was_saying() {
+        let shared = Shared::new(0.0);
+        shared.push_reply(&speech(0.5));
+        shared.retarget(RATE);
+        assert_eq!(shared.out.lock().unwrap().len(), 24_000, "same rate: all of it, as it was");
+        assert!(shared.playing());
+        // New speakers at 44.1 kHz: the same half second, at their rate.
+        shared.retarget(44_100);
+        let n = shared.out.lock().unwrap().len() as i64;
+        assert!((n - 22_050).abs() < 10, "{n}");
+        // and what comes next is converted the same way
+        shared.push_reply(&speech(0.5));
+        let n = shared.out.lock().unwrap().len() as i64;
+        assert!((n - 44_100).abs() < 20, "{n}");
+        shared.stop_reply();
+        assert!(!shared.playing());
+    }
 
     #[test]
     fn resamples_to_the_right_length() {
