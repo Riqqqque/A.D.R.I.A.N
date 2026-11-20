@@ -91,6 +91,25 @@ pub fn offer(shared: &Shared, cmds: &mpsc::UnboundedSender<Cmd>, cmd: Cmd) -> bo
     shared.online() && cmds.send(cmd).is_ok()
 }
 
+/// Stop or Snooze on an alarm, from the window or the tray. False when an order
+/// meant for the server can't reach it.
+pub fn answer_alarm(
+    shared: &Shared,
+    cmds: &mpsc::UnboundedSender<Cmd>,
+    action: &'static str,
+    now: f64,
+) -> bool {
+    match shared.alarms.answer(action, now) {
+        // Rung here by itself: quiet now; the server hears after the next welcome.
+        crate::alarm::Answer::Here => {
+            shared.stop_reply();
+            true
+        }
+        crate::alarm::Answer::Server => offer(shared, cmds, Cmd::Alarm(action)),
+        crate::alarm::Answer::Nothing => true,
+    }
+}
+
 /// The talk button went down or up. False for a press nobody can hear.
 pub fn talk_key(shared: &Shared, cmds: &mpsc::UnboundedSender<Cmd>, down: bool) -> bool {
     if down && !shared.online() {
@@ -1122,5 +1141,209 @@ mod tests {
         };
         let (ended, _) = ended.expect("it never noticed");
         assert!(matches!(ended, Err(Fail::Other(r)) if r == "sending timed out"));
+    }
+
+    fn epoch_now() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64
+    }
+
+    /// An alarm ringing here by itself: the server listed it and never rang it.
+    fn ringing_here(shared: &Shared) -> f64 {
+        let now = epoch_now();
+        let due = now - 30_000.0;
+        shared.alarms.server_said(&json!({
+            "type": "alarms",
+            "list": [{ "id": "a1", "kind": "alarm", "label": "", "at": due, "base": due }],
+            "ringing": [],
+            "now": now,
+        }));
+        assert!(shared.alarms.tick(now), "it should ring here");
+        now
+    }
+
+    #[tokio::test]
+    async fn an_alarm_answered_here_reaches_the_server_on_the_same_link() {
+        let (_up_tx, mut up) = mpsc::channel(4);
+        let (cmds_tx, mut cmds) = mpsc::unbounded_channel();
+        let (events, mut seen) = mpsc::unbounded_channel();
+        let shared = Shared::new(0.0);
+        let now = ringing_here(&shared);
+        let (listener, url) = listen().await;
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.next().await;
+            ws.send(Message::Text(WELCOME.into())).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), heard_until(ws, "alarm_done")).await
+        };
+        let answer = async {
+            until_status(&mut seen, true).await;
+            assert!(answer_alarm(&shared, &cmds_tx, "stop", now));
+            std::future::pending::<()>().await
+        };
+        let client = async {
+            tokio::select! {
+                _ = attempt_on(&shared, &url, &mut up, &mut cmds, &events) => {}
+                _ = answer => {}
+            }
+        };
+        let (heard, _) = tokio::join!(server, client);
+        let heard = heard.expect("the server never heard how it was answered");
+        let done: Vec<Value> = heard
+            .iter()
+            .filter_map(|t| serde_json::from_str::<Value>(t).ok())
+            .filter(|m| m["type"] == "alarm_done")
+            .collect();
+        assert_eq!(done.len(), 1, "{heard:?}");
+        assert_eq!(done[0]["id"], "a1");
+        assert_eq!(done[0]["action"], "stop");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "on the same link");
+        assert!(shared.alarms.pending_done().is_empty(), "and it's forgotten");
+        assert!(!shared.alarms.ringing());
+    }
+
+    #[tokio::test]
+    async fn an_alarm_answered_offline_goes_out_once_at_the_welcome() {
+        let (_up_tx, mut up) = mpsc::channel(4);
+        let (cmds_tx, mut cmds) = mpsc::unbounded_channel();
+        let (events, mut seen) = mpsc::unbounded_channel();
+        let shared = Shared::new(0.0);
+        let now = ringing_here(&shared);
+        assert!(answer_alarm(&shared, &cmds_tx, "snooze", now));
+        assert_eq!(shared.alarms.pending_done().len(), 1);
+        let (listener, url) = listen().await;
+        let say_now = async {
+            until_status(&mut seen, true).await;
+            cmds_tx.send(Cmd::Text("new order".into())).unwrap();
+            std::future::pending::<()>().await
+        };
+        let client = async {
+            tokio::select! {
+                _ = attempt_on(&shared, &url, &mut up, &mut cmds, &events) => {}
+                _ = say_now => {}
+            }
+        };
+        let (heard, _) = tokio::join!(orders(&listener, || {}, &[WELCOME], "new order"), client);
+        let done = heard.iter().filter(|t| t.contains("\"alarm_done\"")).count();
+        assert_eq!(done, 1, "{heard:?}");
+        assert!(shared.alarms.pending_done().is_empty());
+    }
+
+    /// What one outage cost: from the server listening again to its welcome
+    /// going out, and the tries made while it was gone.
+    struct Outage {
+        back: Duration,
+        tries: usize,
+    }
+
+    /// The real reconnect loop against a server that welcomes it, holds the
+    /// link past `HELD`, closes it the way the real one shuts down (1000 "bye")
+    /// and is then gone for `secs`: not listening at all (`hole` false), or
+    /// taking connections and never answering them, like a dead path (`hole`).
+    async fn outage(secs: f64, hole: bool) -> Outage {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_link_tx, link) = watch::channel(Some(Link {
+            url: format!("ws://{addr}"),
+            token: "token".into(),
+            device: "test".into(),
+        }));
+        let (_up_tx, up) = mpsc::channel(4);
+        let (_cmds_tx, cmds) = mpsc::unbounded_channel();
+        let (events, mut seen) = mpsc::unbounded_channel();
+        let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = tries.clone();
+        let count = tokio::spawn(async move {
+            while let Some(e) = seen.recv().await {
+                if matches!(&e, Event::Status { text, .. } if text == "Connecting…") {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let client = tokio::spawn(run(link, up, cmds, Shared::new(0.0), pc(), events));
+        // The link that worked.
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        ws.next().await;
+        ws.send(Message::Text(WELCOME.into())).await.unwrap();
+        let end = tokio::time::Instant::now() + HELD * 2;
+        while let Ok(Some(Ok(m))) = tokio::time::timeout_at(end, ws.next()).await {
+            if matches!(&m, Message::Text(t) if t.contains("\"ping\"")) {
+                ws.send(Message::Text(r#"{"type":"pong"}"#.into())).await.unwrap();
+            }
+        }
+        let bye = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "bye".into(),
+        };
+        let _ = ws.close(Some(bye)).await;
+        while let Some(Ok(_)) = ws.next().await {}
+        let before = tries.load(Ordering::SeqCst);
+        let gone = Duration::from_secs_f64(secs);
+        // Sockets the dead path took, kept open so tries on them time out.
+        let mut held = Vec::new();
+        let listener = if hole {
+            let until = tokio::time::Instant::now() + gone;
+            while let Ok(Ok((tcp, _))) = tokio::time::timeout_at(until, listener.accept()).await {
+                held.push(tcp);
+            }
+            listener
+        } else {
+            drop(listener);
+            tokio::time::sleep(gone).await;
+            TcpListener::bind(addr).await.expect("the port came back")
+        };
+        let back = Instant::now();
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        ws.next().await;
+        ws.send(Message::Text(WELCOME.into())).await.unwrap();
+        let back = back.elapsed();
+        let tries = tries.load(Ordering::SeqCst) - before - 1;
+        client.abort();
+        count.abort();
+        drop(held);
+        Outage { back, tries }
+    }
+
+    /// Not a check: prints how long the link takes to come back after outages
+    /// of a few lengths, and how often it tried meanwhile.
+    /// `cargo test -p adrian-desktop reconnect_after_outages -- --ignored --nocapture --test-threads 1`
+    /// (`ADRIAN_OUTAGES=3,10` for other lengths, `ADRIAN_OUTAGE_RUNS` for repeats).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn reconnect_after_outages() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let t = Instant::now();
+        let r = tokio_tungstenite::connect_async(format!("ws://{addr}")).await;
+        println!("one refused connect: {:?} (failed: {})", t.elapsed(), r.is_err());
+        let lengths: Vec<f64> = std::env::var("ADRIAN_OUTAGES")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![3.0, 10.0, 21.0, 60.0]);
+        let runs: usize = std::env::var("ADRIAN_OUTAGE_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        for hole in [false, true] {
+            for &secs in &lengths {
+                for _ in 0..runs {
+                    let o = outage(secs, hole).await;
+                    println!(
+                        "outage {} {secs:>4} s: back {:>6} ms after, {} tries meanwhile",
+                        if hole { "dead path" } else { "refused  " },
+                        o.back.as_millis(),
+                        o.tries
+                    );
+                }
+            }
+        }
     }
 }

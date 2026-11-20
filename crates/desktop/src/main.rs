@@ -259,15 +259,8 @@ fn epoch_ms() -> f64 {
 /// Stop or Snooze, from the window or the tray.
 fn answer_alarm(app: &AppHandle, action: &'static str) {
     let state = app.state::<AppState>();
-    match state.shared.alarms.answer(action, epoch_ms()) {
-        // Rung here by itself: quiet now; the server hears after the next welcome.
-        alarm::Answer::Here => state.shared.stop_reply(),
-        alarm::Answer::Server => {
-            if !link::offer(&state.shared, &state.cmds, Cmd::Alarm(action)) {
-                let _ = app.emit("not_sent", link::NOT_SENT);
-            }
-        }
-        alarm::Answer::Nothing => {}
+    if !link::answer_alarm(&state.shared, &state.cmds, action, epoch_ms()) {
+        let _ = app.emit("not_sent", link::NOT_SENT);
     }
     let _ = app.emit("alarm", state.shared.alarms.view());
 }
