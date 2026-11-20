@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<!--
+  The orb under a simulated monitor, for orb-bench.mjs (headless Edge).
+  ?orb=<url of orb.js>  &hz=120  &secs=20         time it in real time
+  ?orb=<a>&ref=<b>&compare=1 [&refhz=60]         draw both on the same fake clock, compare pixels
+  requestAnimationFrame is replaced by a fake vsync at `hz`, so a 120 Hz
+  monitor can be timed on any machine. Her state follows a fixed script
+  (idle, listening, thinking, speaking, idle) with levels arriving at 20 Hz,
+  like the app's frame events.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; background: #06080b; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="a"></canvas>
+<canvas id="b" style="visibility: hidden"></canvas>
+<script>
+'use strict';
+const q = new URLSearchParams(location.search);
+const HZ = Number(q.get('hz')) || 120;
+const SECS = Number(q.get('secs')) || 20;
+const COMPARE = q.get('compare') === '1';
+const OPTS = { accent: '#9fd4ff', scale: 0.24, centerY: 0.4 };
+
+// --- a fake vsync -------------------------------------------------------------
+let nextId = 1;
+// Each callback belongs to the orb that asked for it, so two orbs can see different refresh rates.
+const pending = new Map();
+let current = 'a';
+window.requestAnimationFrame = (cb) => { const id = nextId++; pending.set(id, { cb, who: current }); return id; };
+window.cancelAnimationFrame = (id) => { pending.delete(id); };
+function vsync(ts, who = 'a') {
+  const due = [...pending].filter(([, p]) => p.who === who);
+  for (const [id] of due) pending.delete(id);
+  current = who;
+  for (const [, p] of due) p.cb(ts);
+  current = 'a';
+}
+
+// Count the ticks on which a canvas was really drawn.
+const touched = new Set();
+const orig = HTMLCanvasElement.prototype.getContext;
+HTMLCanvasElement.prototype.getContext = function (kind, o) {
+  const ctx = orig.call(this, kind, o);
+  if (this.id && !ctx.__counted) {
+    ctx.__counted = true;
+    const id = this.id;
+    const fr = ctx.fillRect.bind(ctx);
+    ctx.fillRect = (...a) => { touched.add(id); return fr(...a); };
+  }
+  return ctx;
+};
+
+function load(src) {
+  return new Promise((ok, bad) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = () => { const f = window.createOrb; delete window.createOrb; ok(f); };
+    s.onerror = () => bad(new Error('could not load ' + src));
+    document.head.appendChild(s);
+  });
+}
+
+// --- her state over time --------------------------------------------------------
+function script(orb, t) {
+  const phase = Math.floor(t / 4) % 5;
+  const mode = ['idle', 'listening', 'thinking', 'speaking', 'idle'][phase];
+  orb.setMode(mode);
+  const lvl = mode === 'speaking' ? 0.5 + 0.4 * Math.sin(t * 7) * Math.sin(t * 2.3)
+    : mode === 'listening' ? 0.3 + 0.3 * Math.sin(t * 5) : 0;
+  orb.setLevel(Math.max(0, lvl));
+}
+const phaseOf = (t) => ['idle', 'listening', 'thinking', 'speaking', 'idle2'][Math.floor(t / 4) % 5];
+
+window.__bench = { done: false };
+
+async function timed() {
+  const make = await load(q.get('orb'));
+  const orb = make(document.getElementById('a'), OPTS);
+  const period = 1000 / HZ;
+  const t0 = performance.now();
+  const per = {};
+  let ticks = 0, drawn = 0, jsMs = 0, lastLevel = -1, slot = 0;
+  window.__bench.started = true;
+  await new Promise((done) => {
+    function tick() {
+      const now = performance.now();
+      const t = (now - t0) / 1000;
+      if (t >= SECS) return done();
+      // levels at 20 Hz, like the app's frame events
+      const lt = Math.floor(t * 20);
+      if (lt !== lastLevel) { lastLevel = lt; script(orb, t); }
+      touched.clear();
+      const s = performance.now();
+      vsync(t0 + slot * period); // stamped with the refresh it belongs to, like real rAF
+      const ms = performance.now() - s;
+      const p = (per[phaseOf(t)] ??= { ticks: 0, drawn: 0, jsMs: 0, from: t, to: t });
+      p.to = t;
+      ticks++; p.ticks++;
+      jsMs += ms; p.jsMs += ms;
+      if (touched.has('a')) { drawn++; p.drawn++; }
+      // the next refresh after this one (a late tick skips refreshes, as on a real screen)
+      slot = Math.max(slot + 1, Math.ceil((performance.now() - t0) / period));
+      const n = slot;
+      setTimeout(tick, Math.max(0, t0 + n * period - performance.now()));
+    }
+    tick();
+  });
+  orb.destroy();
+  const c = document.getElementById('a');
+  Object.assign(window.__bench, {
+    done: true, hz: HZ, secs: SECS, canvas: [c.width, c.height], dpr: devicePixelRatio,
+    ticks, drawn, fps: drawn / SECS, tickHz: ticks / SECS,
+    jsMsPerDrawn: jsMs / Math.max(1, drawn), jsMsPerSec: jsMs / SECS,
+    phases: Object.fromEntries(Object.entries(per).map(([k, v]) => [k, {
+      fps: v.drawn / Math.max(1e-3, v.to - v.from), jsMsPerDrawn: v.jsMs / Math.max(1, v.drawn),
+    }])),
+  });
+}
+
+// Both orbs on one synthetic 120 Hz clock; at each checkpoint (one every 0.5 s,
+// on a 60 Hz boundary) compare what's on screen.
+async function compare() {
+  const makeA = await load(q.get('orb'));
+  const makeB = await load(q.get('ref'));
+  const ca = document.getElementById('a'), cb = document.getElementById('b');
+  cb.style.visibility = 'visible';
+  const a = makeA(ca, OPTS);
+  current = 'b';
+  const b = makeB(cb, OPTS);
+  current = 'a';
+  // ?refhz=60: the reference sees a slower screen (every nth tick of the same clock).
+  const refEvery = Math.max(1, Math.round(HZ / (Number(q.get('refhz')) || HZ)));
+  const period = 1000 / HZ;
+  const shots = [];
+  let lastLevel = -1;
+  const total = Math.round(SECS * HZ);
+  const every = Math.round(HZ / 2);
+  for (let i = 0; i <= total; i++) {
+    const ts = 1000 + i * period;
+    const t = i / HZ;
+    const lt = Math.floor(t * 20);
+    if (lt !== lastLevel) { lastLevel = lt; script(a, t); script(b, t); }
+    vsync(ts, 'a');
+    if (i % refEvery === 0) vsync(ts, 'b');
+    if (i > 0 && i % every === 0) {
+      const da = ca.getContext('2d').getImageData(0, 0, ca.width, ca.height).data;
+      const db = cb.getContext('2d').getImageData(0, 0, cb.width, cb.height).data;
+      let sum = 0, max = 0, sq = 0, over = 0;
+      for (let k = 0; k < da.length; k += 4) {
+        for (let c = 0; c < 3; c++) {
+          const d = Math.abs(da[k + c] - db[k + c]);
+          sum += d; sq += d * d; if (d > max) max = d;
+          if (d > 8) over++;
+        }
+      }
+      const n = (da.length / 4) * 3;
+      const mse = sq / n;
+      shots.push({ t: +t.toFixed(2), phase: phaseOf(t), meanAbs: +(sum / n).toFixed(3), max, over8: +(over / n * 100).toFixed(3),
+        psnr: mse === 0 ? Infinity : +(10 * Math.log10(255 * 255 / mse)).toFixed(1) });
+    }
+  }
+  a.destroy(); b.destroy();
+  Object.assign(window.__bench, { done: true, shots, canvas: [ca.width, ca.height], dpr: devicePixelRatio });
+}
+
+(COMPARE ? compare() : timed()).catch((e) => Object.assign(window.__bench, { done: true, error: String(e) }));
+</script>
+</body>
+</html>

@@ -8,6 +8,9 @@
 // orb.destroy();
 //
 // Drawing stops while the page is hidden, so a minimized window costs nothing.
+// It draws at most about 60 times a second whatever the monitor's refresh: on a
+// 120 Hz (or faster) screen it draws every second (or nth) refresh, and the
+// motion is timed by the clock, so it looks the same at any rate.
 
 (function (global) {
   'use strict';
@@ -19,6 +22,12 @@
   const col = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${Math.max(0, Math.min(1, a))})`;
   const mix = (a, b, k) => a.map((v, i) => Math.round(v + (b[i] - v) * k));
   const WHITE = [255, 255, 255];
+  /** The motion was tuned frame by frame on a 120 Hz screen; easing is by time now, scaled to that. */
+  const TUNED_HZ = 120;
+  /** Draw about this often, at most. */
+  const MAX_FPS = 60;
+  /** Per-frame easing `k` at TUNED_HZ, as the share to move after `dt` seconds. */
+  const ease = (k, dt) => 1 - Math.pow(1 - Math.min(1, k), dt * TUNED_HZ);
 
   /** Deterministic 0..1 noise per index, so the dust looks the same every launch. */
   const hash = (i, n) => {
@@ -51,9 +60,10 @@
     let accent = rgb(opts.accent || '#9fd4ff');
     let sprites = new Map();
     const sprite = (c, hot) => {
-      const key = `${c.join(',')}/${hot}`;
-      if (!sprites.has(key)) sprites.set(key, makeSprite(c, hot));
-      return sprites.get(key);
+      const key = ((c[0] << 16) | (c[1] << 8) | c[2]) + Math.round(hot * 100) * 16777216;
+      let s = sprites.get(key);
+      if (!s) sprites.set(key, (s = makeSprite(c, hot)));
+      return s;
     };
 
     let mode = 'idle';
@@ -69,12 +79,38 @@
     let raf = 0;
     let last = 0;
     let dpr = 1;
+    // The refresh rate, learned from the callbacks, and how many to let pass between drawings.
+    let prevTick = 0;
+    let tickAvg = 0;
+    let skipped = 0;
+    const tgt = new Float32Array(RINGS);
 
     // Dust: far specks, nearer specks, and a few large out-of-focus motes.
     const DUST = Array.from({ length: 230 }, (_, i) => {
       const z = i < 150 ? 0.15 + 0.35 * hash(i, 3) : i < 222 ? 0.5 + 0.4 * hash(i, 3) : 1;
-      return { x: hash(i, 1), y: hash(i, 2), z, ph: hash(i, 4) * 6.28, big: i >= 222 };
+      const ph = hash(i, 4) * 6.28;
+      return { x: hash(i, 1), y: hash(i, 2), z, ph, big: i >= 222, size: 40 + 50 * hash(ph * 10, 5) };
     });
+
+    // Each ring's fixed shape: its height, radius, and the angles of its points.
+    const turn = (n) => {
+      const c = new Float64Array(n + 1), s = new Float64Array(n + 1);
+      for (let k = 0; k <= n; k++) {
+        const th = (k / n) * Math.PI * 2;
+        c[k] = Math.cos(th);
+        s[k] = Math.sin(th);
+      }
+      return { c, s };
+    };
+    const OUTLINE = turn(64);
+    const RING = Array.from({ length: RINGS }, (_, i) => {
+      const v = (i + 0.5) / RINGS;
+      const y0 = 1 - 2 * v;
+      const rr = Math.sqrt(1 - y0 * y0);
+      const n = Math.max(14, Math.round(86 * rr));
+      return { v, e: Math.abs(v - 0.5) * 2, y0, rr, n, dots: turn(n) };
+    });
+    let vignette = null;
 
     function fit() {
       dpr = Math.min(2, global.devicePixelRatio || 1);
@@ -86,6 +122,7 @@
         layer.height = h;
         glowCanvas.width = Math.max(1, Math.round(w / 2));
         glowCanvas.height = Math.max(1, Math.round(h / 2));
+        vignette = null;
       }
       return w > 0 && h > 0;
     }
@@ -115,12 +152,12 @@
         if (y < 0) y += 1;
         y += lean.y * 0.05 * d.z;
         const px = x * w, py = y * h;
-        const dx = px - cx, dy = py - cy, dist = Math.hypot(dx, dy) || 1;
+        const dx = px - cx, dy = py - cy, dist = Math.sqrt(dx * dx + dy * dy) || 1;
         const push = 18 * dpr * s.slowSpeak * d.z;
         const fx = px + (dx / dist) * push, fy = py + (dy / dist) * push;
         const tw = 0.55 + 0.45 * Math.sin(t * (0.6 + d.z * 1.4) + d.ph);
         if (d.big) {
-          const sz = (40 + 50 * hash(d.ph * 10, 5)) * dpr;
+          const sz = d.size * dpr;
           ctx.globalAlpha = 0.035 * tw;
           ctx.drawImage(mote, fx - sz / 2, fy - sz / 2, sz, sz);
         } else {
@@ -131,17 +168,18 @@
       }
       ctx.globalAlpha = 1;
       ctx.globalCompositeOperation = 'source-over';
-      const v = ctx.createRadialGradient(w / 2, h / 2, m * 0.28, w / 2, h / 2, m * 0.82);
-      v.addColorStop(0, 'rgba(0,0,0,0)');
-      v.addColorStop(1, 'rgba(0,0,0,0.5)');
-      ctx.fillStyle = v;
+      if (!vignette) {
+        vignette = ctx.createRadialGradient(w / 2, h / 2, m * 0.28, w / 2, h / 2, m * 0.82);
+        vignette.addColorStop(0, 'rgba(0,0,0,0)');
+        vignette.addColorStop(1, 'rgba(0,0,0,0.5)');
+      }
+      ctx.fillStyle = vignette;
       ctx.fillRect(0, 0, w, h);
     }
 
     // ---- the bands ------------------------------------------------------
     /** What each ring should do right now: 0 = resting width. */
-    function targets(t, s) {
-      const out = new Float32Array(RINGS);
+    function targets(t, s, out) {
       // a formant that slides with the syllables, so speech isn't just "all rings up"
       const f1 = 0.25 + 0.35 * (0.5 + 0.5 * Math.sin(t * 2.7 + Math.sin(t * 1.1) * 1.5));
       const rise = 1 - ((t * 0.7) % 1);
@@ -159,8 +197,9 @@
 
     function drawBands(t, dt, w, h, cx, cy, R, s) {
       const step = dt * 60;
+      const tick = dt * TUNED_HZ;
       rot += (0.0022 + 0.004 * W.thinking + 0.0015 * W.speaking) * step * (reduce ? 0.3 : 1);
-      const tgt = targets(t, s);
+      targets(t, s, tgt);
       const scan = (t * 0.85) % 1.25 - 0.12;
       lctx.setTransform(1, 0, 0, 1, 0, 0);
       lctx.clearRect(0, 0, w, h);
@@ -173,55 +212,56 @@
       for (let i = 0; i < RINGS; i++) {
         // EQ feel: fast attack, slow release; peak caps hang and fall.
         const k = tgt[i] > width[i] ? 0.42 : 0.075;
-        width[i] += (tgt[i] - width[i]) * Math.min(1, k * step);
+        width[i] += (tgt[i] - width[i]) * (1 - Math.pow(1 - Math.min(1, k * 0.5), tick));
         peak[i] = Math.max(width[i], peak[i] - 0.0035 * step);
         // while thinking, alternate rings counter-rotate
         ringTurn[i] += (i % 2 ? 1 : -1) * 0.018 * W.thinking * step * (reduce ? 0.3 : 1);
 
-        const v = (i + 0.5) / RINGS;
-        const e = Math.abs(v - 0.5) * 2;
-        const y0 = 1 - 2 * v;
-        const rr = Math.sqrt(1 - y0 * y0);
+        const { v, e, y0, rr, n, dots } = RING[i];
         const wide = 1 + width[i];
         const lit = W.thinking * Math.exp(-Math.pow((v - scan) / 0.045, 2));
         const ringCol = mix(accent, WHITE, 0.4 * (1 - e) + 0.4 * lit);
         const spr = sprite(ringCol, 0.5);
         const a0 = rot + ringTurn[i] + i * 0.31;
         const ca = Math.cos(a0), sa = Math.sin(a0);
-
-        const project = (th, scale) => {
-          const x = Math.cos(th) * rr * scale, z = Math.sin(th) * rr * scale;
-          const x1 = x * ca + z * sa, z1 = -x * sa + z * ca;
-          const y1 = y0 * ct - z1 * st, z2 = y0 * st + z1 * ct;
-          const f = 1 / (1 - 0.2 * z2);
-          return [cx + x1 * R * f, cy + y1 * R * f, z2, f];
-        };
+        const yc = y0 * ct, ys = y0 * st;
 
         // a hairline for the ring itself, and a peak cap above it while she talks
         const outline = 0.07 + 0.06 * W.speaking + 0.25 * lit;
         const cap = Math.min(0.35, (peak[i] - width[i]) * 3) * (W.speaking + W.listening * 0.6);
-        for (const [scale, alpha, lw] of [[wide, outline, 0.9], [1 + peak[i] + 0.012, cap, 1.1]]) {
+        for (let pass = 0; pass < 2; pass++) {
+          const scale = pass ? 1 + peak[i] + 0.012 : wide;
+          const alpha = pass ? cap : outline;
           if (alpha < 0.01) continue;
           lctx.beginPath();
           for (let k2 = 0; k2 <= 64; k2++) {
-            const p = project((k2 / 64) * Math.PI * 2, scale);
-            k2 ? lctx.lineTo(p[0], p[1]) : lctx.moveTo(p[0], p[1]);
+            const x = OUTLINE.c[k2] * rr * scale, z = OUTLINE.s[k2] * rr * scale;
+            const x1 = x * ca + z * sa, z1 = -x * sa + z * ca;
+            const y1 = yc - z1 * st, z2 = ys + z1 * ct;
+            const f = 1 / (1 - 0.2 * z2);
+            const px = cx + x1 * R * f, py = cy + y1 * R * f;
+            k2 ? lctx.lineTo(px, py) : lctx.moveTo(px, py);
           }
           lctx.strokeStyle = col(ringCol, alpha * b);
-          lctx.lineWidth = lw * dpr;
+          lctx.lineWidth = (pass ? 1.1 : 0.9) * dpr;
           lctx.stroke();
         }
 
-        const n = Math.max(14, Math.round(86 * rr));
+        // the ring's points, one sprite each
         const grow = Math.max(0.8, Math.min(2, R / (70 * dpr)));
+        const sizeK = dpr * 1.9 * grow;
+        const dim = 1 - 0.1 * e;
         for (let k2 = 0; k2 < n; k2++) {
-          const [x, y, z, f] = project((k2 / n) * Math.PI * 2, wide);
-          const depth = (z + 1) / 2;
-          const alpha = ((0.14 + 0.78 * Math.pow(depth, 1.5)) * b + lit * 0.7) * (1 - 0.1 * e);
+          const x = dots.c[k2] * rr * wide, z = dots.s[k2] * rr * wide;
+          const x1 = x * ca + z * sa, z1 = -x * sa + z * ca;
+          const y1 = yc - z1 * st, z2 = ys + z1 * ct;
+          const f = 1 / (1 - 0.2 * z2);
+          const depth = (z2 + 1) / 2;
+          const alpha = ((0.14 + 0.78 * depth * Math.sqrt(depth)) * b + lit * 0.7) * dim;
           if (alpha < 0.005) continue;
-          const sz = (0.85 + 1.25 * depth + 1.3 * lit + 0.8 * width[i]) * f * dpr * 1.9 * grow;
+          const sz = (0.85 + 1.25 * depth + 1.3 * lit + 0.8 * width[i]) * f * sizeK;
           lctx.globalAlpha = Math.min(1, alpha);
-          lctx.drawImage(spr, x - sz / 2, y - sz / 2, sz, sz);
+          lctx.drawImage(spr, cx + x1 * R * f - sz / 2, cy + y1 * R * f - sz / 2, sz, sz);
         }
         lctx.globalAlpha = 1;
       }
@@ -243,6 +283,13 @@
     function frame(ms) {
       raf = global.requestAnimationFrame(frame);
       const now = ms / 1000;
+      // Learn the refresh rate (ignoring pauses) and let the extra refreshes pass.
+      const gap = prevTick ? now - prevTick : 0;
+      prevTick = now;
+      if (gap > 0 && gap < 0.1) tickAvg = tickAvg ? tickAvg + (gap - tickAvg) * 0.05 : gap;
+      const every = tickAvg ? Math.max(1, Math.floor(1 / MAX_FPS / tickAvg + 0.25)) : 1;
+      if (++skipped < every) return;
+      skipped = 0;
       const dt = last ? Math.max(0, Math.min(0.05, now - last)) : 1 / 60;
       last = now;
       if (!fit()) return;
@@ -250,10 +297,10 @@
       const k = 1 - Math.pow(0.002, dt);
       for (const m of MODES) W[m] += ((m === mode ? 1 : 0) - W[m]) * k;
       const target = mode === 'speaking' || mode === 'listening' ? inLevel : 0;
-      level += (target - level) * (target > level ? 0.3 : 0.1);
-      slow += (level * W.speaking - slow) * 0.04;
-      lean.x += (lean.tx - lean.x) * 0.06;
-      lean.y += (lean.ty - lean.y) * 0.06;
+      level += (target - level) * ease(target > level ? 0.3 : 0.1, dt);
+      slow += (level * W.speaking - slow) * ease(0.04, dt);
+      lean.x += (lean.tx - lean.x) * ease(0.06, dt);
+      lean.y += (lean.ty - lean.y) * ease(0.06, dt);
       const s = { speak: level * W.speaking, listen: level * W.listening, slowSpeak: slow };
       const w = canvas.width, h = canvas.height;
       const cx = w / 2, cy = h * (opts.centerY ?? 0.46);
@@ -271,6 +318,7 @@
         raf = 0;
       } else if (!raf) {
         last = 0;
+        prevTick = 0;
         raf = global.requestAnimationFrame(frame);
       }
     }
