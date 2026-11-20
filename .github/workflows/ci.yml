@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Smaller, cache-friendly target folders: no incremental state, line tables only.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # The toolchain the project is developed and linted with.
+  RUST_DEV: "1.94.1"
+
+jobs:
+  windows:
+    name: Windows (whole workspace)
+    # The desktop app, pc-control and the satellite are Windows programs.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_DEV" --profile minimal --component clippy
+          rustup default "$RUST_DEV"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-${{ env.RUST_DEV }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-${{ env.RUST_DEV }}-
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  linux:
+    name: Linux (protocol and server)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_DEV" --profile minimal --component clippy
+          rustup default "$RUST_DEV"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-${{ env.RUST_DEV }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-${{ env.RUST_DEV }}-
+
+      - name: Clippy
+        run: cargo clippy -p adrian-protocol -p adrian-server --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test -p adrian-protocol -p adrian-server --locked
+
+  msrv:
+    name: MSRV 1.88 (whole workspace)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: msrv-1.88.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: msrv-1.88.0-
+
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
