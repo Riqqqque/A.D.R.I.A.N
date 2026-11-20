@@ -58,7 +58,8 @@ More detail: [docs/architecture.md](docs/architecture.md) (crates and how they c
 
 ## What the PC app does
 
-- **Always listening, cheaply.** Say "Hey Adrian", or hold **Ctrl+Alt+Space** (push-to-talk), or type in the window. Follow-ups without her name work for a short window after she answers; the server decides how long.
+- **Always listening, cheaply.** Say "Hey Adrian", or hold **Ctrl+Alt+Space** (push-to-talk), or type in the window. Follow-ups without her name work for a short window after she answers; the server decides how long. From the next release push-to-talk lasts exactly as long as you hold the key: what you say while holding it is hers, nothing after.
+- **Knows when the mic hears your call** (next release). The app tells the server whether her sound plays on headphones or speakers. While you're in a Discord voice call the bot can see and the PC is on speakers, she takes only push-to-talk and typing there, and her name said aloud gets a soft chime instead of an answer. Many USB DACs and docks report "speakers" even with earphones plugged in: tick **These speakers are headphones** in settings once for that output.
 - **Talk over her.** The mic stays open while she speaks. The app learns how much of her voice leaks back into the mic. It lowers her to 30% on the PC the moment you talk over her, and the server then stops her. Music alone is never ducked for noise.
 - **PC actions**, typed and allow-listed (`crates/pc-control`):
   - open, close, focus or minimize apps and games, and list what's open;
@@ -72,10 +73,11 @@ More detail: [docs/architecture.md](docs/architecture.md) (crates and how they c
   - the PC's own named shortcuts from its settings (an `.exe`, `.lnk`, `.bat` or `.ps1` file, or a URL). Only these and installed apps can be started.
 - **Leaves running games alone.** It doesn't type or click into other programs or kill processes, and windows of games and of programs it can't identify are never closed, moved or pictured. Two exceptions are still open (see [docs/ROADMAP.md](docs/ROADMAP.md#safety-and-rights)): "screens off" broadcasts a system message to every window, and "show desktop" minimizes everything.
 - **Quiet while gaming.** Every 2 s it checks whether a game is in front (after 5 s in a game, ended after 20 s out) and tells the server, which then answers only to her name, keeps answers short and holds reminders until the match ends.
-- **Alarms at the PC.** It keeps the server's upcoming alarms. If the server hasn't rung one 20 s after it's due, or the link drops mid-ring, it rings the alarm itself with a beep pattern. It has Stop and Snooze buttons in the window and tray, and raises speakers that are below 30% or muted for the ring, then puts them back.
-- **Stays out of the way.** In the tray there is no window at all; the web view exists only while the window is open. The process drops to low priority and EcoQoS when idle. The orb stops drawing when it's off screen or a full-screen app is in front.
+- **Alarms at the PC.** It keeps the server's upcoming alarms. If the server hasn't rung one 20 s after it's due, or the link drops mid-ring, it rings the alarm itself with a beep pattern. It has Stop and Snooze buttons in the window and tray, and raises speakers that are below 30% or muted for the ring, then puts them back. From the next release an answer given at the PC reaches the server at once when linked and survives a stale list from the server; known gaps are in [docs/desktop.md](docs/desktop.md#known-issues-open).
+- **Stays out of the way.** In the tray there is no window at all; the web view exists only while the window is open. The process drops to low priority and EcoQoS when idle. The orb stops drawing when it's off screen or a full-screen app is in front, and from the next release it draws at most about 60 times a second on any monitor (about 40% less CPU with the window open on a 120 Hz screen, measured in headless Edge).
 - **Updates itself** from GitHub releases, checked 3 minutes after start and then every 6 hours. Each download is checked against its `.sha256` and must pass `--self-check` before it's used. It installs only while she's idle with no window and no full-screen app in front, and keeps the old copy until the new one has connected and lasted 3 minutes.
-- **Follows the Windows default devices** when you switch speakers or microphone.
+- **Follows the Windows default devices** when you switch speakers or microphone; from the next release what she's saying carries on on the new device.
+- **Comes back quickly** (next release): about a second after a server restart, and a small local `link.log` records why a link dropped (server name and token blanked).
 
 Setup (turning the PC server on in the bot, pairing, installing) is in the bot repo's [docs/pc-app.md](https://github.com/Riqqqque/adrian-discord-voice/blob/main/docs/pc-app.md). Internals are in [docs/desktop.md](docs/desktop.md).
 
@@ -101,16 +103,16 @@ Before the tray redesign on 2026-10-23, the app used 7 processes and 303 MB of p
 
 ## Repository layout
 
-| Path | Package | What it is | Test attributes at 0.17.1 |
+| Path | Package | What it is | Test attributes (2026-11-20) |
 |---|---|---|---|
-| `crates/desktop` | `adrian-desktop` 0.17.1 | The PC app. Tauri `=2.11.6`, tauri-build `=2.6.3`. UI in `crates/desktop/ui` (embedded in the exe). Installer `crates/desktop/packaging/Install.ps1`. | 73 |
+| `crates/desktop` | `adrian-desktop` 0.17.1 | The PC app. Tauri `=2.11.6`, tauri-build `=2.6.3`. UI in `crates/desktop/ui` (embedded in the exe). Installer `crates/desktop/packaging/Install.ps1`. Orb bench in `crates/desktop/bench`. | 116 (3 ignored measurements; 73 at 0.17.1) |
 | `crates/pc-control` | `adrian-pc-control` 0.1.0 | PC actions library and the `pcctl` CLI (`src/bin/pcctl.rs`). No network code apart from the DNS lookup `pc_open` makes to check a page's addresses; the library writes no files (`pcctl --out` saves a screenshot when asked); no paid service. | 109 (1 ignored live test) |
 | `crates/server` | `adrian-server` 0.1.0 | Older household server: axum HTTP API, one SQLite worker thread, providers, Home Assistant lights, scheduler, usage. | 157 |
 | `crates/satellite` | `adrian-satellite` 0.1.0 | Older Windows voice client for `crates/server` (push-to-talk, Windows SAPI voice, optional rustpotter wake word). Superseded by `crates/desktop`; whether to keep it is undecided. | 5 (1 ignored live TLS test) |
 | `crates/protocol` | `adrian-protocol` 0.1.0 | JSON wire types between `crates/server` and `crates/satellite` only. | 4 |
 | `web/` | `adrian-web` 0.1.0 | SvelteKit single-page UI for `crates/server`, built statically and served by it. | 10 (`npm test`) |
 
-Test numbers are counts of `#[test]` / `#[tokio::test]` attributes in the source, not a record of a run. There is no CI in this repository.
+Test numbers are counts of `#[test]` / `#[tokio::test]` attributes in the source, not a record of a run ([TEST_REPORT.md](TEST_REPORT.md) has the reported runs). CI (`.github/workflows/ci.yml`, added 2026-11-20) runs clippy and the tests on Windows for the whole workspace, on Linux for the protocol and server crates, and the MSRV check; see [CONTRIBUTING.md](CONTRIBUTING.md#continuous-integration).
 
 Workspace facts: edition 2024, `rust-version = "1.88"` (MSRV), release profile `lto = "thin"`, `codegen-units = 1`. `.cargo/config.toml` links the C runtime statically for `x86_64-pc-windows-msvc`, so the exe runs without the Visual C++ Redistributable.
 

@@ -180,7 +180,7 @@ None of these are shared at runtime. A token from one stack never works on the o
 | Lockfile | `Cargo.lock` is committed | repo root |
 | Tauri pin | `tauri = "=2.11.6"`, `tauri-build = "=2.6.3"`: the newest that keep Rust 1.88 (2.12 needs 1.90) | `crates/desktop/Cargo.toml` |
 | `windows` crate | 0.58.0 in both `desktop` and `pc-control`; keep them in step | both `Cargo.toml` files |
-| CI | None. There is no `.github` folder; run the checks below yourself. | |
+| CI | GitHub Actions on push and pull request to `main`: Windows clippy (`-D warnings`) and tests for the whole workspace, Linux clippy and tests for `adrian-protocol` and `adrian-server`, and the MSRV 1.88 check on Windows. Not yet run on GitHub when this was written; the Linux job is unverified. What it doesn't cover: [CONTRIBUTING.md](../CONTRIBUTING.md#continuous-integration) | `.github/workflows/ci.yml` |
 
 ## How crates depend on each other
 
@@ -198,7 +198,11 @@ and nothing in the PC crates calls `crates/server`.
 1. **Mic and gate (PC).** The default Windows input device is resampled to 48 kHz mono
    and cut into 20 ms frames. The gate opens after 60 ms above an automatic threshold and
    sends 300 ms of audio from just before it opened (`speech_start`, binary PCM,
-   `speech_end`). It closes after 1.2 s of quiet. Push-to-talk (Ctrl+Alt+Space) forces it open.
+   `speech_end`). It closes after 1.2 s of quiet. Push-to-talk (Ctrl+Alt+Space) forces it
+   open; from the next release the app sends the press with `hold: true` and the release
+   too, and the bot takes only what was said in between. While the PC's owner is in a voice
+   call the bot can see and the PC reports speakers (`output`), the bot takes only
+   push-to-talk and typing there.
 2. **Bot.** Silero VAD, wake phrase, ASR (local, optionally re-checked by a cloud model),
    the language model with tools, then the voice. See the bot's
    [architecture.md](https://github.com/Riqqqque/adrian-discord-voice/blob/main/docs/architecture.md).
@@ -252,14 +256,17 @@ Every action, argument and safety rule is in [pc-control.md](pc-control.md).
 | What | Where | Written by |
 |---|---|---|
 | PC app settings (server address, DPAPI-encrypted token, mic threshold, policy, switches) | `%APPDATA%\adrian\desktop\config\config.json` | `crates/desktop` |
-| PC alarm backup copy and pending answers | `%APPDATA%\adrian\desktop\config\alarms.json` | `crates/desktop` |
+| PC alarm backup copy, pending answers and answer markers | `%APPDATA%\adrian\desktop\config\alarms.json` | `crates/desktop` |
+| PC link log (next release) | `%APPDATA%\adrian\desktop\config\link.log` and `link.old.log`, about 128 KB each | `crates/desktop` |
 | PC app exe and update leftovers | the install folder (`%LOCALAPPDATA%\A.D.R.I.A.N\` with `Install.ps1`): `ADRIAN.exe`, `ADRIAN.new.exe`, `ADRIAN.old.exe` | installer, updater |
 | PC action state | none on disk; app index and window undo history in memory | `crates/pc-control` |
 | Everything the brain keeps (memory, people, alarms, usage, logs, pairing list) | the bot's state directory on the bot server | bot repo |
 | Older server database, backups, key, setup token | `ADRIAN_DATA_DIR` (default `data/`): `adrian.db`, `backups/`, `secret.key`, `SETUP_TOKEN.txt` | `crates/server` |
 | Old satellite config and alarm replicas | `%APPDATA%\adrian\satellite\config\` | `crates/satellite` |
 
-The PC app writes no log files; its `eprintln!` output is invisible in release builds.
+The PC app's only log file is `link.log` (next release; 0.17.1 writes none): how each
+connection ended and why tries failed, with the server's host and the token blanked
+([desktop.md](desktop.md#linklog)). Its `eprintln!` output is invisible in release builds.
 
 ## Cross-repo couplings (change them together)
 
@@ -277,7 +284,8 @@ fields, never repurpose or require them.
 | `win/clipboard.rs` `MAX_CHARS = 8000` | `senses.ts` description; the 9000-character result cap | Clipboard text size |
 | Result wording: `Unknown PC action` prefix, `pc_apps open` "(app/game/shortcut)." suffix, `pc_clipboard` first line, `pc_screen` reply shape | `senses.ts` `UNKNOWN`, `forLog`; `tools.ts` `confirmation()` | Parsed by the bot; reword only together |
 | `activity` message (`gaming`, `game` up to 60 characters) | `src/satellite/quiet.ts` `parseActivity` | Quiet while gaming |
-| `alarm.rs` reading of `alarms` (`ringing`, `list`, `snoozeMin`, `ringMin`, `now`) and `alarm_action` / `alarm_done` | `src/app/alarm-commands.ts`, `connection.ts` | PC backup ring |
+| `alarm.rs` reading of `alarms` (`ringing`, `list`, `snoozeMin`, `ringMin`, `now`) and `alarm_action` / `alarm_done` | `src/app/alarm-commands.ts`, `connection.ts` | PC backup ring. From the next release `alarm_done` is sent at once on a live link, which relies on the bot accepting it at any time (it does) |
+| `ptt {down, hold}` and `ptt {down: false}`; `output {kind}`; `notice {kind}` (`link.rs`, next release) | `src/satellite/ptt.ts`, the PC call guard in `src/app/stack.ts`, `connection.ts` | Held push-to-talk; hands-free on headphones during a call; the chime. All optional both ways: an old app sends no `hold` (one-shot press) and no `output` (treated as speakers); an old bot ignores both and sends no `notice` |
 | `update.rs` `REPO`, asset names, tag format `v<X.Y.Z>` | release assets of the bot repo | Auto-update |
 | `hello.version` (`CARGO_PKG_VERSION`) | `senses.ts` `HEALTH_SINCE` and other version checks | The bot degrades for older apps by version |
 
@@ -285,7 +293,7 @@ fields, never repurpose or require them.
 
 ```
 cargo build --release -p adrian-desktop        # target\release\adrian-desktop.exe (installed as ADRIAN.exe)
-cargo test -p adrian-desktop                   # 73 tests
+cargo test -p adrian-desktop                   # 116 tests (3 ignored measurements)
 cargo test -p adrian-pc-control                # 109 tests (1 ignored live test)
 cargo build -p adrian-pc-control --bin pcctl   # the PC actions CLI
 cargo clippy --workspace
@@ -295,7 +303,9 @@ cargo test --workspace                         # also builds and tests the older
 cd web && npm ci && npm run check && npm run build && npm test
 ```
 
-Test counts are `#[test]` / `#[tokio::test]` attributes at commit `ac9708d` (2026-11-19);
-see [../TEST_REPORT.md](../TEST_REPORT.md). Most PC crate tests only compile on Windows.
+Test counts are `#[test]` / `#[tokio::test]` attributes on 2026-11-20 (desktop: 73 at
+`ac9708d`, 0.17.1); see [../TEST_REPORT.md](../TEST_REPORT.md). The orb has no automated
+test; `crates/desktop/bench/orb-bench.mjs` measures it in headless Edge
+([desktop.md](desktop.md#change-guide)). Most PC crate tests only compile on Windows.
 Never run anything that locks, sleeps, restarts or shuts down the machine as a test; see
 [pc-control.md](pc-control.md#tests).

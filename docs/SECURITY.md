@@ -57,7 +57,8 @@ This repo holds two stacks with separate security models (see
   address before any token check, so point it only at your own server.
 - **Nothing stale.** Anything typed, pressed or recorded while offline is dropped, not sent
   later, so an old "lock the PC" can't run minutes after it was said. Push-to-talk never
-  survives a lost link.
+  survives a lost link. From the next release the PC also drops speech that waited more than
+  1.5 s for speakers that were gone, so a late answer isn't played long after it was said.
 - **Audio leaves only while someone talks.** The mic is always open, but frames are sent only
   while the local loudness gate is open (plus 300 ms from just before). Offline audio is
   dropped and the queue is bounded at 30 s.
@@ -98,6 +99,19 @@ From the bot repo (`src/satellite/server.ts`, `devices.ts`, `tools.ts`); see its
   identification: whoever talks near the PC, or whatever audio reaches its mic, acts as the
   PC's owner, including any owner-only powers that person has on the bot. The per-PC policy
   and the spoken yes for power actions are the stopgap. Turn off what you don't need.
+- **A voice call heard through the PC's speakers** is a way in: people in the call speak
+  through the PC's mic. From the next release the app reports whether its output is
+  headphones, speakers or unknown (`output`), and the bot then takes only push-to-talk and
+  typing at a PC on speakers or unknown while its owner is in any voice call the bot can see
+  (the rule and its edges are in the bot's
+  [satellite.md](https://github.com/Riqqqque/adrian-discord-voice/blob/main/docs/satellite.md)).
+  The setting "These speakers are headphones" is trusted as given: ticking it for real
+  speakers turns that guard off for the PC. Calls the bot can't see (servers it isn't in,
+  direct-message calls, other apps, a video) are not covered. Older apps never send
+  `output`, so they are always guarded in a call.
+- **link.log** (next release) is a local file in the settings folder. It blanks the server's
+  host name and the token, but a TLS certificate-name error can still include the other
+  names and addresses on the server's certificate. Read it before sharing it.
 - **`ws://` is plain text.** The bot's satellite endpoint speaks plain WebSocket; the token
   (in `hello`) and audio travel unencrypted unless you use a private network, a VPN, or a TLS
   reverse proxy in front of the bot and a `wss://` (or `https://`) server address in the app.
