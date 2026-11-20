@@ -246,7 +246,7 @@ impl Shared {
     /// The speakers' next `frames` samples: her queue, then silence. Runs on
     /// the audio callback: a reply being queued holds the lock only for a
     /// moment, so wait that out (briefly) rather than play a gap.
-    fn fill(&self, played: &mut Vec<f32>, frames: usize) {
+    fn fill(&self, played: &mut Vec<f32>, frames: usize, wait: Duration) {
         played.clear();
         let mut deadline = None;
         let q = loop {
@@ -254,7 +254,7 @@ impl Shared {
                 Ok(q) => break Some(q),
                 Err(TryLockError::Poisoned(e)) => break Some(e.into_inner()),
                 Err(TryLockError::WouldBlock) => {
-                    let until = *deadline.get_or_insert_with(|| Instant::now() + FILL_WAIT);
+                    let until = *deadline.get_or_insert_with(|| Instant::now() + wait);
                     if Instant::now() >= until {
                         break None;
                     }
@@ -724,7 +724,7 @@ where
         move |data: &mut [T], _| {
             audio_thread();
             let frames = data.len() / channels.max(1);
-            shared.fill(&mut played, frames);
+            shared.fill(&mut played, frames, FILL_WAIT);
             let gain = if shared.duck.load(Ordering::Relaxed) {
                 DUCK
             } else {
@@ -879,7 +879,8 @@ mod tests {
         });
         locked_rx.recv().unwrap();
         let mut played = Vec::new();
-        shared.fill(&mut played, 480);
+        // a generous wait here: the test is that it waits, not how fast threads get scheduled
+        shared.fill(&mut played, 480, Duration::from_secs(5));
         holder.join().unwrap();
         assert_eq!(played.len(), 480);
         assert!(rms(&played) > 0.05, "played silence while her audio was queued");
