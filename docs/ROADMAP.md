@@ -4,7 +4,7 @@ This page covers this repository: the Windows PC app (`crates/desktop`), PC cont
 
 The bot's plans (speed, cost, music, alarms, home control over MCP, the bot's known limitations) are in the bot repository's [docs/roadmap.md](https://github.com/Riqqqque/adrian-discord-voice/blob/main/docs/roadmap.md). That page's PC section carries a short copy of the main PC items; this page is the full list. When you add, close or change a PC item here, check that page too. Why the PC app is built the way it is (and so which items are deliberate, not missing) is in the bot's [docs/decisions.md](https://github.com/Riqqqque/adrian-discord-voice/blob/main/docs/decisions.md#the-pc-app-and-pc-actions).
 
-State of the code: PC app 0.17.1 (2026-11-19). Page updated 2026-11-20. It replaces the design review of 2026-10-14, whose findings and plans are carried over below with their current status. Nothing here is a promise or a schedule.
+State of the code: PC app 0.17.1 (2026-11-19), plus the 2026-11-20 improvement passes that ship with the next PC app release (listed in [desktop.md](desktop.md#changes-in-the-next-release)). Page updated 2026-11-20. It replaces the design review of 2026-10-14, whose findings and plans are carried over below with their current status. Nothing here is a promise or a schedule.
 
 Status words: **done** = in the code and tested; **open** = planned, not started; **superseded** = the plan was overtaken by what was built.
 
@@ -26,7 +26,7 @@ Status words: **done** = in the code and tested; **open** = planned, not started
 
 | Part | State | Notes |
 |---|---|---|
-| PC app (`crates/desktop`) | **Live.** Released with every bot release since 0.14.9; updates itself from the bot repo's GitHub releases. | Talks to the bot's satellite WebSocket, not to the Rust server. 73 test attributes. |
+| PC app (`crates/desktop`) | **Live.** Released with every bot release since 0.14.9; updates itself from the bot repo's GitHub releases. | Talks to the bot's satellite WebSocket, not to the Rust server. 116 test attributes (73 at 0.17.1). |
 | PC control (`crates/pc-control`) | **Live** through the PC app. | Nine PC tools, game detection, `pcctl`. 109 test attributes. |
 | Discord bot and the PC app's server side | **Live**, in [adrian-discord-voice](https://github.com/Riqqqque/adrian-discord-voice). | The hub of the suite today: brain, memory, people, budgets, alarms, voices. |
 | Household server (`crates/server`, `web/`) | Preview ("Gate A + early Gate B": Gate A is the server core, Gate B the old voice satellite; see the [README](../README.md#the-older-rust-household-server)). Maintained (last server changes 2026-11-01), not in production. | 157 test attributes. Never run against a real provider or Home Assistant ([TEST_REPORT.md](../TEST_REPORT.md)). |
@@ -68,7 +68,7 @@ Concrete items, in no fixed order. Each change here also needs the bot side chec
 
 ### Safety and rights
 
-- **Rights at a PC (F1).** Long-term: speaker verification as a soft factor plus assurance levels. Until then, the per-PC allow-list and the power yes stay the boundary.
+- **Rights at a PC (F1).** Long-term: speaker verification as a soft factor plus assurance levels. Until then, the per-PC allow-list and the power yes stay the boundary. From the next release the bot also takes only push-to-talk at a PC on speakers while its owner is in a voice call it can see (the PC reports `output`); calls it can't see still reach the PC.
 - **Close the game-protection gaps** in `crates/pc-control`, so the code matches the "nothing that messages a running game" rule in the `lib.rs` header:
   - `pc_volume` with a named `app`, and the master volume, have no game check (only `playing: true` skips games);
   - `pc_system screen_off` broadcasts `WM_SYSCOMMAND` to every top-level window, a running game's included;
@@ -84,19 +84,29 @@ Concrete items, in no fixed order. Each change here also needs the bot side chec
   - the first index-using action after start, or after a settings Save (which builds a new `Pc`), waits up to 15 s for the background build and then builds the index itself, so it can take longer than the bot's 15 s tool timeout;
   - games from Battle.net, Xbox, EA, Ubisoft and Rockstar folders have no launcher entry. They open by name only if the Start menu lists them, and they're missing from the no-filter `pc_apps list`.
 - **Hard-coded paths**: Epic and Riot read literal `C:\ProgramData\...` paths and the Vanguard root is literal, so installs in other locations aren't seen.
-- **Speaker output**: a `try_lock` on the output path can play a moment of silence under contention.
-- **Orb cost with the window open** at high refresh rates (120 Hz) hasn't been measured or tuned. The tray state is already near zero.
+- **Alarm and link issues found on 2026-11-20** (details and effects in [desktop.md](desktop.md#known-issues-open)):
+  - an alarm answer written to a silently dead link is forgotten and the alarm rings again after the reconnect (A1, new with sending answers at once);
+  - after the PC's clock jumps ahead, an early local ring can be stopped, which finishes the real occurrence on the server (A2; a server-side due check or a monotonic clock anchor would fix it);
+  - answer markers are dropped when the server lists the occurrence as ringing (A3);
+  - failed reconnect tries cut the backup ring's beeps (A4); a clock set back mid-ring stretches the ring (A6);
+  - with no working mic, the speakers never open, so the backup alarm ring is silent (S3);
+  - stale speech after sleep, and a device that fails right after opening (S1, S2);
+  - link.log: certificate names in TLS errors, no per-line cap (L1, L2);
+  - the bot counts "no hello" toward its address lockout (R2, bot side).
+- **Links dropping when a game starts**, back after more than a minute: cause unknown. link.log (next release) is there to settle it.
+- **Speaker output**: a `try_lock` on the output path can play a moment of silence under contention. **Done for the next release** (the callback waits up to 2 ms instead).
+- **Orb cost with the window open** at high refresh rates: **done for the next release**, at most about 60 frames a second on any screen, about 40% less CPU at 120 Hz measured in headless Edge. Measuring it in the app's own WebView2 window is still open.
 - **Settings that reset on reconnect** (voice volume, speed, music level, queue): they live in the bot's per-connection PC room. The fix is on the bot side (keep them per device).
-- **Default-device switch**: audio queued at the moment of a switch is dropped (`open_streams` clears the queue). Audio that arrives after the switch plays on the new device.
+- **Default-device switch**: audio queued at the moment of a switch is dropped (`open_streams` clears the queue). **Done for the next release**: the queue is kept and resampled.
 
 ### Development
 
-- **No CI.** Nothing runs `cargo test --workspace`, `cargo clippy --workspace` or the MSRV check automatically; they are run by hand.
+- **CI**: added 2026-11-20 (`.github/workflows/ci.yml`: Windows clippy and tests, Linux protocol and server, MSRV 1.88). Its first GitHub run is still to come, and the Linux job has never run. Not covered: ignored and live tests, the orb bench, `cargo fmt`, `web/`, release builds ([CONTRIBUTING.md](../CONTRIBUTING.md#continuous-integration)).
 - **Dev builds update themselves.** `update::run` isn't gated by build type, so a local build older than the latest release replaces itself about 3 minutes after start unless auto-update is off.
 - **`Install.ps1`** has no automated test.
 - **`pcctl --policy`** silently accepts the whole settings file as an all-on policy (`Policy` has no `deny_unknown_fields`).
 - **Stale comments** listed in [CONTRIBUTING.md](../CONTRIBUTING.md#known-stale-comments).
-- **`crates/desktop/src/audio.rs`** is 977 lines; split it only if that is clearly better.
+- **`crates/desktop/src/audio.rs`** is 1340 lines and `link.rs` 2105 (about two thirds of it tests); split them only if that is clearly better.
 
 ### Live checks still to do
 
@@ -105,7 +115,8 @@ These paths have unit tests but little or no real-world use yet:
 - window moves across monitors with different scaling;
 - real screen captures;
 - quiet while gaming with real games;
-- raising quiet or muted speakers for an alarm ring.
+- raising quiet or muted speakers for an alarm ring;
+- the next release's changes against a live bot: reconnect after a real restart, held push-to-talk, the call guard and the headphones switch, the notice chime, a device switch while she talks.
 
 ## PC app and PC control: known limitations
 
@@ -114,7 +125,7 @@ What doesn't work, or works with a catch, as of 0.17.1:
 - **The link is plain `ws://` by default**: a bare `host:port` or `http://` address becomes `ws://`, so the token and mic audio are unencrypted unless the server is behind TLS and the address is `wss://`/`https://`. Use a LAN, a VPN or a TLS reverse proxy. Tokens don't expire.
 - **Windows only.** Other platforms compile, but the token can't be saved and every action answers "PC control only works on Windows."
 - **No acoustic echo cancellation.** Talking over her relies on a learned speaker-to-mic coupling and a 3× margin. `examples/aec_probe.rs` explored Windows' communications-mode echo cancellation; it wasn't adopted.
-- **Push-to-talk sends only the press** (`ptt down: true`), never a release; the gate closes on its own after 1.2 s of quiet.
+- **Push-to-talk sends only the press** (`ptt down: true`), never a release; the gate closes on its own after 1.2 s of quiet. Fixed in the next release (`hold: true` and a key-up).
 - **`is_protected("")` is true**: elevated or otherwise unreadable windows are refused as "might be a game", even ordinary admin tools. This is deliberate, since unreadable exes are often anti-cheat-protected games.
 - **`pc_windows` refuses every change while an exclusive full-screen D3D app runs**, even on another monitor. Window undo history is in memory only (32 entries).
 - **`pc_open`** refuses every raw IP address, public ones too. The DNS check resolves once, and the browser resolves again later.
@@ -244,7 +255,7 @@ The server has no API to create members or guests yet. Before adding one, schedu
 The maintainer sets priorities; this is one reasonable order, not a schedule:
 
 1. **PC safety**: the game-protection gaps and the game-folder root check in `crates/pc-control`, because they guard people's game accounts.
-2. **PC reliability**: app index refresh and first-use wait, the speaker `try_lock`, pairing refusal messages.
+2. **PC reliability**: the open alarm items (A1, A2, S3 first: each can lose or silence an alarm), app index refresh and first-use wait, pairing refusal messages.
 3. **Decisions** on `crates/satellite`, release signing and the license metadata.
 4. **Identity and assurance levels**, which also fix F1 for the PC app, wherever the maintainer decides they belong (this server or the bot).
 5. Then the household server plans: rooms and announcements with Piper, memory v2 and scheduled backups, Frigate, more Home Assistant domains and Wyoming room satellites.

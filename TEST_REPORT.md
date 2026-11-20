@@ -2,14 +2,18 @@
 
 This file has two parts:
 
-1. **[Current test inventory](#current-test-inventory)**: what tests exist at commit `ac9708d`
-   (PC app 0.17.1, 2026-11-19), counted on 2026-11-20. The suite was **not re-run** for this
-   report, so it records no pass or fail for the current tree. Run the commands below to get one.
+1. **[Current test inventory](#current-test-inventory)**: what tests exist on the branch that
+   combines the 2026-11-20 PC app passes (crate still 0.17.1; the changes ship with the next
+   release), counted on 2026-11-20, plus the
+   [runs reported by those passes](#pc-app-runs-reported-on-2026-11-20). The suite was **not
+   re-run** for this report.
 2. **[Historical report](#historical-report-gate-a-gate-b-and-alarm-replicas)**: the
    2026-09-17 report for the older Rust household server and old satellite (Gate A and
    Gate B), updated 2026-10-14. Its results describe that date's code, not today's.
 
-There is no CI (no `.github` folder); every result here comes from a local run.
+A CI workflow (`.github/workflows/ci.yml`) was added on 2026-11-20 but had not run on GitHub
+when this was written; every result here comes from a local run. What it covers:
+[CONTRIBUTING.md](CONTRIBUTING.md#continuous-integration).
 
 ## Current test inventory
 
@@ -18,7 +22,7 @@ Counts are `#[test]` / `#[tokio::test]` attributes found with grep (Rust) and `t
 
 | Crate or folder | Tests | Ignored by default | Notes |
 |---|---|---|---|
-| `crates/desktop` (PC app) | 73 | 0 | alarm 8, audio 6, config 10, link 24, main 4, single 2, tray 4, update 15; 6 Windows-only. `link.rs` tests run real WebSocket servers on `127.0.0.1:0` with shortened timings; `update.rs` Windows tests spawn `cmd`, `ping` and a copied `ping.exe` |
+| `crates/desktop` (PC app) | 116 | 3 (measurements: `reconnect_after_outages`, `reconnect_schedule_sweep`, `default_output_form_reads`) | alarm 25, audio 15, config 11, link 38, linklog 2, main 4, single 2, tray 4, update 15. `link.rs` tests run real WebSocket servers on `127.0.0.1:0` with shortened timings; `update.rs` Windows tests spawn `cmd`, `ping` and a copied `ping.exe` |
 | `crates/pc-control` (PC actions) | 109 | 1 (`live_notepad`) | activity 17, lib 5, matching 5, win/activity 6, apps 7, audio 1, clipboard 8, health 8, info 3, layout 25, media 2, nvml 2, open 7, screen 13. Everything under `win/` compiles only on Windows |
 | `crates/server` (older server) | 157 | 0 | 97 unit tests in `src/` (including a fake Home Assistant), plus integration tests: `http_flow.rs` 33, `usage_flow.rs` 11 (with a mock OpenAI-compatible SSE server), `ws_session.rs` 16 |
 | `crates/satellite` (old client) | 5 | 1 (live TLS) | Replica store and TLS client |
@@ -27,7 +31,42 @@ Counts are `#[test]` / `#[tokio::test]` attributes found with grep (Rust) and `t
 
 How the counts grew (from the maintainer's dated records): server 38 to 157 and desktop 8 to
 61 over the night of 2026-10-31; pc-control 12 to 22 (2026-11-01) and to 109 (0.15.6,
-2026-11-08); desktop 61 to 65 (0.15.6) and to 73 (0.17.0, 2026-11-19).
+2026-11-08); desktop 61 to 65 (0.15.6), to 73 (0.17.0, 2026-11-19) and to 116 (2026-11-20,
+next release).
+
+### PC app runs reported on 2026-11-20
+
+Each improvement pass ran the PC crates' tests on a Windows desktop at low priority
+(`-j 2`). These are the passes' own reports, not re-run for this page.
+
+| Pass | `adrian-desktop` | `adrian-pc-control` | Also |
+|---|---|---|---|
+| 0.17.1 (`ac9708d`), before | 73 passed | 108 passed, 1 ignored | |
+| Orb, playback, alarm resync | 83 passed (+3 audio, +7 alarm) | unchanged | audio tests 30 runs in a row, 0 failures |
+| Reconnect, alarm answers on the link, link.log | 92 passed, 2 ignored | unchanged | the stall test 50 of 50 runs; the desktop suite 15 of 15 |
+| Stale lists, stale speech, clock jump, sleep | 106 passed, 2 ignored (+10 alarm, +4 audio) | unchanged | |
+| Output kind, held push-to-talk, notice chime | **113 passed, 3 ignored** | **108 passed, 1 ignored** | one run under load missed the 700 ms stall test's bound; it passed 3 of 3 alone and the suite passed again |
+
+Every pass also reported `cargo clippy -p adrian-desktop -p adrian-pc-control --all-targets -- -D warnings`
+clean and `cargo +1.88.0 check --workspace --all-targets` passing. Tests added to fix a bug
+were first run against the old code and failed there (for example
+`snoozed_here_while_linked_a_stale_resync_doesnt_lose_the_snooze`,
+`speakers_back_after_an_outage_play_only_what_just_came`,
+`an_alarm_answered_here_reaches_the_server_on_the_same_link`). The CI pass ran the exact
+Windows CI commands on the 0.17.1 code: clippy clean; `cargo test --workspace --locked` 346
+passed, 2 ignored.
+
+Measurements, not pass or fail (details in [docs/desktop.md](docs/desktop.md)):
+
+| What | How | Result |
+|---|---|---|
+| Orb cost on a 120 Hz screen | `crates/desktop/bench/orb-bench.mjs`, headless Edge, 5 interleaved runs | 101.8 → 61.3 frames drawn per second; Edge CPU 990 → 608 ms per second; per-frame cost unchanged. Not measured in the app's WebView2 window |
+| Orb look | same bench, `--compare`, 40 checkpoints | new vs old at 120 Hz differs less than old 60 Hz vs old 120 Hz |
+| Reconnect after a 21 s refused outage | ignored `reconnect_after_outages`, real `run()` loop on loopback | about 3 s → 0.33-0.48 s |
+| Reconnect over outages of 0.1-120 s | ignored `reconnect_schedule_sweep` (model) | restarts (15-30 s), refused tries: median 6.7 → 1.45 s, worst 11.9 → 2.95 s |
+
+Known issues found by the review of these passes and not fixed yet are listed in
+[docs/desktop.md](docs/desktop.md#known-issues-open).
 
 ### Commands
 
@@ -51,6 +90,9 @@ cd web && npm ci && npm run check && npm run build && npm test
 | Read-only PC actions | `pcctl pc_info '{"action":"health"}'`, `pcctl pc_windows '{"action":"monitors"}'`, `pcctl pc_volume '{"action":"get","playing":true}'` (see [docs/pc-control.md](docs/pc-control.md#pcctl)) | Nothing is changed |
 | Old satellite against a TLS server | `ADRIAN_TEST_TLS_URL=https://127.0.0.1:18787 ADRIAN_TEST_TLS_CA=cert.pem cargo test -p adrian-satellite -- --ignored` | Needs the older server running with a leaf test certificate (`basicConstraints=critical,CA:FALSE`) |
 | Echo probe | `cargo run --release -p adrian-desktop --example aec_probe -- <voice.wav> <out dir>` | Plays sound and records the mic |
+| Reconnect measurements | `cargo test -p adrian-desktop --bin adrian-desktop reconnect_after_outages -- --ignored --nocapture --test-threads 1` and `... reconnect_schedule_sweep -- --ignored --nocapture` | Loopback sockets only; the harness takes minutes |
+| Output form factor | `cargo test -p adrian-desktop default_output_form_reads -- --ignored --nocapture` | Reads the default output's form factor; changes nothing |
+| Orb bench | `node orb-bench.mjs ...` in `crates/desktop/bench` (see [docs/desktop.md](docs/desktop.md#change-guide)) | Starts headless Edge with a temporary profile; no window |
 | Model routing of PC requests | `bench/pc-orders.mjs` in the bot repo | Calls the real model; needs keys |
 
 Never run, as a test, anything that locks, sleeps, restarts or shuts down the machine, launches
@@ -62,6 +104,9 @@ see [docs/pc-control.md](docs/pc-control.md#tests).
 
 - The PC app's audio on real devices (mic gate by ear, barge-in, device switching), the tray
   and the window's look, and a live alarm ring (it makes sound and opens a window).
+- The next release's changes against a live bot: reconnect after a real server restart,
+  held push-to-talk and the call guard, the notice chime, the headphones switch in a running
+  window. All of it is unit-tested only so far.
 - `crates/desktop/packaging/Install.ps1` (no automated test).
 - `pc-control` against real games, multi-monitor moves with mixed DPI, real screen capture,
   and quiet mode with real games: unit-tested logic only.
