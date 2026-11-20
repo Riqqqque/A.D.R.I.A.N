@@ -137,7 +137,11 @@ impl Alarms {
     }
 
     /// The server's `alarms` message. The server is back: what it says wins,
-    /// and anything ringing here by itself stops (the server rings it now).
+    /// and anything ringing here by itself stops once the server rings it or
+    /// has moved on from it (that occurrence is gone from its list). One the
+    /// server still lists as due but isn't ringing keeps ringing here: the
+    /// server resends the list every hour and on every change, and that alone
+    /// mustn't silence an alarm nobody answered.
     pub fn server_said(&self, m: &Value) {
         let mut st = self.lock();
         let list = |k: &str| -> Vec<Replica> { m.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(read).take(MAX_KEPT).collect()).unwrap_or_default() };
@@ -153,7 +157,15 @@ impl Alarms {
         if let Some(v) = m.get("ringMin").and_then(Value::as_f64).filter(|v| (1.0..=30.0).contains(v)) {
             st.saved.ring_min = v;
         }
-        st.local = None;
+        if let Some((list, since)) = st.local.take() {
+            let keep: Vec<Replica> = list
+                .into_iter()
+                .filter(|a| !st.server.iter().any(|r| r.id == a.id) && st.saved.list.iter().any(|r| r.id == a.id && r.at == a.at))
+                .collect();
+            if !keep.is_empty() {
+                st.local = Some((keep, since));
+            }
+        }
         self.save(&st);
     }
 
@@ -162,11 +174,21 @@ impl Alarms {
     pub fn link_lost(&self, now: f64) {
         let mut st = self.lock();
         let was = std::mem::take(&mut st.server);
-        if !was.is_empty() && st.local.is_none() {
-            for a in &was {
-                st.rung.insert((a.id.clone(), a.at as u64));
+        for a in &was {
+            st.rung.insert((a.id.clone(), a.at as u64));
+        }
+        let since = now + st.skew;
+        match &mut st.local {
+            // Already ringing one here: the server's join it.
+            Some((list, _)) => {
+                for a in was {
+                    if !list.iter().any(|l| l.id == a.id) {
+                        list.push(a);
+                    }
+                }
             }
-            st.local = Some((was, now + st.skew));
+            None if !was.is_empty() => st.local = Some((was, since)),
+            None => {}
         }
     }
 
@@ -208,9 +230,13 @@ impl Alarms {
             for a in &list {
                 st.saved.done.push(Done { id: a.id.clone(), base: a.base, action: action.into(), at: now });
                 if action == "snooze" {
-                    // Still offline then: it rings here again.
+                    // Still offline then: it rings here again. One the server was
+                    // ringing when the link went isn't in the copy (the server leaves
+                    // out what's ringing), so it goes back in.
                     if let Some(r) = st.saved.list.iter_mut().find(|r| r.id == a.id) {
                         r.at = now + snooze;
+                    } else if st.saved.list.len() < MAX_KEPT {
+                        st.saved.list.push(Replica { at: now + snooze, ..a.clone() });
                     }
                 } else {
                     st.saved.list.retain(|r| r.id != a.id);
@@ -411,6 +437,115 @@ mod tests {
         let a = Alarms::default();
         a.server_said(&json!({ "type": "alarms", "list": [{ "id": 5 }, { "id": "x", "base": "soon" }, { "id": "ok", "base": 1.0 }] }));
         assert!(a.tick(GRACE_MS + 2.0));
+    }
+
+    fn epoch_now() -> f64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64
+    }
+
+    #[test]
+    fn a_resync_from_the_server_doesnt_silence_one_ringing_here() {
+        // The server is up but never rang it; it resends the list every hour and on every change.
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        a.server_said(&state(0.0));
+        assert!(a.ringing(), "it stopped without anyone answering it");
+        assert!(a.view().local);
+        assert_eq!(a.answer("stop", 60_000.0), Answer::Here);
+        assert_eq!(a.pending_done().len(), 1, "and the server hears how it was answered");
+    }
+
+    #[test]
+    fn a_resync_still_stops_it_once_the_server_rings_it_or_moved_on() {
+        let a = Alarms::default();
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        // Answered somewhere else: the server's list has the next occurrence.
+        a.server_said(&state(86_400_000.0));
+        assert!(!a.ringing());
+        assert!(!a.tick(GRACE_MS + 2.0), "and it doesn't start again");
+    }
+
+    #[test]
+    fn snoozed_here_after_the_link_dropped_mid_ring_it_rings_again() {
+        // The server's list leaves out what it's ringing, so the copy has no entry for it.
+        let a = Alarms::default();
+        a.server_said(&json!({ "type": "alarms", "ringing": [{ "id": "a1", "kind": "alarm", "label": "gym", "base": 0.0 }], "list": [], "snoozeMin": 5 }));
+        a.link_lost(1_000.0);
+        assert!(a.tick(1_200.0));
+        assert_eq!(a.answer("snooze", 2_000.0), Answer::Here);
+        assert!(!a.tick(3_000.0));
+        assert!(a.tick(2_000.0 + 5.0 * 60_000.0 + GRACE_MS + 1.0), "the snooze never came back");
+        assert_eq!(a.view().label, "Alarm: gym");
+    }
+
+    #[test]
+    fn the_link_dropping_while_one_rings_here_keeps_the_servers_too() {
+        let a = Alarms::default();
+        // a1 rings here (the server never did); then the server starts ringing a2.
+        a.server_said(&state(0.0));
+        assert!(a.tick(GRACE_MS + 1.0));
+        a.server_said(&json!({ "type": "alarms",
+            "ringing": [{ "id": "a2", "kind": "timer", "label": "pasta", "base": 30_000.0 }],
+            "list": [{ "id": "a1", "kind": "alarm", "label": "gym", "at": 0.0, "base": 0.0 }] }));
+        a.link_lost(40_000.0);
+        assert!(a.tick(40_200.0));
+        assert_eq!(a.answer("stop", 41_000.0), Answer::Here);
+        let done: Vec<String> = a.pending_done().iter().map(|d| d["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(done, ["a1", "a2"], "the server's alarm was dropped when the link went");
+    }
+
+    #[test]
+    fn due_times_follow_the_servers_clock() {
+        // This PC's clock is an hour behind the server's.
+        let here = epoch_now();
+        let server_now = here + 3_600_000.0;
+        let a = Alarms::default();
+        a.server_said(&json!({ "type": "alarms", "ringing": [], "now": server_now,
+            "list": [{ "id": "a1", "kind": "alarm", "label": "", "at": server_now + 60_000.0, "base": server_now + 60_000.0 }] }));
+        assert!(!a.tick(here + 60_000.0 + GRACE_MS - 1_000.0), "not yet by the server's clock");
+        assert!(a.tick(here + 60_000.0 + GRACE_MS + 1_000.0));
+        // Its ring time runs on the same clock: ten minutes from when it started here.
+        assert!(a.tick(here + 60_000.0 + 9.0 * 60_000.0));
+        assert!(!a.tick(here + 60_000.0 + GRACE_MS + 10.0 * 60_000.0 + 2_000.0));
+    }
+
+    #[test]
+    fn speakers_raised_before_a_crash_are_put_back_at_the_next_start() {
+        let dir = std::env::temp_dir().join(format!("adrian-alarm-test-{}", std::process::id()));
+        let file = dir.join("alarms.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let a = Alarms::default();
+            a.load(file.clone());
+            a.server_said(&state(5_000.0));
+            assert_eq!(a.plan_raise((0.05, true)), Some(FLOOR));
+            // ...and the app dies here, with the speakers still up.
+        }
+        let b = Alarms::default();
+        b.load(file.clone());
+        assert_eq!(b.take_restore(), Some((0.05, true)));
+        assert_eq!(b.take_restore(), None, "only once");
+        // The copy came back too, and the restore is gone from the file.
+        assert!(b.tick(5_000.0 + GRACE_MS + 1.0));
+        let c = Alarms::default();
+        c.load(file);
+        assert_eq!(c.take_restore(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_broken_file_starts_empty() {
+        let dir = std::env::temp_dir().join(format!("adrian-alarm-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("alarms.json");
+        std::fs::write(&file, b"{ not json").unwrap();
+        let a = Alarms::default();
+        a.load(file);
+        assert_eq!(a.take_restore(), None);
+        assert!(!a.tick(1e13));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
