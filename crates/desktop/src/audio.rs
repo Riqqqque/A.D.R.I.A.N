@@ -43,6 +43,21 @@ const MAX_BUFFER_SECS: usize = 8;
 /// How long the speakers wait for a reply being queued (it takes microseconds)
 /// before they play silence for this buffer instead.
 const FILL_WAIT: Duration = Duration::from_millis(2);
+/// Speakers gone longer than this (unplugged, a failed device, sleep): when
+/// they're back, what was queued more than this long before is dropped, so an
+/// answer that ended while nothing could play it isn't played late. A device
+/// switch (nothing failed) keeps all of it.
+const STALE: Duration = Duration::from_millis(1500);
+/// Pushes remembered while the speakers are gone, at most.
+const MAX_MARKS: usize = 4096;
+
+/// The speakers are gone: since when, and what was queued since (when, how
+/// many samples), newest last.
+#[derive(Default)]
+struct Outage {
+    since: Option<Instant>,
+    marks: VecDeque<(Instant, usize)>,
+}
 
 /// To the device thread: a stream failed, she has something to say, or
 /// Windows' default speakers or mic changed.
@@ -64,6 +79,8 @@ pub enum Up {
 
 pub struct Shared {
     out: Mutex<VecDeque<f32>>,
+    /// Locked only with `out` held (down, then out, then this).
+    outage: Mutex<Outage>,
     /// How much is in `out`, kept beside it so asking never takes its lock
     /// (the speakers' callback shouldn't have to wait for the gate thread).
     queued: AtomicUsize,
@@ -114,6 +131,7 @@ impl Shared {
     pub fn new(threshold: f32) -> Arc<Self> {
         Arc::new(Shared {
             out: Mutex::new(VecDeque::new()),
+            outage: Mutex::new(Outage::default()),
             queued: AtomicUsize::new(0),
             out_rate: AtomicU32::new(RATE),
             down: Mutex::new(Resampler::new(RATE, RATE)),
@@ -213,6 +231,10 @@ impl Shared {
 
     /// Reply audio from the server (48 kHz mono s16le).
     pub fn push_reply(&self, bytes: &[u8]) {
+        self.push_reply_at(bytes, Instant::now());
+    }
+
+    fn push_reply_at(&self, bytes: &[u8], at: Instant) {
         let input: Vec<f32> = bytes
             .chunks_exact(2)
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
@@ -222,15 +244,63 @@ impl Shared {
             r.push(&input, &mut converted);
         }
         if let Ok(mut q) = self.out.lock() {
+            let n = converted.len();
             q.extend(converted);
             let cap = self.out_rate.load(Ordering::Relaxed) as usize * MAX_BUFFER_SECS;
             let extra = q.len().saturating_sub(cap);
             q.drain(..extra);
             self.queued.store(q.len(), Ordering::Relaxed);
+            let mut o = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+            if o.since.is_some() && n > 0 {
+                // Only the last STALE of pushes can matter when they come back.
+                while o.marks.front().is_some_and(|m| at.saturating_duration_since(m.0) > STALE) || o.marks.len() >= MAX_MARKS {
+                    o.marks.pop_front();
+                }
+                o.marks.push_back((at, n));
+            }
         }
         if let Some(tx) = self.wake.lock().ok().and_then(|w| w.clone()) {
             let _ = tx.send(Ctl::Wake);
         }
+    }
+
+    /// The speakers stopped working (or couldn't be opened). Counts from the
+    /// first failure: retries that fail too don't restart it.
+    fn speakers_gone(&self, at: Instant) {
+        let mut o = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+        if o.since.is_none() {
+            o.since = Some(at);
+            o.marks.clear();
+        }
+    }
+
+    /// The speakers work again.
+    fn speakers_back(&self) {
+        let mut o = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+        o.since = None;
+        o.marks.clear();
+    }
+
+    /// Before each try at opening the speakers: after an outage longer than STALE, keep
+    /// only what was queued in the last STALE. An alarm ringing keeps all its
+    /// sound (the PC's own beeps are queued a second ahead). Returns how many
+    /// samples were dropped.
+    fn drop_stale(&self, now: Instant) -> usize {
+        let ringing = self.alarms.ringing();
+        let mut q = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        let mut o = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(since) = o.since else { return 0 };
+        if now.saturating_duration_since(since) <= STALE || ringing {
+            return 0;
+        }
+        while o.marks.front().is_some_and(|m| now.saturating_duration_since(m.0) > STALE) {
+            o.marks.pop_front();
+        }
+        let fresh: usize = o.marks.iter().map(|m| m.1).sum();
+        let drop = q.len().saturating_sub(fresh);
+        q.drain(..drop);
+        self.queued.store(q.len(), Ordering::Relaxed);
+        drop
     }
 
     /// The speakers (re)opened at `rate` (a new default device, or after an
@@ -244,6 +314,10 @@ impl Shared {
             let mut converted = Vec::with_capacity(q.len() * rate as usize / old.max(1) as usize + 1);
             Resampler::new(old, rate).push(q.make_contiguous(), &mut converted);
             *q = converted.into();
+            let mut o = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+            for m in o.marks.iter_mut() {
+                m.1 = (m.1 as u64 * rate as u64 / old.max(1) as u64) as usize;
+            }
         }
         self.queued.store(q.len(), Ordering::Relaxed);
         *down = Resampler::new(RATE, rate);
@@ -535,10 +609,14 @@ pub fn start(shared: Arc<Shared>, up: Sender<Up>) {
         .spawn(move || {
             let mut retry = Duration::from_millis(300);
             loop {
+                // Gone a while (each try, so a queue nothing can play doesn't
+                // keep counting as her playing): what she said long ago goes.
+                shared.drop_stale(Instant::now());
                 let (tx, rx) = mpsc::channel::<Ctl>();
                 *shared.wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
                 let failure = match open_streams(&shared, mic_tx.clone(), tx) {
                     Ok((_mic, speakers)) => {
+                        shared.speakers_back();
                         *shared.mic_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         retry = Duration::from_millis(300);
                         let mut on = false;
@@ -586,6 +664,7 @@ pub fn start(shared: Arc<Shared>, up: Sender<Up>) {
                 // A device switch reopens right away; a failure (unplugged, busy)
                 // retries soon, then less often while nothing works.
                 if let Some(e) = failure {
+                    shared.speakers_gone(Instant::now());
                     *shared.mic_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
                     std::thread::sleep(retry);
                     retry = (retry * 2).min(Duration::from_secs(5));
@@ -909,6 +988,65 @@ mod tests {
         assert!((n - 44_100).abs() < 20, "{n}");
         shared.stop_reply();
         assert!(!shared.playing());
+    }
+
+    #[test]
+    fn speakers_back_after_an_outage_play_only_what_just_came() {
+        let shared = Shared::new(0.0);
+        let t0 = Instant::now();
+        // The tail of an answer, queued just before the DAC was unplugged.
+        shared.push_reply_at(&speech(0.5), t0);
+        shared.speakers_gone(t0 + Duration::from_millis(100));
+        // The rest of it arrives with nothing to play it, then a new answer later on.
+        shared.push_reply_at(&speech(2.0), t0 + Duration::from_millis(200));
+        shared.push_reply_at(&speech(0.25), t0 + Duration::from_secs(59));
+        // A retry that still fails doesn't restart the clock.
+        shared.speakers_gone(t0 + Duration::from_secs(30));
+        let dropped = shared.drop_stale(t0 + Duration::from_secs(60));
+        assert_eq!(dropped, 24_000 + 96_000, "an answer that ended a minute ago would play now");
+        assert_eq!(shared.out.lock().unwrap().len(), 12_000);
+        shared.speakers_back();
+        // Back to normal: a later reopen (a device switch) keeps everything.
+        shared.push_reply_at(&speech(1.0), t0 + Duration::from_secs(61));
+        assert_eq!(shared.drop_stale(t0 + Duration::from_secs(70)), 0);
+        assert_eq!(shared.out.lock().unwrap().len(), 12_000 + 48_000);
+    }
+
+    #[test]
+    fn a_short_dropout_keeps_what_she_was_saying() {
+        let shared = Shared::new(0.0);
+        let t0 = Instant::now();
+        shared.push_reply_at(&speech(2.0), t0);
+        shared.speakers_gone(t0);
+        assert_eq!(shared.drop_stale(t0 + Duration::from_millis(1_200)), 0);
+        assert_eq!(shared.out.lock().unwrap().len(), 96_000);
+    }
+
+    #[test]
+    fn an_alarm_ringing_keeps_its_sound_through_an_outage() {
+        let shared = Shared::new(0.0);
+        shared.alarms.server_said(&serde_json::json!({ "type": "alarms",
+            "ringing": [{ "id": "a1", "kind": "alarm", "label": "", "base": 0.0 }], "list": [] }));
+        let t0 = Instant::now();
+        shared.speakers_gone(t0);
+        shared.push_reply_at(&speech(1.0), t0 + Duration::from_millis(100));
+        assert_eq!(shared.drop_stale(t0 + Duration::from_secs(10)), 0);
+        assert_eq!(shared.out.lock().unwrap().len(), 48_000);
+    }
+
+    #[test]
+    fn what_came_during_an_outage_survives_a_rate_change_in_step() {
+        let shared = Shared::new(0.0);
+        let t0 = Instant::now();
+        shared.speakers_gone(t0);
+        shared.push_reply_at(&speech(1.0), t0 + Duration::from_secs(5));
+        // A reopen that changed rate and then failed again.
+        shared.retarget(44_100);
+        shared.push_reply_at(&speech(0.5), t0 + Duration::from_secs(9));
+        // At 9.5 s only the last push is fresh.
+        let left = shared.drop_stale(t0 + Duration::from_millis(9_500));
+        let n = shared.out.lock().unwrap().len() as i64;
+        assert!((n - 22_050).abs() < 10, "kept {n}, dropped {left}");
     }
 
     #[test]
