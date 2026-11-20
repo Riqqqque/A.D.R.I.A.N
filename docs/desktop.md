@@ -509,7 +509,7 @@ server or the link is down (`alarm.rs`, alarm thread in `main.rs`).
   local ring. Now a local ring survives the server's hourly or on-change resync and stops
   once the server rings it itself, lists a later time or another occurrence, or drops it.
   One exception: a local ring that isn't due by the server's clock in that message (`at +
-  GRACE_MS > now`) stops and is forgotten, so it rings at its real time. That is the case
+  GRACE_MS > now`) stops and comes out of the already-rung set, so it rings at its real time. That is the case
   of a PC clock that jumped ahead and rang an alarm early; the skew is refreshed only by the
   server's lists.
 - **Sound.** `Beeper`: a soft 1 kHz square-ish tone (fundamental + 3rd + 5th harmonics),
@@ -676,7 +676,7 @@ gate openings (noise, shows) cost server CPU but are usually dropped before the 
 linklog 2, main 4, single 2, tray 4, update 15), 3 of them ignored by default. Reported runs
 on the branch, 2026-11-20: 113 passed, 3 ignored (73 at 0.17.1, then 83, 92 and 106 over the
 passes). `link.rs` tests start real WebSocket servers on `127.0.0.1:0` with shortened
-timings under `cfg(test)` (`HELD` 500 ms, `PING` 300 ms, `SEND_LIMIT` 200 ms; the reconnect
+timings under `cfg(test)` (`HELD` 500 ms, `PING` 300 ms, `SEND_LIMIT` 200 ms, `REFUSED_RETRY` 1.5 s; the reconnect
 schedule constants are the production values). The ignored ones are measurements, not
 checks: `reconnect_after_outages` (the outage harness; `ADRIAN_OUTAGES`, `ADRIAN_OUTAGE_RUNS`),
 `reconnect_schedule_sweep` (the model above) and `default_output_form_reads` (reads the real
@@ -710,8 +710,9 @@ asserts a 700 ms bound in real time and can miss it on a heavily loaded machine.
 
 ## Known issues (open)
 
-Found by a review of the 2026-11-20 passes (with probe tests that show each behavior) and
-checked again in the code on this branch. **Not fixed yet**; a later pass is planned. Letters
+Found by a review of the 2026-11-20 passes (with probe tests that show each behavior). The
+PC-side items were checked again in the code on this branch; R2 and the server half of A2
+rest on the review's reading of the bot. **Not fixed yet**; a later pass is planned. Letters
 are the review's.
 
 | | Issue | Effect | Since |
