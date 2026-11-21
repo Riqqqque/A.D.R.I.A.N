@@ -124,7 +124,7 @@ async fn harness_with(cloud: Option<SocketAddr>) -> H {
         "/api/setup/claim",
         Some(
             json!({"token": token, "username": "owner", "password": "password123",
-                    "timezone": "America/Denver", "privacy_mode": "hybrid"}),
+                    "timezone": "America/Boise", "privacy_mode": "hybrid"}),
         ),
         None,
         None,

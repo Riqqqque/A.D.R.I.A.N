@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn month_window_follows_local_time_across_dst() {
-        let tz = TimeZone::get("America/Denver").unwrap();
+        let tz = TimeZone::get("America/Boise").unwrap();
         // 2026-03-31 23:30 local (MDT) is still March.
         let late_march = jiff::civil::date(2026, 3, 31)
             .at(23, 30, 0, 0)
