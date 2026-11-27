@@ -446,6 +446,7 @@ files. Lines start with a UTC time. It records only link events, a few lines per
 - `link ended: <how>; lasted N s, heard from X s before, K ping(s) unanswered, longest hold-up L ms; quiet mode on|off, game in front|no`
 - `can't reach the server: <error> (after T ms); ...`, for the first failed try only
 - `link back after X s: N failed tries (refused 3, timed out 2, ...; slowest S ms), last: <error>; ...`, or `link back after X s, at the first try; ...`, or `link up; ...`
+- `action <name> took N ms`, `action <name> gave up after N ms` or `action <name> failed after N ms` (next release): a PC action that took over 2 s, ran past the app's own 10 s limit (the server then hears "The PC got stuck doing that and gave up." instead of waiting out its 15 s), or failed inside. Only the action's name and time, never its words.
 
 "Longest hold-up" is the longest wait for any event beyond the 20 s ping timer, which fires at
 least that often, so a larger number means the app wasn't run (a starved or suspended

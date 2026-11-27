@@ -190,19 +190,57 @@ struct StartApp {
     app_id: String,
 }
 
+/// `Get-StartApps` takes about a second; one that hangs (say, while the shell
+/// is still starting at sign-in) is stopped, and the index goes without it.
+const START_APPS_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A program's output, or None if it couldn't start or ran past `limit` (then
+/// it's ended).
+fn output_within(cmd: &mut Command, limit: std::time::Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = child.stdout.take()?;
+    // Read on the side: a full pipe would otherwise hold the program up.
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out.read_to_end(&mut buf);
+        buf
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return reader.join().ok(),
+            Ok(None) if started.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Every Start menu entry, desktop and Store apps alike (`Get-StartApps`).
 fn start_apps(apps: &mut Vec<App>) {
-    let out = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-StartApps | ConvertTo-Json -Compress",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    let Ok(out) = out else { return };
-    let text = String::from_utf8_lossy(&out.stdout);
+    let Some(stdout) = output_within(
+        Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-StartApps | ConvertTo-Json -Compress",
+            ])
+            .creation_flags(CREATE_NO_WINDOW),
+        START_APPS_LIMIT,
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&stdout);
     let list: Vec<StartApp> = serde_json::from_str(&text)
         .or_else(|_| serde_json::from_str::<StartApp>(&text).map(|a| vec![a]))
         .unwrap_or_default();
@@ -625,7 +663,27 @@ pub fn list(index: &Index, filter: &str) -> Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{Index, battle_net_roots, other_roots, vdf_values};
+    use super::{Index, battle_net_roots, other_roots, output_within, vdf_values};
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_program_that_finishes_gives_its_output() {
+        let out = output_within(Command::new("cmd").args(["/c", "echo hi"]).creation_flags(0x0800_0000), Duration::from_secs(5));
+        assert_eq!(String::from_utf8_lossy(&out.unwrap()).trim(), "hi");
+    }
+
+    #[test]
+    fn a_program_that_hangs_is_ended_at_the_limit() {
+        let started = Instant::now();
+        let out = output_within(
+            Command::new("cmd").args(["/c", "ping -n 20 127.0.0.1 >nul"]).creation_flags(0x0800_0000),
+            Duration::from_millis(300),
+        );
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+    }
 
     fn index(game_roots: Vec<String>) -> Index {
         Index {

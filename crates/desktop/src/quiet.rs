@@ -67,6 +67,39 @@ pub fn trim() {
     }
 }
 
+/// For the thread doing a PC action: a normal app's priority and full speed
+/// even while the process is in the background mode above, so a game in front
+/// can't starve "mute my music" past the server's wait.
+#[cfg(windows)]
+pub fn action_thread() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadInformation, SetThreadPriority,
+        THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        THREAD_POWER_THROTTLING_STATE, THREAD_PRIORITY_HIGHEST, ThreadPowerThrottling,
+    };
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0, // never throttled
+    };
+    // SAFETY: the current-thread pseudo handle needs no closing, and the
+    // structure is passed with its own size. Below-normal plus highest is a
+    // normal app's priority, no more.
+    unsafe {
+        let me = GetCurrentThread();
+        let _ = SetThreadPriority(me, THREAD_PRIORITY_HIGHEST);
+        let _ = SetThreadInformation(
+            me,
+            ThreadPowerThrottling,
+            &state as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn action_thread() {}
+
 #[cfg(not(windows))]
 pub fn background(_on: bool) {}
 

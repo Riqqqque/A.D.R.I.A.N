@@ -43,6 +43,10 @@ const PING: Duration = if cfg!(test) {
 };
 /// Pings in a row that can go unanswered before the link counts as lost.
 const UNANSWERED: u32 = 2;
+/// One action's limit here: under the server's 15 s, so it hears why.
+const ACTION_LIMIT: Duration = Duration::from_secs(10);
+/// Actions slower than this are noted in link.log.
+const SLOW_ACTION: Duration = Duration::from_secs(2);
 /// How long one send may take. A send stuck on a full socket would otherwise
 /// hold up everything here, the ping included.
 const SEND_LIMIT: Duration = if cfg!(test) {
@@ -670,8 +674,12 @@ async fn session(
                                 // The settings may have changed what's allowed: use the current policy.
                                 let pc = pc.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 let done = done_tx.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let o = pc.run(&name, &args);
+                                let shared = shared.clone();
+                                tokio::spawn(async move {
+                                    let (o, note) = run_action(pc, name.clone(), args, ACTION_LIMIT).await;
+                                    if let Some(note) = note {
+                                        shared.log.line(&format!("action {name} {note}"));
+                                    }
                                     let _ = done.send(action_result(&id, &o));
                                 });
                             }
@@ -743,6 +751,27 @@ async fn session(
                 put(&mut tx, Message::Text(json!({ "type": "ping" }).to_string().into())).await?;
             }
         }
+    }
+}
+
+/// One action on a blocking thread, within `limit`. A slow, stuck or failed one
+/// still gets an answer for the server (whose own wait is 15 s), and a note
+/// for link.log (the action's name and time only, never its words).
+async fn run_action(pc: Arc<Pc>, name: String, args: Value, limit: Duration) -> (Outcome, Option<String>) {
+    let started = Instant::now();
+    let job = tokio::task::spawn_blocking(move || {
+        crate::quiet::action_thread();
+        pc.run(&name, &args)
+    });
+    let ms = || started.elapsed().as_millis();
+    match tokio::time::timeout(limit, job).await {
+        Ok(Ok(o)) => {
+            let note = (started.elapsed() >= SLOW_ACTION).then(|| format!("took {} ms", ms()));
+            (o, note)
+        }
+        Ok(Err(_)) => (Outcome::no("Something went wrong on the PC doing that."), Some(format!("failed after {} ms", ms()))),
+        // The thread keeps going; whatever it does later isn't reported.
+        Err(_) => (Outcome::no("The PC got stuck doing that and gave up."), Some(format!("gave up after {} ms", ms()))),
     }
 }
 
@@ -1049,6 +1078,28 @@ mod tests {
             connect(&url, &mut up, &events)
         );
         assert!(!welcomed);
+    }
+
+    #[tokio::test]
+    async fn a_quick_action_answers_as_it_is_with_no_note() {
+        let pc = Arc::new(Pc::new(Policy::default()));
+        let (o, note) = run_action(pc, "pc_nothing".into(), json!({ "action": "x" }), Duration::from_secs(5)).await;
+        assert!(!o.ok);
+        assert!(o.text.contains("Unknown PC action"), "{}", o.text);
+        assert_eq!(note, None);
+    }
+
+    #[tokio::test]
+    async fn a_stuck_action_still_gets_an_answer_before_the_server_gives_up() {
+        // The first index build runs about a second, and an action waits for it.
+        let pc = Arc::new(Pc::new(Policy::default()));
+        let started = Instant::now();
+        let (o, note) = run_action(pc, "pc_apps".into(), json!({ "action": "which", "name": "notepad" }), Duration::from_millis(20)).await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!o.ok);
+        assert_eq!(o.text, "The PC got stuck doing that and gave up.");
+        assert!(note.unwrap().starts_with("gave up after"));
+        assert!(ACTION_LIMIT < Duration::from_secs(15), "the server waits 15 s");
     }
 
     /// The real reconnect loop, with the rest of the app stubbed out.

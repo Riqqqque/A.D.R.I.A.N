@@ -28,6 +28,11 @@ pub use apps::Index;
 /// Rebuilt at most this often (new installs show up without a restart).
 const INDEX_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
+/// How long an action waits for the first build before building it itself.
+/// With `apps`' own limit on the Start menu list, that stays well under the
+/// server's 15 s wait for an answer (it used to be 15 s by itself).
+const FIRST_BUILD_WAIT: Duration = Duration::from_secs(2);
+
 pub struct Inner {
     index: Arc<Mutex<Option<Index>>>,
     building: Arc<Mutex<bool>>,
@@ -62,29 +67,44 @@ impl Inner {
         }
         let (index, building, policy) = (self.index.clone(), self.building.clone(), policy.clone());
         std::thread::spawn(move || {
+            // Cleared however the build ends: a build that panicked used to
+            // leave this set, so no later one ever started.
+            struct Done(Arc<Mutex<bool>>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    *self.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                }
+            }
+            let _done = Done(building);
             let built = apps::build(&policy);
             *index.lock().unwrap_or_else(|e| e.into_inner()) = Some(built);
-            *building.lock().unwrap_or_else(|e| e.into_inner()) = false;
         });
     }
 
-    /// The index, waiting for the first build if it's still running.
+    /// The index, waiting a little for the first build if it's still running,
+    /// then building it here. What's built here is kept, so a first build that
+    /// never finishes costs one action this wait, not every action after it.
     fn index(&self, policy: &Policy) -> Index {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + FIRST_BUILD_WAIT;
         loop {
-            if let Some(i) = self
-                .index
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-            {
+            // Copied out first: `refresh` takes this lock too, and a guard kept
+            // across it (as an `if let` on the lock did) hung the thread for
+            // good once the index was ten minutes old, and with it everything
+            // else that reads the index, the game-in-front check included.
+            let now = self.index.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(i) = now {
                 if i.built.elapsed() >= INDEX_MAX_AGE {
                     self.refresh(policy);
                 }
-                return i.clone();
+                return i;
             }
             if Instant::now() > deadline {
-                return apps::build(policy);
+                let built = apps::build(policy);
+                self.index
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(|| built.clone());
+                return built;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -200,4 +220,33 @@ pub(crate) fn exe_stem(path: &str) -> String {
         .or_else(|| file.strip_suffix(".EXE"))
         .unwrap_or(file)
         .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INDEX_MAX_AGE, Index, Inner};
+    use crate::Policy;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_index_past_its_age_is_handed_back_and_rebuilt_without_hanging() {
+        let Some(old) = Instant::now().checked_sub(INDEX_MAX_AGE + Duration::from_secs(1)) else {
+            return; // the clock started too recently to make an old index
+        };
+        let inner = Arc::new(Inner {
+            index: Arc::new(Mutex::new(Some(Index { apps: Vec::new(), game_roots: vec!["d:/games/".into()], built: old }))),
+            building: Arc::new(Mutex::new(false)),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let me = inner.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(me.index(&Policy::default()).game_roots);
+        });
+        // This used to hang for good: the stale check called `refresh` with the lock held.
+        let roots = rx.recv_timeout(Duration::from_secs(5)).expect("index() hung on a stale index");
+        assert_eq!(roots, vec!["d:/games/".to_string()]);
+        // The lock is free for everyone else (the game-in-front check takes it every 2 s).
+        assert!(inner.index.try_lock().is_ok() || *inner.building.lock().unwrap());
+    }
 }

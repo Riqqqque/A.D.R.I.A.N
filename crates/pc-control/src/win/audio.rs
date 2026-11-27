@@ -283,7 +283,23 @@ fn one_app(action: &str, app: &str, args: &Value) -> windows::core::Result<Outco
 /// "Turn my music down": every app making sound that could be music, each from
 /// its own level. The master volume, games and voice chat stay where they are.
 fn what_plays(action: &str, args: &Value, index: &Index) -> windows::core::Result<Outcome> {
-    let (found, rest) = playing(index, app_sessions()?);
+    let apps = app_sessions()?;
+    // "Unmute my music": what was muted, which needn't read as making sound.
+    let muted: Vec<String> = if action == "unmute" {
+        apps.iter()
+            .filter(|a| could_be_music(index, a))
+            .filter(|a| a.controls.iter().any(|c| unsafe { c.GetMute() }.is_ok_and(|m| m.as_bool())))
+            .map(|a| a.name.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let (found, rest) = if muted.is_empty() {
+        playing(index, apps)
+    } else {
+        let (found, rest): (Vec<_>, Vec<_>) = apps.into_iter().partition(|a| muted.contains(&a.name));
+        (found, rest.iter().map(|a| pretty(&a.name)).collect())
+    };
     if found.is_empty() {
         return Ok(Outcome::no(if rest.is_empty() {
             "Nothing is playing sound right now.".to_string()
